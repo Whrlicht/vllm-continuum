@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="3"
-DECODE_GPUS="4"
+PREFILL_GPUS="1"
+DECODE_GPUS="6"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -267,6 +267,10 @@ trap cleanup INT TERM EXIT
 
 cd "${SCRIPT_DIR}"
 
+rm -rf "${SCRIPT_DIR}/continuum_exp"/prefill_* "${SCRIPT_DIR}/continuum_exp"/decode_* 2>/dev/null || true
+
+mkdir -p "${SCRIPT_DIR}/continuum_exp"
+
 echo "Starting proxy..."
 setsid python3 "${PROXY_SCRIPT}" \
   --host "${PROXY_API_HOST}" \
@@ -297,6 +301,7 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
   fi
 
   prefill_output_dir="${SCRIPT_DIR}/continuum_exp/prefill_${http_port}"
+  rm -rf "${prefill_output_dir}"
   mkdir -p "${prefill_output_dir}"
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid vllm serve "${MODEL_PATH}" \
@@ -337,6 +342,7 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
   fi
 
   decode_output_dir="${SCRIPT_DIR}/continuum_exp/decode_${http_port}"
+  rm -rf "${decode_output_dir}"
   mkdir -p "${decode_output_dir}"
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid vllm serve "${MODEL_PATH}" \

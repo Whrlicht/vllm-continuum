@@ -21,7 +21,6 @@ import json
 import random
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -877,15 +876,16 @@ def dump_output(
     cfg: ClientConfig,
     results: list[dict[str, Any]],
     timing_enrichment_summary: Optional[dict[str, Any]] = None,
+    run_status: str = "completed",
 ) -> Path:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"multiturn_trace_client_{ts}.json"
+    out_path = out_dir / f"multiturn_trace_client.json"
 
     payload = {
         "config": asdict(cfg),
+        "run_status": run_status,
         "record_scope": "end_to_end_client",
         "record_note": (
             "Each round is one client-visible request to base_url. In "
@@ -915,34 +915,56 @@ async def async_main(cfg: ClientConfig) -> int:
     print(f"Loaded {len(samples)} trajectories")
     print(f"Dispatch mode: {cfg.dispatch_mode}")
 
+    results: list[dict[str, Any]] = []
+    timing_enrichment_summary: Optional[dict[str, Any]] = None
     t0 = time.time()
-    # Avoid connector-level caps masking the intended client concurrency.
-    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
-    timeout = aiohttp.ClientTimeout(total=None)
-    async with aiohttp.ClientSession(connector=connector,
-                                     timeout=timeout) as session:
-        if cfg.dispatch_mode == "fixed":
-            results = await run_fixed_dispatch(samples, cfg, session)
-        else:
-            results = await run_poisson_dispatch(samples, cfg, session)
-    t1 = time.time()
+    try:
+        # Avoid connector-level caps masking the intended client concurrency.
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+        timeout = aiohttp.ClientTimeout(total=None)
+        async with aiohttp.ClientSession(connector=connector,
+                                         timeout=timeout) as session:
+            if cfg.dispatch_mode == "fixed":
+                results = await run_fixed_dispatch(samples, cfg, session)
+            else:
+                results = await run_poisson_dispatch(samples, cfg, session)
+        t1 = time.time()
 
-    timing_enrichment_summary = _enrich_results_with_monitoring(cfg, results)
-
-    out_path = dump_output(
-        cfg,
-        results,
-        timing_enrichment_summary=timing_enrichment_summary,
-    )
-    summary = summarize(results)
-    print("Run finished")
-    print(f"Elapsed: {t1 - t0:.3f}s")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if timing_enrichment_summary:
-        print("Timing enrichment summary:")
-        print(json.dumps(timing_enrichment_summary, ensure_ascii=False, indent=2))
-    print(f"Output saved to: {out_path}")
-    return 0
+        timing_enrichment_summary = _enrich_results_with_monitoring(cfg, results)
+        out_path = dump_output(
+            cfg,
+            results,
+            timing_enrichment_summary=timing_enrichment_summary,
+            run_status="completed",
+        )
+        summary = summarize(results)
+        print("Run finished")
+        print(f"Elapsed: {t1 - t0:.3f}s")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if timing_enrichment_summary:
+            print("Timing enrichment summary:")
+            print(json.dumps(timing_enrichment_summary, ensure_ascii=False, indent=2))
+        print(f"Output saved to: {out_path}")
+        return 0
+    except asyncio.CancelledError:
+        t1 = time.time()
+        timing_enrichment_summary = {
+            "enabled": False,
+            "enriched": False,
+            "reason": "interrupted_by_ctrl_c",
+        }
+        out_path = dump_output(
+            cfg,
+            results,
+            timing_enrichment_summary=timing_enrichment_summary,
+            run_status="interrupted",
+        )
+        summary = summarize(results)
+        print("Run interrupted; partial output saved")
+        print(f"Elapsed: {t1 - t0:.3f}s")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        print(f"Output saved to: {out_path}")
+        return 130
 
 
 def main() -> None:
