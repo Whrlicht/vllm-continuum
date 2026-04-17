@@ -51,11 +51,11 @@ class SchedulerConfig:
     is primarily set in `ModelConfig` and that value should be manually
     duplicated here."""
 
-    max_num_partial_prefills: int = 1
+    max_num_partial_prefills: int = 256
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""
 
-    max_long_partial_prefills: int = 1
+    max_long_partial_prefills: int = 256
     """For chunked prefill, the maximum number of prompts longer than
     long_prefill_token_threshold that will be prefilled concurrently. Setting
     this less than max_num_partial_prefills will allow shorter prompts to jump
@@ -127,6 +127,15 @@ class SchedulerConfig:
     of arrival.\n
     - "priority" means requests are handled based on given priority (lower
     value means earlier handling) and time of arrival deciding any ties)."""
+
+    licht: bool = False
+    """Enable LICHT mode.
+
+    LICHT is an algorithm switch for disaggregated serving:
+    - prefill instance: use LICHT dynamic priority scheduling.
+    - decode instance: keep default FCFS scheduling.
+    KV cache transfer strategy is kept as the default implementation for now.
+    """
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
@@ -283,7 +292,7 @@ class SchedulerConfig:
                 f"max_num_partial_prefills ({self.max_num_partial_prefills}) "
                 "must be greater than or equal to 1.")
         elif self.max_num_partial_prefills > 1:
-            if not self.chunked_prefill_enabled:
+            if self.chunked_prefill_enabled is False:
                 raise ValueError("Chunked prefill must be enabled to set "
                                  "max_num_partial_prefills > 1.")
 

@@ -296,6 +296,10 @@ class ResponsesRequest(OpenAIBaseModel):
     is_last_step: Optional[bool] = None
     this_func_call: Optional[str] = None
 
+    # Trace replay controls.
+    trace_replay: Optional[bool] = False
+    traj_id: Optional[str] = None
+
     request_id: str = Field(
         default_factory=lambda: f"resp_{random_uuid()}",
         description=(
@@ -335,6 +339,9 @@ class ResponsesRequest(OpenAIBaseModel):
         default_max_tokens: int,
         default_sampling_params: Optional[dict] = None,
     ) -> SamplingParams:
+        if self.trace_replay and not self.traj_id:
+            raise ValueError("trace_replay=true requires traj_id")
+
         if self.max_output_tokens is None:
             max_tokens = default_max_tokens
         else:
@@ -371,7 +378,7 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.this_func_call is not None:
             extra_args["this_func_call"] = self.this_func_call
         
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -383,6 +390,9 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding=guided_decoding,
             extra_args=extra_args or None,
         )
+        sampling_params.trace_replay = bool(self.trace_replay)
+        sampling_params.traj_id = self.traj_id
+        return sampling_params
 
     def is_include_output_logprobs(self) -> bool:
         """Check if the request includes output logprobs."""
@@ -405,6 +415,12 @@ class ResponsesRequest(OpenAIBaseModel):
     def validate_prompt(cls, data):
         if data.get("prompt") is not None:
             raise ValueError("prompt template is not supported")
+        return data
+
+    @model_validator(mode="before")
+    def validate_trace_replay(cls, data):
+        if data.get("trace_replay") and not data.get("traj_id"):
+            raise ValueError("trace_replay=true requires traj_id")
         return data
 
     @model_validator(mode="before")
@@ -453,6 +469,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     ]] = "none"
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
     include_reasoning: bool = True
+
+    # Trace replay controls.
+    trace_replay: Optional[bool] = False
+    traj_id: Optional[str] = None
+
 
     # NOTE this will be ignored by vLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
@@ -672,7 +693,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         logits_processor_pattern: Optional[str],
         default_sampling_params: dict,
     ) -> SamplingParams:
-        print(f"DEBUGGING eos: {self.ignore_eos}")
+        if self.trace_replay and not self.traj_id:
+            raise ValueError("trace_replay=true requires traj_id")
+        if self.trace_replay and self.n != 1:
+            raise ValueError("trace_replay requires n=1")
+        if self.trace_replay and self.use_beam_search:
+            raise ValueError("trace_replay does not support beam search")
+
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get(
@@ -735,9 +762,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["is_last_step"] = self.is_last_step
         if self.this_func_call is not None:
             extra_args["this_func_call"] = self.this_func_call
-        
-        print(f"extra_args: {extra_args}")
-        return SamplingParams.from_optional(
+
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             best_of=self.best_of,
             presence_penalty=self.presence_penalty,
@@ -769,6 +795,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
         )
+        sampling_params.trace_replay = bool(self.trace_replay)
+        sampling_params.traj_id = self.traj_id
+        return sampling_params
 
     def _get_guided_json_from_tool(
             self) -> Optional[Union[str, dict, BaseModel]]:
@@ -983,6 +1012,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_trace_replay(cls, data):
+        if data.get("trace_replay") and not data.get("traj_id"):
+            raise ValueError("trace_replay=true requires traj_id")
+        if data.get("trace_replay") and data.get("n", 1) != 1:
+            raise ValueError("trace_replay requires n=1")
+        if data.get("trace_replay") and data.get("use_beam_search"):
+            raise ValueError("trace_replay does not support beam search")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_cache_salt_support(cls, data):
         if data.get("cache_salt") is not None:
             if not envs.VLLM_USE_V1:
@@ -1018,6 +1058,10 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
+
+    # Trace replay controls.
+    trace_replay: Optional[bool] = False
+    traj_id: Optional[str] = None
 
     # --8<-- [start:completion-sampling-params]
     use_beam_search: bool = False
@@ -1189,6 +1233,12 @@ class CompletionRequest(OpenAIBaseModel):
         logits_processor_pattern: Optional[str],
         default_sampling_params: Optional[dict] = None,
     ) -> SamplingParams:
+        if self.trace_replay and not self.traj_id:
+            raise ValueError("trace_replay=true requires traj_id")
+        if self.trace_replay and self.n != 1:
+            raise ValueError("trace_replay requires n=1")
+        if self.trace_replay and self.use_beam_search:
+            raise ValueError("trace_replay does not support beam search")
 
         if default_sampling_params is None:
             default_sampling_params = {}
@@ -1246,7 +1296,7 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args["is_last_step"] = self.is_last_step
         if self.this_func_call is not None:
             extra_args["this_func_call"] = self.this_func_call
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             best_of=self.best_of,
             presence_penalty=self.presence_penalty,
@@ -1277,6 +1327,9 @@ class CompletionRequest(OpenAIBaseModel):
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             )
+        sampling_params.trace_replay = bool(self.trace_replay)
+        sampling_params.traj_id = self.traj_id
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -1334,6 +1387,17 @@ class CompletionRequest(OpenAIBaseModel):
                 "Either prompt or prompt_embeds must be provided and non-empty."
             )
 
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_trace_replay(cls, data):
+        if data.get("trace_replay") and not data.get("traj_id"):
+            raise ValueError("trace_replay=true requires traj_id")
+        if data.get("trace_replay") and data.get("n", 1) != 1:
+            raise ValueError("trace_replay requires n=1")
+        if data.get("trace_replay") and data.get("use_beam_search"):
+            raise ValueError("trace_replay does not support beam search")
         return data
 
     @model_validator(mode="before")

@@ -47,6 +47,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.trace_replay.store import get_trace_store
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
@@ -129,6 +130,7 @@ class OpenAIServingChat(OpenAIServing):
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+        self.trace_store = get_trace_store()
         self.default_sampling_params = (
             self.model_config.get_diff_sampling_param())
         if self.default_sampling_params:
@@ -280,6 +282,158 @@ class OpenAIServingChat(OpenAIServing):
                     sampling_params = request.to_sampling_params(
                         max_tokens, self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
+
+                    if sampling_params.trace_replay:
+                        assert sampling_params.traj_id is not None
+                        raw_trace_messages = self.trace_store.get_messages(
+                            sampling_params.traj_id)
+
+                        def _normalize_trace_message(
+                                msg: dict[str, object]) -> dict[str, object]:
+                            role = str(msg.get("role", "user"))
+                            norm: dict[str, object] = {"role": role}
+                            content = msg.get("content")
+                            if isinstance(content, (str, list)):
+                                norm["content"] = content
+                            elif content is None:
+                                norm["content"] = ""
+                            else:
+                                norm["content"] = str(content)
+
+                            # Keep schema-minimal to avoid parser-specific
+                            # validation failures while computing token spans.
+                            return norm
+
+                        trace_messages = [
+                            _normalize_trace_message(m)
+                            for m in raw_trace_messages
+                            if isinstance(m, dict)
+                        ]
+
+                        full_trace_token_ids: list[int]
+                        if trace_messages:
+                            # Build trace token ids with the same chat template
+                            # pipeline as the incoming request to keep token
+                            # positions consistent.
+                            _, _, trace_engine_prompts = await self._preprocess_chat(
+                                request,
+                                tokenizer,
+                                trace_messages,
+                                chat_template=request.chat_template
+                                or self.chat_template,
+                                chat_template_content_format=self.
+                                chat_template_content_format,
+                                add_generation_prompt=request.
+                                add_generation_prompt,
+                                continue_final_message=request.
+                                continue_final_message,
+                                tool_dicts=tool_dicts,
+                                documents=request.documents,
+                                chat_template_kwargs=request.
+                                chat_template_kwargs,
+                                tool_parser=tool_parser,
+                                add_special_tokens=request.add_special_tokens,
+                            )
+                            full_trace_token_ids = list(
+                                trace_engine_prompts[0]["prompt_token_ids"])
+                        else:
+                            full_trace_token_ids = (
+                                self.trace_store.materialize_trace_token_ids(
+                                    sampling_params.traj_id,
+                                    tokenizer,
+                                ))
+
+                        prompt_token_ids = engine_prompt.get("prompt_token_ids")
+                        trace_token_ids = full_trace_token_ids
+                        prompt_len = 0
+                        if isinstance(prompt_token_ids, list):
+                            prompt_len = len(prompt_token_ids)
+                            if (prompt_len <= len(full_trace_token_ids)
+                                    and full_trace_token_ids[:prompt_len] ==
+                                    prompt_token_ids):
+                                trace_token_ids = full_trace_token_ids[prompt_len:]
+                            else:
+                                logger.warning(
+                                    "trace_replay prompt prefix mismatch for traj_id=%s; "
+                                    "falling back to full trace tokens",
+                                    sampling_params.traj_id,
+                                )
+
+                        # Optional: cap replay to a specific assistant round.
+                        # Client passes this via vllm_xargs.trace_replay_assistant_round.
+                        if trace_messages:
+                            extra_args = sampling_params.extra_args or {}
+                            round_idx_raw = extra_args.get(
+                                "trace_replay_assistant_round")
+                            if isinstance(round_idx_raw, int) and round_idx_raw >= 0:
+                                assistant_positions = [
+                                    idx for idx, m in enumerate(trace_messages)
+                                    if m.get("role") == "assistant"
+                                ]
+                                if round_idx_raw < len(assistant_positions):
+                                    target_msg_idx = assistant_positions[
+                                        round_idx_raw]
+                                    trace_prefix_messages = trace_messages[:
+                                                                          target_msg_idx]
+                                    trace_upto_messages = trace_messages[:
+                                                                        target_msg_idx +
+                                                                        1]
+
+                                    _, _, prefix_prompts = await self._preprocess_chat(
+                                        request,
+                                        tokenizer,
+                                        trace_prefix_messages,
+                                        chat_template=request.chat_template
+                                        or self.chat_template,
+                                        chat_template_content_format=self.
+                                        chat_template_content_format,
+                                        add_generation_prompt=request.
+                                        add_generation_prompt,
+                                        continue_final_message=request.
+                                        continue_final_message,
+                                        tool_dicts=tool_dicts,
+                                        documents=request.documents,
+                                        chat_template_kwargs=request.
+                                        chat_template_kwargs,
+                                        tool_parser=tool_parser,
+                                        add_special_tokens=request.
+                                        add_special_tokens,
+                                    )
+                                    _, _, upto_prompts = await self._preprocess_chat(
+                                        request,
+                                        tokenizer,
+                                        trace_upto_messages,
+                                        chat_template=request.chat_template
+                                        or self.chat_template,
+                                        chat_template_content_format=self.
+                                        chat_template_content_format,
+                                        add_generation_prompt=request.
+                                        add_generation_prompt,
+                                        continue_final_message=request.
+                                        continue_final_message,
+                                        tool_dicts=tool_dicts,
+                                        documents=request.documents,
+                                        chat_template_kwargs=request.
+                                        chat_template_kwargs,
+                                        tool_parser=tool_parser,
+                                        add_special_tokens=request.
+                                        add_special_tokens,
+                                    )
+
+                                    prefix_len = len(
+                                        prefix_prompts[0]["prompt_token_ids"])
+                                    upto_len = len(
+                                        upto_prompts[0]["prompt_token_ids"])
+
+                                    if prompt_len == prefix_len and upto_len >= prefix_len:
+                                        target_new_tokens = upto_len - prefix_len
+                                        trace_token_ids = trace_token_ids[:
+                                                                          target_new_tokens]
+
+                        extra_args = dict(sampling_params.extra_args or {})
+                        extra_args["trace_replay_token_ids"] = trace_token_ids
+                        sampling_params.extra_args = extra_args
+
 
                 self._log_inputs(request_id,
                                  request_prompts[i],

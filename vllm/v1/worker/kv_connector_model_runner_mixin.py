@@ -66,11 +66,22 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     def kv_connector_no_forward(scheduler_output: "SchedulerOutput",
                                 vllm_config: VllmConfig) -> ModelRunnerOutput:
+        wait_for_save = False
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            # In direct block mode, producer start_load_kv enqueues bridge
+            # metadata that must be published via wait_for_save even when
+            # no model forward is executed in this step.
+            if getattr(kv_connector, "is_producer", False) and getattr(
+                    kv_connector, "direct_block_mode", False):
+                wait_for_save = True
+
         # KV send/recv even if no work to do.
         with set_forward_context(
                 None, vllm_config
         ), KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, wait_for_save=False) as kv_connector_output:
+            scheduler_output,
+            wait_for_save=wait_for_save) as kv_connector_output:
             pass
 
         if (not kv_connector_output.finished_sending

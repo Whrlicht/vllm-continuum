@@ -6,16 +6,20 @@ import os
 import threading
 import time
 import typing
+import ctypes
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import msgpack
 import torch
 import zmq
 
+from vllm import _custom_ops as custom_ops
 from vllm.config.kv_transfer import KVTransferConfig
+from vllm.distributed.device_communicators.cuda_wrapper import (
+    CudaRTLibrary, cudaIpcMemHandle_t)
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary, buffer_type, cudaStream_t, ncclComm_t, ncclDataTypeEnum)
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.tensor_memory_pool import (  # noqa: E501
@@ -25,6 +29,11 @@ from vllm.utils import current_stream, get_ip
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
+DEFAULT_REQUEST_COMPLETION_TIMEOUT_S = 120.0
+DEFAULT_GET_RETRY_TIMEOUT_S = 30.0
+DEFAULT_GET_RETRY_INTERVAL_S = 0.002
+IPC_HANDLE_SIZE_BYTES = ctypes.sizeof(cudaIpcMemHandle_t)
+DIRECT_BLOCK_SEND_TYPES = {"BLOCK_MIGRATE", "BLOCK_DIRECT", "DISTSERVE"}
 
 
 @contextmanager
@@ -117,28 +126,29 @@ class P2pNcclEngine:
         self.send_stream = torch.cuda.Stream()
         self.recv_stream = torch.cuda.Stream()
 
-        mem_pool_size_gb = float(
-            self.config.get_from_extra_config("mem_pool_size_gb",
-                                              DEFAULT_MEM_POOL_SIZE_GB))
-        self.pool = TensorMemoryPool(max_block_size=int(mem_pool_size_gb *
-                                                        1024**3))  # GB
-
         # The sending type includes tree mutually exclusive options:
-        # PUT, GET, PUT_ASYNC.
-        self.send_type = self.config.get_from_extra_config(
-            "send_type", "PUT_ASYNC")
-        if self.send_type == "GET":
-            # tensor_id: torch.Tensor
-            self.send_store: dict[str, torch.Tensor] = {}
+        # PUT, GET, PUT_ASYNC, BLOCK_MIGRATE.
+        self.send_type = str(
+            self.config.get_from_extra_config("send_type",
+                                              "PUT_ASYNC")).upper()
+        self.direct_block_mode = self.send_type in DIRECT_BLOCK_SEND_TYPES
+
+        if not self.direct_block_mode:
+            mem_pool_size_gb = float(
+                self.config.get_from_extra_config("mem_pool_size_gb",
+                                                  DEFAULT_MEM_POOL_SIZE_GB))
+            self.pool = TensorMemoryPool(max_block_size=int(mem_pool_size_gb *
+                                                            1024**3))  # GB
         else:
-            # PUT or PUT_ASYNC
-            # tensor_id: torch.Tensor
-            self.send_queue: deque[SendQueueItem] = deque()
-            self.send_request_id_to_tensor_ids: dict[str, set[str]] = {}
-            if self.send_type == "PUT_ASYNC":
-                self._send_thread = threading.Thread(target=self.send_async,
-                                                     daemon=True)
-                self._send_thread.start()
+            self.pool = None
+
+        self.send_store: dict[str, torch.Tensor] = {}
+        self.send_queue: deque[SendQueueItem] = deque()
+        self.send_request_id_to_tensor_ids: dict[str, set[str]] = {}
+        if self.send_type == "PUT_ASYNC":
+            self._send_thread = threading.Thread(target=self.send_async,
+                                                 daemon=True)
+            self._send_thread.start()
 
         # tensor_id: torch.Tensor/(addr, dtype, shape)
         self.recv_store: dict[str, Any] = {}
@@ -148,6 +158,43 @@ class P2pNcclEngine:
 
         self.buffer_size = 0
         self.buffer_size_threshold = float(self.config.kv_buffer_size)
+        self.request_completion_timeout_s = float(
+            self.config.get_from_extra_config(
+                "request_completion_timeout_s",
+                DEFAULT_REQUEST_COMPLETION_TIMEOUT_S,
+            ))
+        self.get_retry_timeout_s = float(
+            self.config.get_from_extra_config(
+                "get_retry_timeout_s",
+                DEFAULT_GET_RETRY_TIMEOUT_S,
+            ))
+        self.get_retry_interval_s = max(
+            float(
+                self.config.get_from_extra_config(
+                    "get_retry_interval_s",
+                    DEFAULT_GET_RETRY_INTERVAL_S,
+                )),
+            1e-4,
+        )
+        self.state_lock = threading.Lock()
+        self.expected_tensor_ids: dict[str, set[str]] = {}
+        self.pending_sending_deadlines: dict[str, float] = {}
+        self.pending_recving_deadlines: dict[str, float] = {}
+        self.pending_release_deadlines: dict[str, float] = {}
+
+        # Direct block migration runtime state.
+        self.kv_caches: dict[str, torch.Tensor] = {}
+        self.cuda_rt: Optional[CudaRTLibrary] = None
+        self.serialized_ipc_handles: Optional[dict[str, bytes]] = None
+        self.serialized_ipc_meta: Optional[dict[str, dict[str, Any]]] = None
+        self.local_ipc_epoch: int = 0
+        self.remote_ipc_ptrs: dict[str, dict[str, ctypes.c_void_p]] = {}
+        self.remote_kv_views: dict[str, dict[str, torch.Tensor]] = {}
+        self.remote_ipc_epochs: dict[str, int] = {}
+        self.bridge_queue: dict[str, list[int]] = {}
+        self.pending_migrations: dict[str, tuple[torch.cuda.Event, str]] = {}
+        self.completed_recving_req_ids: set[str] = set()
+        self.completed_release_req_ids: set[str] = set()
 
         self.nccl_num_channels = self.config.get_from_extra_config(
             "nccl_num_channels", "8")
@@ -164,9 +211,10 @@ class P2pNcclEngine:
         logger.info(
             "💯P2pNcclEngine init, rank:%d, local_rank:%d, http_address:%s, "
             "zmq_address:%s, proxy_address:%s, send_type:%s, buffer_size_"
-            "threshold:%.2f, nccl_num_channels:%s", self.rank, self.local_rank,
-            self.http_address, self.zmq_address, self.proxy_address,
-            self.send_type, self.buffer_size_threshold, self.nccl_num_channels)
+            "threshold:%.2f, nccl_num_channels:%s, direct_block_mode:%s",
+            self.rank, self.local_rank, self.http_address, self.zmq_address,
+            self.proxy_address, self.send_type, self.buffer_size_threshold,
+            self.nccl_num_channels, self.direct_block_mode)
 
     def create_connect(self, remote_address: typing.Optional[str] = None):
         assert remote_address is not None
@@ -175,6 +223,11 @@ class P2pNcclEngine:
             sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
             sock.connect(f"tcp://{remote_address}")
             self.socks[remote_address] = sock
+
+            if self.direct_block_mode:
+                self.comms[remote_address] = (None, 0)
+                return self.socks[remote_address], self.comms[remote_address]
+
             if remote_address in self.comms:
                 logger.info("👋comm exists, remote_address:%s, comms:%s",
                             remote_address, self.comms)
@@ -195,6 +248,347 @@ class P2pNcclEngine:
 
         return self.socks[remote_address], self.comms[remote_address]
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        self.kv_caches = kv_caches
+        # KV cache tensors may be re-initialized during engine lifetime.
+        # Rebuild handles lazily on demand.
+        self.serialized_ipc_handles = None
+        self.serialized_ipc_meta = None
+        self.local_ipc_epoch += 1
+
+    def stage_bridge_request(self, request_id: str,
+                             context_block_ids: list[int]) -> None:
+        with self.state_lock:
+            self.bridge_queue[request_id] = context_block_ids
+
+    def pop_bridge_request(self,
+                           request_id: str,
+                           remote_address: str,
+                           timeout_s: Optional[float] = None
+                           ) -> Optional[list[int]]:
+        if timeout_s is None:
+            timeout_s = max(self.get_retry_timeout_s,
+                            self.request_completion_timeout_s)
+
+        # Fast path: single non-blocking probe, useful for per-step retries.
+        if timeout_s <= 0:
+            payload = self._rpc(
+                remote_address,
+                {
+                    "cmd": "BRIDGE_POP",
+                    "request_id": request_id,
+                },
+            )
+            if payload.get("ret") == 0:
+                return [int(x) for x in payload.get("context_block_ids", [])]
+            return None
+
+        deadline = time.time() + timeout_s
+        while True:
+            payload = self._rpc(
+                remote_address,
+                {
+                    "cmd": "BRIDGE_POP",
+                    "request_id": request_id,
+                },
+            )
+            if payload.get("ret") == 0:
+                return [int(x) for x in payload.get("context_block_ids", [])]
+
+            if time.time() >= deadline:
+                logger.warning(
+                    "🔴[BLOCK]Bridge pop timeout from %s, request_id:%s, "
+                    "rank:%d, timeout_s:%.3f", remote_address, request_id,
+                    self.rank, timeout_s)
+                return None
+            time.sleep(self.get_retry_interval_s)
+
+    def launch_block_migration(self, request_id: str,
+                               context_block_ids: list[int],
+                               decoding_block_ids: list[int],
+                               remote_address: str) -> bool:
+        if not self.direct_block_mode:
+            raise RuntimeError("launch_block_migration only works in direct "
+                               "block mode")
+
+        if not context_block_ids or not decoding_block_ids:
+            with self.state_lock:
+                self.completed_recving_req_ids.add(request_id)
+            self._send_release_callback(request_id, remote_address)
+            return True
+
+        # In disaggregated prefill/decode, decode side typically imports
+        # prompt-1 tokens. This can lead to src blocks = dst blocks + 1 when
+        # the last prompt token occupies a trailing partial block on prefill.
+        # Trim that trailing source block to keep the migration one-to-one.
+        if len(context_block_ids) == len(decoding_block_ids) + 1:
+            context_block_ids = context_block_ids[:len(decoding_block_ids)]
+
+        num_pairs = min(len(context_block_ids), len(decoding_block_ids))
+        if num_pairs != len(context_block_ids) or num_pairs != len(
+                decoding_block_ids):
+            logger.warning(
+                "🚧[BLOCK]Mismatched block_ids, req:%s, src:%d, dst:%d, "
+                "copy:%d", request_id, len(context_block_ids),
+                len(decoding_block_ids), num_pairs)
+
+        src_ids = torch.tensor(context_block_ids[:num_pairs],
+                               dtype=torch.int64,
+                               device="cpu")
+        dst_ids = torch.tensor(decoding_block_ids[:num_pairs],
+                               dtype=torch.int64,
+                               device="cpu")
+
+        for attempt in range(2):
+            try:
+                self._ensure_remote_kv_views(
+                    remote_address, force_refresh=(attempt > 0))
+                remote_views = self.remote_kv_views.get(remote_address, {})
+                if not remote_views:
+                    raise RuntimeError("Remote KV views are not initialized "
+                                       f"for {remote_address}")
+
+                event = torch.cuda.Event(blocking=False)
+                with torch.cuda.stream(self.recv_stream):
+                    for layer_name, dst_kv_cache in self.kv_caches.items():
+                        src_kv_cache = remote_views.get(layer_name)
+                        if src_kv_cache is None:
+                            continue
+
+                        block_dim = self._infer_block_dim(dst_kv_cache)
+                        custom_ops.migrate_kv_cache_blocks(
+                            dst_kv_cache, src_kv_cache, src_ids, dst_ids,
+                            block_dim)
+
+                    event.record(self.recv_stream)
+
+                with self.state_lock:
+                    self.pending_migrations[request_id] = (event,
+                                                           remote_address)
+                return True
+            except Exception:
+                if attempt == 0:
+                    logger.warning(
+                        "⚠️[BLOCK]Migration failed, refreshing IPC views and "
+                        "retrying. req:%s remote:%s src:%d dst:%d",
+                        request_id,
+                        remote_address,
+                        len(context_block_ids),
+                        len(decoding_block_ids),
+                        exc_info=True,
+                    )
+                    self._invalidate_remote_kv_views(remote_address)
+                    continue
+
+                logger.exception(
+                    "🔴[BLOCK]Migration failed after IPC refresh. "
+                    "req:%s remote:%s src:%d dst:%d",
+                    request_id,
+                    remote_address,
+                    len(context_block_ids),
+                    len(decoding_block_ids),
+                )
+                return False
+
+        return False
+
+    @staticmethod
+    def _infer_block_dim(kv_cache: torch.Tensor) -> int:
+        if kv_cache.dim() < 2:
+            raise RuntimeError(
+                f"Invalid KV cache shape for block migration: {kv_cache.shape}"
+            )
+        if kv_cache.shape[1] == 2:
+            return 0
+        if kv_cache.shape[0] == 2:
+            return 1
+        raise RuntimeError(
+            "Unsupported KV cache layout for block migration, "
+            f"shape={tuple(kv_cache.shape)}")
+
+    def _ensure_remote_kv_views(self,
+                                remote_address: str,
+                                force_refresh: bool = False) -> None:
+        if force_refresh:
+            self._invalidate_remote_kv_views(remote_address)
+        elif remote_address in self.remote_kv_views:
+            return
+
+        payload = self._rpc(remote_address, {"cmd": "GET_IPC_METADATA"})
+        if payload.get("ret") != 0:
+            raise RuntimeError("Failed to fetch IPC metadata from "
+                               f"{remote_address}: {payload}")
+
+        handle_map: dict[str, bytes] = payload.get("handles", {})
+        meta_map: dict[str, dict[str, Any]] = payload.get("meta", {})
+        ipc_epoch = int(payload.get("ipc_epoch", 0))
+        if not handle_map:
+            raise RuntimeError("Peer returned empty IPC handle map from "
+                               f"{remote_address}")
+        if not meta_map:
+            raise RuntimeError("Peer returned empty IPC metadata map from "
+                               f"{remote_address}")
+
+        if self.cuda_rt is None:
+            self.cuda_rt = CudaRTLibrary()
+
+        remote_ptrs: dict[str, ctypes.c_void_p] = {}
+        remote_views: dict[str, torch.Tensor] = {}
+        try:
+            for layer_name, raw_handle in handle_map.items():
+                local_kv_cache = self.kv_caches.get(layer_name)
+                if local_kv_cache is None:
+                    continue
+
+                layer_meta = meta_map.get(layer_name)
+                if layer_meta is None:
+                    raise RuntimeError("Missing IPC metadata for layer "
+                                       f"{layer_name} from {remote_address}")
+
+                shape = [int(x) for x in layer_meta.get("shape", [])]
+                stride = [int(x) for x in layer_meta.get("stride", [])]
+                remote_dtype = str(layer_meta.get("dtype", ""))
+                local_dtype = str(local_kv_cache.dtype).replace("torch.", "")
+                if remote_dtype and remote_dtype != local_dtype:
+                    raise RuntimeError(
+                        "Remote/local KV dtype mismatch for layer "
+                        f"{layer_name}: remote={remote_dtype}, local={local_dtype}"
+                    )
+
+                if not shape or len(shape) != len(stride):
+                    raise RuntimeError(
+                        "Invalid shape/stride metadata for layer "
+                        f"{layer_name}: shape={shape}, stride={stride}")
+                if len(shape) != local_kv_cache.dim():
+                    raise RuntimeError(
+                        "Remote/local KV dim mismatch for layer "
+                        f"{layer_name}: remote_dim={len(shape)}, "
+                        f"local_dim={local_kv_cache.dim()}")
+
+                handle_bytes = raw_handle if isinstance(raw_handle,
+                                                        (bytes,
+                                                         bytearray)) else \
+                    bytes(raw_handle)
+                if len(handle_bytes) != IPC_HANDLE_SIZE_BYTES:
+                    raise RuntimeError(
+                        "Invalid IPC handle size for layer "
+                        f"{layer_name}: {len(handle_bytes)}")
+
+                handle = cudaIpcMemHandle_t()
+                ctypes.memmove(ctypes.byref(handle), handle_bytes,
+                               IPC_HANDLE_SIZE_BYTES)
+                opened_ptr = self.cuda_rt.cudaIpcOpenMemHandle(handle)
+
+                remote_ptrs[layer_name] = opened_ptr
+                remote_views[layer_name] = \
+                    custom_ops.get_cuda_view_from_ptr_shape_stride(
+                        int(opened_ptr.value), shape, stride, local_kv_cache)
+        except Exception:
+            for ptr in remote_ptrs.values():
+                try:
+                    self.cuda_rt.cudaIpcCloseMemHandle(ptr)
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.debug("Failed to close IPC handle: %r", exc)
+            raise
+
+        if not remote_views:
+            raise RuntimeError("No compatible remote KV views were created "
+                               f"for {remote_address}")
+
+        self.remote_ipc_ptrs[remote_address] = remote_ptrs
+        self.remote_kv_views[remote_address] = remote_views
+        self.remote_ipc_epochs[remote_address] = ipc_epoch
+
+    def _invalidate_remote_kv_views(self, remote_address: str) -> None:
+        ptrs_by_layer = self.remote_ipc_ptrs.pop(remote_address, None)
+        self.remote_kv_views.pop(remote_address, None)
+        self.remote_ipc_epochs.pop(remote_address, None)
+
+        if ptrs_by_layer is None or self.cuda_rt is None:
+            return
+
+        for ptr in ptrs_by_layer.values():
+            try:
+                self.cuda_rt.cudaIpcCloseMemHandle(ptr)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.debug("Failed to close IPC handle: %r", exc)
+
+    def _get_local_ipc_payload(self) -> dict[str, Any]:
+        if self.serialized_ipc_handles is None:
+            if not self.kv_caches:
+                return {"ret": 1, "error": "kv_caches_not_registered"}
+            if self.cuda_rt is None:
+                self.cuda_rt = CudaRTLibrary()
+
+            handles: dict[str, bytes] = {}
+            meta: dict[str, dict[str, Any]] = {}
+            for layer_name, kv_cache in self.kv_caches.items():
+                dev_ptr = ctypes.c_void_p(int(kv_cache.data_ptr()))
+                handle = self.cuda_rt.cudaIpcGetMemHandle(dev_ptr)
+                handles[layer_name] = ctypes.string_at(ctypes.byref(handle),
+                                                       IPC_HANDLE_SIZE_BYTES)
+                meta[layer_name] = {
+                    "shape": [int(x) for x in kv_cache.shape],
+                    "stride": [int(x) for x in kv_cache.stride()],
+                    "dtype": str(kv_cache.dtype).replace("torch.", ""),
+                    "device": int(kv_cache.device.index or 0),
+                    "block_dim": int(self._infer_block_dim(kv_cache)),
+                }
+            self.serialized_ipc_handles = handles
+            self.serialized_ipc_meta = meta
+
+        return {
+            "ret": 0,
+            "handles": self.serialized_ipc_handles,
+            "meta": self.serialized_ipc_meta,
+            "ipc_epoch": self.local_ipc_epoch,
+        }
+
+    def _rpc(self, remote_address: str, payload: dict[str, Any]) -> dict[str,
+                                                                         Any]:
+        if remote_address not in self.socks:
+            self.create_connect(remote_address)
+        sock = self.socks[remote_address]
+        sock.send(msgpack.dumps(payload))
+        return msgpack.loads(sock.recv())
+
+    def _send_release_callback(self, request_id: str,
+                               remote_address: str) -> None:
+        payload = self._rpc(
+            remote_address,
+            {
+                "cmd": "RELEASE",
+                "request_id": request_id,
+            },
+        )
+        if payload.get("ret") != 0:
+            logger.warning(
+                "🚧[BLOCK]Release callback failed, request_id:%s, "
+                "remote:%s, payload:%s", request_id, remote_address, payload)
+
+    def _poll_completed_migrations(self) -> None:
+        if not self.pending_migrations:
+            return
+
+        done: list[tuple[str, str]] = []
+        with self.state_lock:
+            pending_items = list(self.pending_migrations.items())
+
+        for request_id, (event, remote_address) in pending_items:
+            if event.query():
+                done.append((request_id, remote_address))
+
+        if not done:
+            return
+
+        for request_id, remote_address in done:
+            self._send_release_callback(request_id, remote_address)
+
+        with self.state_lock:
+            for request_id, _ in done:
+                self.pending_migrations.pop(request_id, None)
+                self.completed_recving_req_ids.add(request_id)
+
     def send_tensor(
         self,
         tensor_id: str,
@@ -210,6 +604,7 @@ class P2pNcclEngine:
         item = SendQueueItem(tensor_id=tensor_id,
                              remote_address=remote_address,
                              tensor=tensor)
+        self._mark_expected_tensor_id(tensor_id)
 
         if self.send_type == "PUT":
             return self.send_sync(item)
@@ -223,18 +618,24 @@ class P2pNcclEngine:
         # GET
         with self.send_store_cv:
             tensor_size = tensor.element_size() * tensor.numel()
+            wait_deadline = time.time() + self.request_completion_timeout_s
             while (self.buffer_size + tensor_size
                    > self.buffer_size_threshold):
-                oldest_tenser_id = next(iter(self.send_store))
-                oldest_tenser = self.send_store.pop(oldest_tenser_id)
-                oldest_tenser_size = oldest_tenser.element_size(
-                ) * oldest_tenser.numel()
-                self.buffer_size -= oldest_tenser_size
-                logger.info(
-                    "⛔[GET]Send to %s, tensor_id:%s, tensor_size:%d,"
-                    " buffer_size:%d, oldest_tenser_size:%d, rank:%d",
-                    remote_address, tensor_id, tensor_size, self.buffer_size,
-                    oldest_tenser_size, self.rank)
+                now = time.time()
+                remaining = wait_deadline - now
+                if remaining <= 0:
+                    logger.error(
+                        "🔴[GET]Send buffer timeout, tensor_id:%s, "
+                        "tensor_size:%d, buffer_size:%d, threshold:%d, "
+                        "rank:%d",
+                        tensor_id,
+                        tensor_size,
+                        self.buffer_size,
+                        int(self.buffer_size_threshold),
+                        self.rank,
+                    )
+                    return False
+                self.send_store_cv.wait(timeout=min(remaining, 0.1))
 
             self.send_store[tensor_id] = tensor
             self.buffer_size += tensor_size
@@ -284,24 +685,33 @@ class P2pNcclEngine:
         sock = self.socks[remote_address]
         comm, rank = self.comms[remote_address]
 
+        deadline = time.time() + self.get_retry_timeout_s
         data = {"cmd": "GET", "tensor_id": tensor_id}
-        sock.send(msgpack.dumps(data))
+        while True:
+            sock.send(msgpack.dumps(data))
 
-        message = sock.recv()
-        data = msgpack.loads(message)
-        if data["ret"] != 0:
-            logger.warning("🔴[GET]Recv From %s, tensor_id: %s, ret: %d",
-                           remote_address, tensor_id, data["ret"])
-            return None
+            message = sock.recv()
+            payload = msgpack.loads(message)
+            if payload["ret"] == 0:
+                with torch.cuda.stream(self.recv_stream):
+                    tensor = torch.empty(payload["shape"],
+                                         dtype=getattr(torch,
+                                                       payload["dtype"]),
+                                         device=self.device)
 
-        with torch.cuda.stream(self.recv_stream):
-            tensor = torch.empty(data["shape"],
-                                 dtype=getattr(torch, data["dtype"]),
-                                 device=self.device)
+                self.recv(comm, tensor, rank ^ 1, self.recv_stream)
+                self.have_received_tensor_id(tensor_id)
+                return tensor
 
-        self.recv(comm, tensor, rank ^ 1, self.recv_stream)
-
-        return tensor
+            if time.time() >= deadline:
+                logger.warning(
+                    "🔴[GET]Recv timeout from %s, tensor_id:%s, rank:%d",
+                    remote_address,
+                    tensor_id,
+                    self.rank,
+                )
+                return None
+            time.sleep(self.get_retry_interval_s)
 
     def listen_for_requests(self):
         while True:
@@ -323,6 +733,30 @@ class P2pNcclEngine:
                     logger.info("🤝ncclCommInitRank Success, %s👈%s, MyRank:%s",
                                 self.zmq_address, remote_address.decode(),
                                 rank)
+            elif data["cmd"] == "GET_IPC_METADATA":
+                payload = self._get_local_ipc_payload()
+                self.router_socket.send_multipart(
+                    [remote_address, msgpack.dumps(payload)])
+            elif data["cmd"] == "BRIDGE_POP":
+                request_id = data["request_id"]
+                with self.state_lock:
+                    context_block_ids = self.bridge_queue.pop(request_id, None)
+                payload: dict[str, Any]
+                if context_block_ids is None:
+                    payload = {"ret": 1}
+                else:
+                    payload = {
+                        "ret": 0,
+                        "context_block_ids": context_block_ids,
+                    }
+                self.router_socket.send_multipart(
+                    [remote_address, msgpack.dumps(payload)])
+            elif data["cmd"] == "RELEASE":
+                request_id = data["request_id"]
+                with self.state_lock:
+                    self.completed_release_req_ids.add(request_id)
+                self.router_socket.send_multipart(
+                    [remote_address, msgpack.dumps({"ret": 0})])
             elif data["cmd"] == "PUT":
                 tensor_id = data["tensor_id"]
                 try:
@@ -363,15 +797,13 @@ class P2pNcclEngine:
             elif data["cmd"] == "GET":
                 tensor_id = data["tensor_id"]
                 with self.send_store_cv:
-                    tensor = self.send_store.pop(tensor_id, None)
+                    tensor = self.send_store.get(tensor_id)
                     if tensor is not None:
                         data = {
                             "ret": 0,
                             "shape": tensor.shape,
                             "dtype": str(tensor.dtype).replace("torch.", "")
                         }
-                        # LRU
-                        self.send_store[tensor_id] = tensor
                         self.have_sent_tensor_id(tensor_id)
                     else:
                         data = {"ret": 1}
@@ -389,16 +821,103 @@ class P2pNcclEngine:
                     remote_address, data)
 
     def have_sent_tensor_id(self, tensor_id: str):
-        request_id = tensor_id.split('#')[0]
-        if request_id not in self.send_request_id_to_tensor_ids:
-            self.send_request_id_to_tensor_ids[request_id] = set()
-        self.send_request_id_to_tensor_ids[request_id].add(tensor_id)
+        request_id = self._request_id_from_tensor_id(tensor_id)
+        with self.state_lock:
+            if request_id not in self.send_request_id_to_tensor_ids:
+                self.send_request_id_to_tensor_ids[request_id] = set()
+            self.send_request_id_to_tensor_ids[request_id].add(tensor_id)
 
     def have_received_tensor_id(self, tensor_id: str):
-        request_id = tensor_id.split('#')[0]
-        if request_id not in self.recv_request_id_to_tensor_ids:
-            self.recv_request_id_to_tensor_ids[request_id] = set()
-        self.recv_request_id_to_tensor_ids[request_id].add(tensor_id)
+        request_id = self._request_id_from_tensor_id(tensor_id)
+        with self.state_lock:
+            if request_id not in self.recv_request_id_to_tensor_ids:
+                self.recv_request_id_to_tensor_ids[request_id] = set()
+            self.recv_request_id_to_tensor_ids[request_id].add(tensor_id)
+
+    @staticmethod
+    def _request_id_from_tensor_id(tensor_id: str) -> str:
+        return tensor_id.split('#')[0]
+
+    def _mark_expected_tensor_id(self, tensor_id: str) -> None:
+        request_id = self._request_id_from_tensor_id(tensor_id)
+        with self.state_lock:
+            if request_id not in self.expected_tensor_ids:
+                self.expected_tensor_ids[request_id] = set()
+            self.expected_tensor_ids[request_id].add(tensor_id)
+
+    def _request_is_transfer_complete(self,
+                                      request_id: str,
+                                      transfer_type: str) -> bool:
+        if transfer_type == "send":
+            expected = self.expected_tensor_ids.get(request_id, set())
+            done = self.send_request_id_to_tensor_ids.get(request_id, set())
+        else:
+            expected = self.expected_tensor_ids.get(request_id, set())
+            done = self.recv_request_id_to_tensor_ids.get(request_id, set())
+
+        # No expected tensor means no async transfer to wait for.
+        if not expected:
+            return True
+        return expected.issubset(done)
+
+    def _cleanup_request_state(self,
+                               request_id: str,
+                               no_compile_layers: Optional[Iterable[str]]
+                               ) -> None:
+        with self.state_lock:
+            tensor_ids = set()
+            tensor_ids.update(self.expected_tensor_ids.pop(request_id, set()))
+            tensor_ids.update(
+                self.send_request_id_to_tensor_ids.pop(request_id, set()))
+            tensor_ids.update(
+                self.recv_request_id_to_tensor_ids.pop(request_id, set()))
+            self.pending_sending_deadlines.pop(request_id, None)
+            self.pending_recving_deadlines.pop(request_id, None)
+            self.pending_release_deadlines.pop(request_id, None)
+            self.bridge_queue.pop(request_id, None)
+            self.pending_migrations.pop(request_id, None)
+            self.completed_recving_req_ids.discard(request_id)
+            self.completed_release_req_ids.discard(request_id)
+
+        if no_compile_layers:
+            for layer_name in no_compile_layers:
+                tensor_ids.add(request_id + "#" + layer_name)
+
+        request_prefix = request_id + "#"
+
+        with self.send_store_cv:
+            if self.send_type == "GET":
+                if not tensor_ids:
+                    tensor_ids.update(
+                        tensor_id for tensor_id in self.send_store
+                        if tensor_id.startswith(request_prefix))
+                freed_size = 0
+                for tensor_id in list(tensor_ids):
+                    tensor = self.send_store.pop(tensor_id, None)
+                    if tensor is None:
+                        continue
+                    freed_size += tensor.element_size() * tensor.numel()
+                if freed_size > 0:
+                    self.buffer_size = max(0, self.buffer_size - freed_size)
+                self.send_store_cv.notify_all()
+
+        with self.recv_store_cv:
+            if not tensor_ids:
+                tensor_ids.update(tensor_id for tensor_id in self.recv_store
+                                  if tensor_id.startswith(request_prefix))
+            for tensor_id in list(tensor_ids):
+                tensor = self.recv_store.pop(tensor_id, None)
+                if isinstance(tensor, tuple) and self.pool is not None:
+                    addr, _, _ = tensor
+                    self.pool.free(addr)
+            self.recv_store_cv.notify_all()
+
+        with self.send_queue_cv:
+            if hasattr(self, "send_queue") and self.send_queue:
+                self.send_queue = deque(
+                    item for item in self.send_queue
+                    if not item.tensor_id.startswith(request_prefix))
+                self.send_queue_cv.notify_all()
 
     def send_async(self):
         while True:
@@ -451,11 +970,69 @@ class P2pNcclEngine:
             return False
 
         self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
-
-        if self.send_type == "PUT_ASYNC":
-            self.have_sent_tensor_id(item.tensor_id)
+        self.have_sent_tensor_id(item.tensor_id)
 
         return True
+
+    def _get_finished_block_mode(
+            self, finished_req_ids: set[str], no_compile_layers
+    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        self._poll_completed_migrations()
+
+        now = time.time()
+        finished_sending: set[str] = set()
+        finished_recving: set[str] = set()
+
+        with self.state_lock:
+            if self.completed_recving_req_ids:
+                finished_recving.update(self.completed_recving_req_ids)
+                self.completed_recving_req_ids.clear()
+
+            if self.config.is_kv_producer:
+                # Producer can free blocks only after decode confirms migration
+                # completion via release callback.
+                for request_id in finished_req_ids:
+                    if request_id in self.completed_release_req_ids:
+                        finished_sending.add(request_id)
+                        self.completed_release_req_ids.discard(request_id)
+                        self.pending_release_deadlines.pop(request_id, None)
+                    elif request_id not in self.pending_release_deadlines:
+                        self.pending_release_deadlines[
+                            request_id] = now + self.request_completion_timeout_s
+
+                for request_id, deadline in list(
+                        self.pending_release_deadlines.items()):
+                    if request_id in self.completed_release_req_ids:
+                        finished_sending.add(request_id)
+                        self.completed_release_req_ids.discard(request_id)
+                        self.pending_release_deadlines.pop(request_id, None)
+                    elif now >= deadline:
+                        logger.warning(
+                            "⚠️KV release callback timeout, request_id:%s, "
+                            "rank:%d; keep waiting to avoid dropping "
+                            "unreleased direct-migrate KV", request_id,
+                            self.rank)
+                        # Keep waiting for decode release callback. Do not
+                        # mark sending finished here, otherwise producer may
+                        # free/reuse blocks before decode migration consumes
+                        # them.
+                        self.pending_release_deadlines[
+                            request_id] = now + self.request_completion_timeout_s
+
+                pending_sending = set(self.pending_release_deadlines.keys())
+            else:
+                # Consumer does not wait for release callbacks and should not
+                # report finished_sending from timeout paths.
+                self.pending_release_deadlines.clear()
+                self.completed_release_req_ids.clear()
+                pending_sending = set()
+
+        cleanup_req_ids = (set(finished_req_ids) - pending_sending
+                           ) | finished_sending | finished_recving
+        for request_id in cleanup_req_ids:
+            self._cleanup_request_state(request_id, no_compile_layers)
+
+        return finished_sending or None, finished_recving or None
 
     def get_finished(
             self, finished_req_ids: set[str], no_compile_layers
@@ -471,26 +1048,77 @@ class P2pNcclEngine:
             call to this method (this call or a prior one).
         """
 
-        # Clear the buffer upon request completion.
-        for request_id in finished_req_ids:
-            for layer_name in no_compile_layers:
-                tensor_id = request_id + "#" + layer_name
-                if tensor_id in self.recv_store:
-                    with self.recv_store_cv:
-                        tensor = self.recv_store.pop(tensor_id, None)
-                        self.send_request_id_to_tensor_ids.pop(
-                            request_id, None)
-                        self.recv_request_id_to_tensor_ids.pop(
-                            request_id, None)
-                    if isinstance(tensor, tuple):
-                        addr, _, _ = tensor
-                        self.pool.free(addr)
+        if self.direct_block_mode:
+            return self._get_finished_block_mode(finished_req_ids,
+                                                 no_compile_layers)
 
-        # TODO:Retrieve requests that have already sent the KV cache.
+        now = time.time()
         finished_sending: set[str] = set()
-
-        # TODO:Retrieve requests that have already received the KV cache.
         finished_recving: set[str] = set()
+
+        with self.state_lock:
+            for request_id in finished_req_ids:
+                if (request_id in self.expected_tensor_ids
+                        and request_id not in self.pending_sending_deadlines):
+                    self.pending_sending_deadlines[
+                        request_id] = now + self.request_completion_timeout_s
+
+                if (request_id in self.recv_request_id_to_tensor_ids
+                        and request_id not in self.pending_recving_deadlines):
+                    self.pending_recving_deadlines[
+                        request_id] = now + self.request_completion_timeout_s
+
+            for request_id, deadline in list(
+                    self.pending_sending_deadlines.items()):
+                if self._request_is_transfer_complete(request_id, "send"):
+                    finished_sending.add(request_id)
+                    self.pending_sending_deadlines.pop(request_id, None)
+                elif now >= deadline:
+                    sent = len(
+                        self.send_request_id_to_tensor_ids.get(request_id,
+                                                              set()))
+                    expected = len(self.expected_tensor_ids.get(request_id,
+                                                                set()))
+                    logger.warning(
+                        "⚠️KV send completion timeout, request_id:%s, "
+                        "sent:%d expected:%d, rank:%d",
+                        request_id,
+                        sent,
+                        expected,
+                        self.rank,
+                    )
+                    finished_sending.add(request_id)
+                    self.pending_sending_deadlines.pop(request_id, None)
+
+            for request_id, deadline in list(
+                    self.pending_recving_deadlines.items()):
+                if self._request_is_transfer_complete(request_id, "recv"):
+                    finished_recving.add(request_id)
+                    self.pending_recving_deadlines.pop(request_id, None)
+                elif now >= deadline:
+                    recved = len(
+                        self.recv_request_id_to_tensor_ids.get(request_id,
+                                                              set()))
+                    expected = len(self.expected_tensor_ids.get(request_id,
+                                                                set()))
+                    logger.warning(
+                        "⚠️KV recv completion timeout, request_id:%s, "
+                        "recved:%d expected:%d, rank:%d",
+                        request_id,
+                        recved,
+                        expected,
+                        self.rank,
+                    )
+                    finished_recving.add(request_id)
+                    self.pending_recving_deadlines.pop(request_id, None)
+
+            pending_sending = set(self.pending_sending_deadlines.keys())
+
+        # Keep producer-side KV tensors until migration/pull is acknowledged.
+        cleanup_req_ids = (set(finished_req_ids) - pending_sending
+                           ) | finished_sending | finished_recving
+        for request_id in cleanup_req_ids:
+            self._cleanup_request_state(request_id, no_compile_layers)
 
         return finished_sending or None, finished_recving or None
 
@@ -535,8 +1163,11 @@ class P2pNcclEngine:
         stream.synchronize()
 
     def close(self) -> None:
+        if self.cuda_rt is not None:
+            for remote_address in list(self.remote_ipc_ptrs.keys()):
+                self._invalidate_remote_kv_views(remote_address)
         self._listener_thread.join()
-        if self.send_type == "PUT_ASYNC":
+        if self.send_type == "PUT_ASYNC" and hasattr(self, "_send_thread"):
             self._send_thread.join()
         if self._ping_thread is not None:
             self._ping_thread.join()

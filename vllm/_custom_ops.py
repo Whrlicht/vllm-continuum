@@ -1633,6 +1633,21 @@ def concat_and_cache_mla(
                                                 scale)
 
 
+def get_cuda_view_from_ptr_like(device_ptr: int,
+                                like_tensor: torch.Tensor) -> torch.Tensor:
+    return torch.ops._C.get_cuda_view_from_ptr_like(device_ptr, like_tensor)
+
+
+def get_cuda_view_from_ptr_shape_stride(
+    device_ptr: int,
+    sizes: list[int],
+    strides: list[int],
+    like_tensor: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.get_cuda_view_from_ptr_shape_stride(
+        device_ptr, sizes, strides, like_tensor)
+
+
 def copy_blocks(key_caches: list[torch.Tensor],
                 value_caches: list[torch.Tensor],
                 block_mapping: torch.Tensor) -> None:
@@ -1642,6 +1657,15 @@ def copy_blocks(key_caches: list[torch.Tensor],
 def copy_blocks_mla(kv_caches: list[torch.Tensor],
                     block_mapping: torch.Tensor) -> None:
     torch.ops._C_cache_ops.copy_blocks_mla(kv_caches, block_mapping)
+
+
+def migrate_kv_cache_blocks(dst_cache: torch.Tensor, src_cache: torch.Tensor,
+                            src_block_ids: torch.Tensor,
+                            dst_block_ids: torch.Tensor,
+                            block_dim: int) -> None:
+    torch.ops._C_cache_ops.migrate_kv_cache_blocks(dst_cache, src_cache,
+                                                   src_block_ids,
+                                                   dst_block_ids, block_dim)
 
 
 def swap_blocks(src: torch.Tensor, dst: torch.Tensor,

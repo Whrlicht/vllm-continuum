@@ -101,6 +101,9 @@ class Sampler(nn.Module):
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
+
+        
+
         # Convert sampled token ids to int64 (long) type to ensure compatibility
         # with subsequent operations that may use these values as indices.
         # This conversion is necessary because FlashInfer sampling operations

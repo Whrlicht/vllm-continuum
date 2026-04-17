@@ -217,6 +217,10 @@ class SamplingParams(
     generated token can complete the sequence."""
     _bad_words_token_ids: Optional[list[list[int]]] = None
 
+    # trace replay
+    trace_replay: bool = False
+    traj_id: Optional[str] = None
+
     @staticmethod
     def from_optional(
         n: Optional[int] = 1,

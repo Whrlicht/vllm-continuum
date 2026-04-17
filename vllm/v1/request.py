@@ -14,6 +14,9 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreRequest, FinishReason)
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
+from vllm.trace_replay.store import get_trace_store
+
+TRACE_STORE = get_trace_store()
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
@@ -22,9 +25,36 @@ if TYPE_CHECKING:
 
 class Request:
 
+    @staticmethod
+    def _parse_non_negative_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if value.is_integer() and value >= 0:
+                return int(value)
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isdigit():
+                return int(stripped)
+        return None
+
+    @classmethod
+    def _extract_agent_round(cls, extra_args: Mapping[str, Any]) -> Optional[int]:
+        # Accept multiple keys for compatibility with existing clients.
+        for key in ("agent_round", "assistant_round",
+                    "trace_replay_assistant_round"):
+            parsed = cls._parse_non_negative_int(extra_args.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
     def __init__(
         self,
         job_id: Optional[str] = None,
+        proxy_request_id: Optional[str] = None,
         request_id: str = "",
         prompt_token_ids: list[int] = [],
         sampling_params: Optional[SamplingParams] = None,
@@ -43,15 +73,37 @@ class Request:
         last_func_call: Optional[str] = None,
         is_last_step: Optional[bool] = None,
         this_func_call: Optional[str] = None,
+        agent_round: Optional[int] = None,
+        trace_replay_token_ids: Optional[list[int]] = None,
     ) -> None:
     # TODO (Hanchen) need to input job_id, last_func_call, is_last_step, this_func_call from the API request
         self.job_id = job_id
+        self.proxy_request_id = proxy_request_id
         # NOTE (Hanchen) this i s used for emulation, we have other ways to get this information in real experiment
 
         self.last_func_call = last_func_call
         self.is_last_step = is_last_step
         self.this_func_call = this_func_call
+        self.agent_round = agent_round if agent_round is not None else 0
         
+        # trace replay
+        self.trace_replay_enabled = bool(
+            sampling_params.trace_replay if sampling_params is not None else False
+        )
+        self.traj_id = sampling_params.traj_id if sampling_params is not None else None
+        self.trace_pos = 0
+        self.trace_finished = False
+
+        if self.trace_replay_enabled:
+            if trace_replay_token_ids is not None:
+                self.trace_token_ids = list(trace_replay_token_ids)
+            else:
+                if not self.traj_id:
+                    raise ValueError(
+                        "trace_replay=true requires a non-empty traj_id")
+                self.trace_token_ids = TRACE_STORE.get_trace(self.traj_id)
+        else:
+            self.trace_token_ids = None
         
         self.request_id = request_id  
         self.client_index = client_index
@@ -139,19 +191,27 @@ class Request:
     ) -> "Request":
         # Extract optional job/function-call metadata from sampling_params.extra_args
         job_id = None
+        proxy_request_id = None
         last_func_call = None
         is_last_step = None
         this_func_call = None
+        agent_round = None
         if request.sampling_params is not None and \
                 request.sampling_params.extra_args is not None:
             extra_args = request.sampling_params.extra_args
             job_id = extra_args.get("job_id")
+            proxy_request_id = extra_args.get("proxy_request_id")
             last_func_call = extra_args.get("last_func_call")
             is_last_step = extra_args.get("is_last_step")
             this_func_call = extra_args.get("this_func_call")
+            agent_round = cls._extract_agent_round(extra_args)
+            trace_replay_token_ids = extra_args.get("trace_replay_token_ids")
+        else:
+            trace_replay_token_ids = None
 
         return cls(
             job_id=job_id,
+            proxy_request_id=proxy_request_id,
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -171,6 +231,8 @@ class Request:
             last_func_call=last_func_call,
             is_last_step=is_last_step,
             this_func_call=this_func_call,
+            agent_round=agent_round,
+            trace_replay_token_ids=trace_replay_token_ids,
         )
 
     def append_output_token_ids(
@@ -186,6 +248,19 @@ class Request:
 
         if self.get_hash_new_full_blocks is not None:
             self.block_hashes.extend(self.get_hash_new_full_blocks())
+
+    def pop_next_trace_token(self) -> int:
+        if not self.trace_replay_enabled or self.trace_token_ids is None:
+            raise RuntimeError("Trace replay is not enabled for this request")
+        if self.trace_pos >= len(self.trace_token_ids):
+            self.trace_finished = True
+            raise IndexError("No more trace tokens available")
+
+        token_id = self.trace_token_ids[self.trace_pos]
+        self.trace_pos += 1
+        if self.trace_pos >= len(self.trace_token_ids):
+            self.trace_finished = True
+        return token_id
 
     @property
     def is_output_corrupted(self) -> bool:

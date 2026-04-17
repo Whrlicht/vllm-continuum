@@ -164,6 +164,11 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
                         torch::Tensor const& page_table, double scale);
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
+torch::Tensor get_cuda_view_from_ptr_like(int64_t device_ptr,
+                                          torch::Tensor& like_tensor);
+torch::Tensor get_cuda_view_from_ptr_shape_stride(
+    int64_t device_ptr, const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& strides, torch::Tensor& like_tensor);
 
 #ifndef USE_ROCM
 

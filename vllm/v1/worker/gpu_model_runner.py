@@ -52,6 +52,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors, PoolerOutput
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
+from vllm.trace_replay.store import get_trace_store
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, check_use_alibi, get_dtype_size,
                         is_pin_memory_available, round_up, supports_dynamo)
@@ -222,6 +223,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.trace_store = get_trace_store()
 
         self.eplb_state: Optional[EplbState] = None
         """
@@ -1900,6 +1902,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
+        self._apply_trace_replay_to_sampled_ids(
+            sampler_output.sampled_token_ids,
+            discard_sampled_tokens_req_indices,
+        )
+
         # Copy some objects so they don't get modified after returning.
         # This is important when using async scheduling.
         req_ids_output_copy = self.input_batch.req_ids.copy()
@@ -1995,6 +2002,75 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
             invalid_req_indices,
         )
+
+    def _apply_trace_replay_to_sampled_ids(
+        self,
+        sampled_token_ids: torch.Tensor,
+        discard_sampled_tokens_req_indices: list[int],
+    ) -> None:
+        if sampled_token_ids.numel() == 0:
+            return
+
+        max_gen_len = sampled_token_ids.shape[-1]
+        if max_gen_len <= 0:
+            return
+
+        discard_set = set(discard_sampled_tokens_req_indices)
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_idx in discard_set:
+                continue
+
+            req_state = self.requests[req_id]
+            sampling_params = req_state.sampling_params
+            if sampling_params is None or not sampling_params.trace_replay:
+                continue
+
+            traj_id = sampling_params.traj_id
+            if not traj_id:
+                raise ValueError(
+                    "trace_replay=true requires non-empty traj_id")
+
+            trace_token_ids: Optional[list[int]] = None
+            extra_args = sampling_params.extra_args or {}
+            if "trace_replay_token_ids" in extra_args:
+                from_request = extra_args.get("trace_replay_token_ids")
+                if isinstance(from_request, list):
+                    trace_token_ids = from_request
+                elif isinstance(from_request, tuple):
+                    trace_token_ids = [int(t) for t in from_request]
+                elif isinstance(from_request, np.ndarray):
+                    trace_token_ids = [int(t) for t in from_request.tolist()]
+                elif isinstance(from_request, torch.Tensor):
+                    trace_token_ids = [int(t) for t in from_request.tolist()]
+                else:
+                    raise ValueError(
+                        "trace_replay_token_ids must be a sequence of ints; "
+                        f"got type={type(from_request).__name__}")
+            else:
+                # Fallback for legacy path where worker reads directly
+                # from trace store.
+                trace_token_ids = self.trace_store.get_trace(traj_id)
+
+            start_pos = len(req_state.output_token_ids)
+            trace_len = len(trace_token_ids)
+
+            # Do not fail the worker when trace is exhausted. Scheduler-side
+            # request.pop_next_trace_token() handles graceful stop with
+            # stop_reason=trace_replay_end.
+            if start_pos >= trace_len:
+                continue
+
+            end_pos = min(start_pos + max_gen_len, trace_len)
+            num_forced = end_pos - start_pos
+            if num_forced <= 0:
+                continue
+
+            forced_ids = torch.tensor(
+                trace_token_ids[start_pos:end_pos],
+                dtype=sampled_token_ids.dtype,
+                device=sampled_token_ids.device,
+            )
+            sampled_token_ids[req_idx, :num_forced] = forced_ids
 
     @torch.inference_mode()
     def execute_model(

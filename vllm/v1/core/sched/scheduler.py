@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import itertools
+import math
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -30,6 +32,7 @@ from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.monitoring import monitoring_recorder
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -39,7 +42,67 @@ from vllm.v1.core.estimate_with_func import ToolCallEstimator, Continuum_Recorde
 logger = init_logger(__name__)
 
 
+def _sanitize_output_tag(value: str) -> str:
+    sanitized = "".join(
+        ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_"
+        for ch in value
+    )
+    sanitized = sanitized.strip("_")
+    return sanitized or "instance"
+
+
+def _resolve_instance_output_dir(vllm_config: VllmConfig) -> str:
+    configured_output_dir = os.environ.get("RUN_OUTPUT_DIR")
+    if configured_output_dir:
+        return configured_output_dir
+
+    base_output_dir = "./continuum_exp"
+    explicit_tag = os.environ.get("CONTINUUM_INSTANCE_TAG")
+    if explicit_tag:
+        return os.path.join(base_output_dir, _sanitize_output_tag(explicit_tag))
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return base_output_dir
+
+    role_map = {
+        "kv_producer": "prefill",
+        "kv_consumer": "decode",
+        "kv_both": "both",
+    }
+    role = role_map.get(kv_transfer_config.kv_role,
+                        kv_transfer_config.kv_role or "single")
+    http_port = kv_transfer_config.get_from_extra_config("http_port", None)
+    if http_port is not None:
+        tag = f"{role}_{http_port}"
+    else:
+        engine_id = kv_transfer_config.engine_id or "engine"
+        tag = f"{role}_{engine_id}"
+
+    return os.path.join(base_output_dir, _sanitize_output_tag(tag))
+
+
+def _resolve_instance_role(vllm_config: VllmConfig) -> str:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return "single"
+
+    role_map = {
+        "kv_producer": "prefill",
+        "kv_consumer": "decode",
+        "kv_both": "both",
+    }
+    return role_map.get(kv_transfer_config.kv_role,
+                        kv_transfer_config.kv_role or "single")
+
+
 class Scheduler(SchedulerInterface):
+
+    # LICHT prefill dynamic-priority parameters.
+    # Update these constants directly if you need to retune the strategy.
+    LICHT_PREFILL_SCORE_A = 3.0
+    LICHT_PREFILL_SCORE_B = 1.0
+    LICHT_PREFILL_SCORE_TMAX_S = 2.0
 
     def __init__(
         self,
@@ -50,7 +113,6 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
-        self.continuum_recorder = Continuum_Recorder()
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
@@ -61,6 +123,13 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+
+        self.continuum_recorder = Continuum_Recorder()
+        output_dir = _resolve_instance_output_dir(vllm_config)
+        self.continuum_recorder.set_output_dir(output_dir)
+        monitoring_recorder.set_output_dir(output_dir)
+        os.environ["RUN_OUTPUT_DIR"] = output_dir
+        logger.info("Continuum timestamps output dir: %s", output_dir)
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -126,6 +195,30 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # LICHT is a global algorithm switch. For now it only changes
+        # scheduler behavior; KV transfer strategy remains default.
+        self.instance_role = _resolve_instance_role(vllm_config)
+        self.licht_enabled = self.scheduler_config.licht
+        self.licht_prefill_sched_enabled = (self.licht_enabled
+                                            and self.instance_role != "decode")
+        self.licht_decode_fcfs_enabled = (self.licht_enabled
+                                          and self.instance_role == "decode")
+        self.licht_waiting_round_start_ts: dict[str, float] = {}
+        if self.licht_enabled:
+            logger.info(
+                "LICHT mode enabled (instance_role=%s). "
+                "KV transfer strategy currently uses default implementation.",
+                self.instance_role,
+            )
+            if self.licht_prefill_sched_enabled:
+                logger.info(
+                    "LICHT prefill scheduler params: a=%.1f, b=%.1f, "
+                    "Tmax=%.1fs",
+                    self.LICHT_PREFILL_SCORE_A,
+                    self.LICHT_PREFILL_SCORE_B,
+                    self.LICHT_PREFILL_SCORE_TMAX_S,
+                )
 
         # Initialize ToolCallEstimator with tokenizer config
         self.tool_call_estimator = ToolCallEstimator(
@@ -260,6 +353,90 @@ class Scheduler(SchedulerInterface):
             if req.job_id == request.job_id:
                 return True
         return False
+
+    def _reset_licht_waiting_state(
+        self,
+        request: Request,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        if not self.licht_enabled:
+            return
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        self.licht_waiting_round_start_ts[request.request_id] = now_monotonic
+
+    def _drop_licht_waiting_state(self, request_id: str) -> None:
+        if not self.licht_enabled:
+            return
+        self.licht_waiting_round_start_ts.pop(request_id, None)
+
+    def _ensure_licht_waiting_start_timestamps(self) -> None:
+        if not self.licht_prefill_sched_enabled:
+            return
+        now_monotonic = time.monotonic()
+        for req in self.waiting:
+            req_id = req.request_id
+            self.licht_waiting_round_start_ts.setdefault(req_id,
+                                                         now_monotonic)
+
+    def _compute_licht_prefill_score(
+        self,
+        request: Request,
+        now_monotonic: float,
+    ) -> float:
+        # k_i is the request's real agent/dialog round from API metadata.
+        ki = max(request.agent_round, 0)
+        wait_start = self.licht_waiting_round_start_ts.get(
+            request.request_id,
+            now_monotonic,
+        )
+        twait = max(now_monotonic - wait_start, 0.0)
+        wait_term = min(twait / self.LICHT_PREFILL_SCORE_TMAX_S, 1.0)
+        return (self.LICHT_PREFILL_SCORE_A * math.log1p(ki)
+                + self.LICHT_PREFILL_SCORE_B * wait_term)
+
+    def _peek_waiting_request(self) -> Request:
+        if self.licht_prefill_sched_enabled:
+            now_monotonic = time.monotonic()
+            return max(
+                self.waiting,
+                key=lambda req: (
+                    self._compute_licht_prefill_score(req, now_monotonic),
+                    -req.arrival_time,
+                    req.request_id,
+                ),
+            )
+
+        if self.licht_decode_fcfs_enabled:
+            return min(
+                self.waiting,
+                key=lambda req: (req.arrival_time, req.request_id),
+            )
+
+        if self.policy == SchedulingPolicy.FCFS:
+            return self.waiting.peek_request()
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return self.waiting.peek_request()
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            return self.waiting.peek_request(self.pinned_requests,
+                                             self.kv_cache_manager,
+                                             self.connector)
+
+        raise ValueError(f"Invalid policy: {self.policy}")
+
+    def _pop_waiting_request(self, request: Request) -> None:
+        # LICHT custom selection may not choose queue head, so remove by object.
+        if self.licht_prefill_sched_enabled or self.licht_decode_fcfs_enabled:
+            self.waiting.remove_request(request)
+            return
+
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            self.waiting.pop_request(self.pinned_requests,
+                                     self.kv_cache_manager,
+                                     self.connector)
+            return
+
+        self.waiting.pop_request()
     
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -400,6 +577,7 @@ class Scheduler(SchedulerInterface):
                                 EngineCoreEventType.PREEMPTED, scheduled_timestamp)
 
                         self.waiting.prepend_request(preempted_req)
+                        self._reset_licht_waiting_state(preempted_req)
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
                             # No more request to preempt.
@@ -456,20 +634,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         # TODO (Hanchen) need to add scheduling logic for returns from functions. It should not be FCFS
         if not preempted_reqs:
+            self._ensure_licht_waiting_start_timestamps()
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
-                
-                # TODO (Hanchen) this is currently peeking FCFS or priority, we can change this to something else.
-                if self.policy == SchedulingPolicy.FCFS:
-                    request = self.waiting.peek_request()
-                elif self.policy == SchedulingPolicy.PRIORITY:
-                    request = self.waiting.peek_request()
-                elif self.policy == SchedulingPolicy.CONTINUUM:
-                    #The current implementation is basically giving priority to jobs with less prefill tokens.
-                    request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector)
-                else:
-                    raise ValueError(f"Invalid policy: {self.policy}")
+
+                request = self._peek_waiting_request()
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -480,10 +650,7 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
-                        else:
-                            self.waiting.pop_request()
+                        self._pop_waiting_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -494,10 +661,7 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
-                        else:
-                            self.waiting.pop_request()
+                        self._pop_waiting_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -507,7 +671,7 @@ class Scheduler(SchedulerInterface):
                     (len(scheduled_loras) == self.lora_config.max_loras and
                      request.lora_request.lora_int_id not in scheduled_loras)):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
+                    self._pop_waiting_request(request)
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
@@ -535,7 +699,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self.waiting.pop_request()
+                            self._pop_waiting_request(request)
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
@@ -572,7 +736,7 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if not self.scheduler_config.chunked_prefill_enabled and \
                         num_new_tokens > token_budget:
-                        self.waiting.pop_request()
+                        self._pop_waiting_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -652,8 +816,8 @@ class Scheduler(SchedulerInterface):
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
-
-                self.waiting.remove_request(request)
+                self._pop_waiting_request(request)
+                self._drop_licht_waiting_state(request.request_id)
 
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -1202,16 +1366,26 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
-        for num_new, output_token_id in enumerate(new_token_ids, 1):
+        emitted_token_ids: list[int] = []
+        for output_token_id in new_token_ids:
+            if request.trace_replay_enabled:
+                try:
+                    output_token_id = request.pop_next_trace_token()
+                except IndexError:
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.stop_reason = "trace_replay_end"
+                    stopped = True
+                    break
+
             request.append_output_token_ids(output_token_id)
+            emitted_token_ids.append(output_token_id)
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
             if stopped:
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
-        return new_token_ids, stopped
+        return emitted_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
         cached_encoder_input_ids = (
@@ -1278,6 +1452,7 @@ class Scheduler(SchedulerInterface):
         if request.job_id not in self.running_job_id_first_entry_time:
             self.running_job_id_first_entry_time[request.job_id] = request.arrival_time
         self.waiting.add_request(request)
+        self._reset_licht_waiting_state(request)
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
@@ -1330,6 +1505,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.tool_call_estimator.request_finished(request)
         self.continuum_recorder.request_finished(request)
+        self._drop_licht_waiting_state(request.request_id)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
@@ -1386,6 +1562,22 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        num_waiting_for_remote_kvs = sum(
+            1 for req in self.waiting
+            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS)
+        num_preempted = sum(
+            1 for req in self.waiting
+            if req.status == RequestStatus.PREEMPTED)
+        monitoring_recorder.record_scheduler_stats(
+            timestamp=time.time(),
+            num_running=len(self.running),
+            num_waiting=len(self.waiting),
+            num_waiting_for_remote_kvs=num_waiting_for_remote_kvs,
+            num_preempted=num_preempted,
+            kv_cache_usage=self.kv_cache_manager.usage,
+            prefix_cache_queries=prefix_cache_stats.queries,
+            prefix_cache_hits=prefix_cache_stats.hits,
+        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -1412,7 +1604,16 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        self.continuum_recorder.print_history()
+        try:
+            self.continuum_recorder.print_history()
+        except Exception:
+            logger.exception("Failed to dump scheduler_timestamps")
+
+        try:
+            monitoring_recorder.dump()
+        except Exception:
+            logger.exception("Failed to dump monitoring_timestamps")
+
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

@@ -21,6 +21,7 @@ from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
                                    RequestStateStats)
+from vllm.v1.metrics.monitoring import monitoring_recorder
 
 
 class RequestOutputCollector:
@@ -458,6 +459,8 @@ class OutputProcessor:
                     self.do_tracing(engine_core_output, req_state,
                                     iteration_stats)
         self.lora_states.update_iteration_stats(iteration_stats)
+        if iteration_stats is not None:
+            monitoring_recorder.record_iteration_stats(iteration_stats)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
@@ -551,6 +554,11 @@ class OutputProcessor:
             num_prompt_tokens=len(req_state.prompt_token_ids),
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats)
+        monitoring_recorder.record_finished_request(
+            req_state,
+            finish_reason,
+            iteration_stats.iteration_timestamp,
+        )
         self.lora_states.finish_request(req_state)
 
         ParentRequest.observe_finished_request(

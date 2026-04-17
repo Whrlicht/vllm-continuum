@@ -25,7 +25,7 @@ class ContextLengthExceededError(Exception):
 @dataclass
 class VllmModelConfig:
     model_name: str = "meta-llama/Llama-3.1-70B-Instruct"
-    base_url: str = "http://localhost:8100/v1"
+    base_url: str = "http://localhost:8003/v1"
     api_key: str = "EMPTY"  # vLLM doesn't require API key
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     job_id: int = 0  # Instance/job ID for tracking

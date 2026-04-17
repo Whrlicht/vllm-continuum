@@ -43,6 +43,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
+from vllm.v1.metrics.monitoring import monitoring_recorder
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
@@ -259,6 +260,7 @@ class AsyncLLM(EngineClient):
             engine_core.shutdown()
 
         cancel_task_threadsafe(getattr(self, "output_handler", None))
+        monitoring_recorder.dump()
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return await self.engine_core.get_supported_tasks_async()

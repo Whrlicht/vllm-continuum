@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -34,15 +35,22 @@ class ReqMeta:
     block_ids: torch.Tensor
     # Request num tokens
     num_tokens: int
+    # Optional explicit remote endpoints.
+    remote_prefill_address: Optional[str] = None
+    remote_decode_address: Optional[str] = None
 
     @staticmethod
     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
-                  block_size: int) -> "ReqMeta":
+                  block_size: int,
+                  remote_prefill_address: Optional[str] = None,
+                  remote_decode_address: Optional[str] = None) -> "ReqMeta":
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
             block_ids=block_ids_tensor,
             num_tokens=len(token_ids),
+            remote_prefill_address=remote_prefill_address,
+            remote_decode_address=remote_decode_address,
         )
 
 
@@ -59,9 +67,18 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         token_ids: list[int],
         block_ids: list[int],
         block_size: int,
+        remote_prefill_address: Optional[str] = None,
+        remote_decode_address: Optional[str] = None,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size))
+            ReqMeta.make_meta(
+                request_id,
+                token_ids,
+                block_ids,
+                block_size,
+                remote_prefill_address,
+                remote_decode_address,
+            ))
 
 
 class P2pNcclConnector(KVConnectorBase_V1):
@@ -72,7 +89,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._requests_need_load: dict[str, Any] = {}
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
+        self.send_type = str(
+            self.config.get_from_extra_config("send_type",
+                                              "PUT_ASYNC")).upper()
+        self.direct_block_mode = self.send_type in {
+            "BLOCK_MIGRATE", "BLOCK_DIRECT", "DISTSERVE"
+        }
         self.chunked_prefill: dict[str, Any] = {}
+        self._pending_bridge_reqs: list[tuple[str, list[int]]] = []
+        self._pending_failed_block_migrations: dict[
+            str, tuple[list[int], list[int], str]
+        ] = {}
 
         self._rank = get_world_group().rank \
             if role == KVConnectorRole.WORKER else 0
@@ -90,6 +117,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
     # Worker-side methods
     # ==============================
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if self.p2p_nccl_engine is not None:
+            self.p2p_nccl_engine.register_kv_caches(kv_caches)
+
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -104,11 +135,78 @@ class P2pNcclConnector(KVConnectorBase_V1):
             the same.
         """
 
-        # Only consumer/decode loads KV Cache
-        if self.is_producer:
+        assert self.p2p_nccl_engine is not None
+
+        metadata: KVConnectorMetadata = self._get_connector_metadata()
+        assert isinstance(metadata, P2pNcclConnectorMetadata)
+
+        if self.direct_block_mode:
+            if self.is_producer:
+                # Bridge publication must happen after prefill forward.
+                self._pending_bridge_reqs.extend((
+                    req.request_id,
+                    [int(x) for x in req.block_ids.tolist()],
+                ) for req in metadata.requests)
+                return
+
+            for req_meta in metadata.requests:
+                remote_address = req_meta.remote_prefill_address
+                if remote_address is None:
+                    ip, port = self.parse_request_id(req_meta.request_id,
+                                                     is_prefill=False)
+                    remote_address = f"{ip}:{port + self._rank}"
+
+                decoding_block_ids = [int(x) for x in req_meta.block_ids.tolist()]
+                pending_migration = self._pending_failed_block_migrations.get(
+                    req_meta.request_id)
+
+                if pending_migration is not None:
+                    context_block_ids, pending_decoding_block_ids, \
+                        pending_remote_address = pending_migration
+                    if pending_remote_address != remote_address:
+                        logger.warning(
+                            "⚠️[BLOCK]Remote address changed while retrying "
+                            "migration for req:%s, old:%s, new:%s",
+                            req_meta.request_id,
+                            pending_remote_address,
+                            remote_address,
+                        )
+                    remote_address = pending_remote_address
+                    decoding_block_ids = pending_decoding_block_ids
+                else:
+                    context_block_ids = self.p2p_nccl_engine.pop_bridge_request(
+                        req_meta.request_id,
+                        remote_address,
+                        timeout_s=0.0,
+                    )
+                    if context_block_ids is None:
+                        # Metadata may not be staged yet on producer side.
+                        # Keep waiting-for-remote-kv state and retry next step.
+                        continue
+
+                migrated = self.p2p_nccl_engine.launch_block_migration(
+                    req_meta.request_id,
+                    context_block_ids,
+                    decoding_block_ids,
+                    remote_address,
+                )
+                if migrated:
+                    self._pending_failed_block_migrations.pop(
+                        req_meta.request_id, None)
+                else:
+                    # Keep request in waiting-for-remote-kv and retry next step
+                    # with the same bridge metadata.
+                    self._pending_failed_block_migrations[req_meta.request_id] = (
+                        context_block_ids,
+                        decoding_block_ids,
+                        remote_address,
+                    )
             return
 
-        assert self.p2p_nccl_engine is not None
+        # Legacy layer-wise GET/PUT path.
+        # Only consumer/decode loads KV Cache.
+        if self.is_producer:
+            return
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -168,16 +266,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         "num_block:%d, request_id:%s", len(block_ids),
                         num_block, request_id)
 
-        # Get the metadata
-        metadata: KVConnectorMetadata = \
-            self._get_connector_metadata()
-        assert isinstance(metadata, P2pNcclConnectorMetadata)
-
-        if metadata is None:
-            return
-
         # Load the KV for each request each layer
         for request in metadata.requests:
+            ip, port = self.parse_request_id(request.request_id,
+                                             is_prefill=False)
+            remote_address = ip + ":" + str(port + self._rank)
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
 
@@ -191,11 +284,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 layer = kv_cache[forward_context.virtual_engine]
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name)
+                    request.request_id + "#" + layer_name,
+                    remote_address=remote_address)
 
                 if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
-                    continue
+                    raise RuntimeError(
+                        "Missing remote KV cache for request "
+                        f"{request.request_id}, layer {layer_name} from "
+                        f"{remote_address}")
 
                 inject_kv_into_layer(layer, kv_cache, request.block_ids,
                                      request.request_id)
@@ -223,6 +319,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+
+        if self.direct_block_mode:
+            return
 
         # Only producer/prefill saves KV Cache
         if not self.is_producer:
@@ -268,12 +367,23 @@ class P2pNcclConnector(KVConnectorBase_V1):
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
-                                             kv_cache, remote_address)
+            ok = self.p2p_nccl_engine.send_tensor(request_id + "#" +
+                                                  layer_name, kv_cache,
+                                                  remote_address)
+            if not ok:
+                raise RuntimeError(
+                    "Failed to stage KV cache for request "
+                    f"{request_id}, layer {layer_name}")
 
     def wait_for_save(self):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
+            if self.direct_block_mode:
+                for request_id, context_block_ids in self._pending_bridge_reqs:
+                    self.p2p_nccl_engine.stage_bridge_request(
+                        request_id, context_block_ids)
+                self._pending_bridge_reqs.clear()
+                return
             self.p2p_nccl_engine.wait_for_sent()
 
     def get_finished(
@@ -328,6 +438,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if num_external_tokens < 0:
             num_external_tokens = 0
 
+        if self.direct_block_mode and num_external_tokens > 0:
+            return num_external_tokens, True
+
         return num_external_tokens, False
 
     def update_state_after_alloc(self, request: "Request",
@@ -354,6 +467,37 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
 
         meta = P2pNcclConnectorMetadata()
+
+        if not self.is_producer and self.direct_block_mode:
+            for req_id, (request, local_block_ids) in \
+                    self._requests_need_load.items():
+                remote_prefill_address: Optional[str] = None
+                remote_decode_address: Optional[str] = None
+
+                kv_params = request.kv_transfer_params
+                if isinstance(kv_params, dict):
+                    remote_prefill_address = kv_params.get(
+                        "prefill_zmq_address")
+                    remote_decode_address = kv_params.get(
+                        "decode_zmq_address")
+
+                if remote_prefill_address is None:
+                    try:
+                        ip, port = self.parse_request_id(req_id,
+                                                         is_prefill=False)
+                        remote_prefill_address = f"{ip}:{port + self._rank}"
+                    except Exception:
+                        remote_prefill_address = None
+
+                meta.add_request(
+                    request_id=req_id,
+                    token_ids=request.prompt_token_ids,
+                    block_ids=local_block_ids,
+                    block_size=self._block_size,
+                    remote_prefill_address=remote_prefill_address,
+                    remote_decode_address=remote_decode_address,
+                )
+            return meta
 
         for new_req in scheduler_output.scheduled_new_reqs:
             if self.is_producer:
@@ -389,8 +533,29 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 num_scheduled_tokens = (
                     scheduler_output.num_scheduled_tokens)[req_id]
                 num_tokens = (num_scheduled_tokens + num_computed_tokens)
-                assert req_id in self.chunked_prefill
-                block_ids = new_block_ids[0]
+                if req_id not in self.chunked_prefill:
+                    logger.warning(
+                        "⚠️[PREFILL]Missing chunked_prefill state, req_id:%s, "
+                        "resumed:%s", req_id, resumed_from_preemption)
+                    continue
+
+                if new_block_ids is None or not new_block_ids \
+                        or new_block_ids[0] is None:
+                    # No newly allocated block can be normal when the newly
+                    # scheduled tokens still fit into existing blocks.
+                    # For resumed requests we still need a full block list;
+                    # keep waiting if scheduler cannot provide it.
+                    if resumed_from_preemption:
+                        logger.warning(
+                            "⚠️[PREFILL]Resumed req has no new_block_ids, "
+                            "req_id:%s, num_computed_tokens:%d", req_id,
+                            num_computed_tokens)
+                        continue
+                    new_block_ids_0: list[int] = []
+                else:
+                    new_block_ids_0 = new_block_ids[0]
+
+                block_ids = new_block_ids_0
                 if not resumed_from_preemption:
                     block_ids = (self.chunked_prefill[req_id][0] + block_ids)
                 prompt_token_ids = self.chunked_prefill[req_id][1]
@@ -412,6 +577,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if not resumed_from_preemption:
                 break
             if req_id in self._requests_need_load:
+                if new_block_ids is None or not new_block_ids \
+                        or new_block_ids[0] is None:
+                    logger.warning(
+                        "⚠️[DECODE]No new_block_ids for resumed request, "
+                        "req_id:%s, num_computed_tokens:%d", req_id,
+                        num_computed_tokens)
+                    continue
+
                 request, _ = self._requests_need_load.pop(req_id)
                 total_tokens = num_computed_tokens + 1
                 token_ids = request.all_token_ids[:total_tokens]
@@ -427,6 +600,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         self._requests_need_load.clear()
         return meta
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        # Keep retrying direct-mode bridge pop until worker reports recving
+        # complete for each request.
+        if self.is_producer or not self.direct_block_mode:
+            return
+
+        for req_id in (connector_output.finished_recving or ()):
+            self._requests_need_load.pop(req_id, None)
+            self._pending_failed_block_migrations.pop(req_id, None)
 
     def request_finished(
         self,
@@ -445,7 +628,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
 
         self.chunked_prefill.pop(request.request_id, None)
+        self._requests_need_load.pop(request.request_id, None)
+        self._pending_failed_block_migrations.pop(request.request_id, None)
+        if self.is_producer and self.direct_block_mode:
+            return len(block_ids) > 0, None
 
+        send_type = str(
+            self.config.get_from_extra_config("send_type",
+                                              "PUT_ASYNC")).upper()
+        if self.is_producer and send_type in ("PUT_ASYNC", "GET"):
+            return True, None
         return False, None
 
     # ==============================

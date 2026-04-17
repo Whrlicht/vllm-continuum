@@ -67,6 +67,7 @@ from vllm.logprobs import SampleLogprobs
 from vllm.outputs import CompletionOutput
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import SamplingParams
+from vllm.trace_replay.store import get_trace_store
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
@@ -122,6 +123,7 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+        self.trace_store = get_trace_store()
         self.default_sampling_params = (
             self.model_config.get_diff_sampling_param())
         if self.default_sampling_params:
@@ -281,6 +283,30 @@ class OpenAIServingResponses(OpenAIServing):
                     engine_prompt["prompt_token_ids"])
                 sampling_params = request.to_sampling_params(
                     default_max_tokens, self.default_sampling_params)
+                if sampling_params.trace_replay:
+                    assert sampling_params.traj_id is not None
+                    full_trace_token_ids = self.trace_store.materialize_trace_token_ids(
+                        sampling_params.traj_id,
+                        tokenizer,
+                    )
+                    prompt_token_ids = engine_prompt.get("prompt_token_ids")
+                    trace_token_ids = full_trace_token_ids
+                    if isinstance(prompt_token_ids, list):
+                        prompt_len = len(prompt_token_ids)
+                        if (prompt_len <= len(full_trace_token_ids)
+                                and full_trace_token_ids[:prompt_len] ==
+                                prompt_token_ids):
+                            trace_token_ids = full_trace_token_ids[prompt_len:]
+                        else:
+                            logger.warning(
+                                "trace_replay prompt prefix mismatch for traj_id=%s; "
+                                "falling back to full trace tokens",
+                                sampling_params.traj_id,
+                            )
+
+                    extra_args = dict(sampling_params.extra_args or {})
+                    extra_args["trace_replay_token_ids"] = trace_token_ids
+                    sampling_params.extra_args = extra_args
 
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))

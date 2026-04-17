@@ -31,6 +31,7 @@ from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
                                      StatLoggerFactory)
+from vllm.v1.metrics.monitoring import monitoring_recorder
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
@@ -330,3 +331,4 @@ class LLMEngine:
     def __del__(self):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+        monitoring_recorder.dump()

@@ -39,6 +39,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 
+  ops.def(
+      "get_cuda_view_from_ptr_like(int device_ptr, Tensor like_tensor) -> "
+      "Tensor");
+  ops.impl("get_cuda_view_from_ptr_like", torch::kCUDA,
+           &get_cuda_view_from_ptr_like);
+
+  ops.def(
+      "get_cuda_view_from_ptr_shape_stride("
+      "int device_ptr, int[] sizes, int[] strides, Tensor like_tensor) -> "
+      "Tensor");
+  ops.impl("get_cuda_view_from_ptr_shape_stride", torch::kCUDA,
+           &get_cuda_view_from_ptr_shape_stride);
+
   // Attention ops
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
@@ -669,6 +682,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.def(
       "copy_blocks_mla(Tensor(a!)[] kv_caches, Tensor block_mapping) -> ()");
   cache_ops.impl("copy_blocks_mla", torch::kCUDA, &copy_blocks_mla);
+
+  cache_ops.def(
+      "migrate_kv_cache_blocks(Tensor! dst_cache, Tensor src_cache, "
+      "Tensor src_block_ids, Tensor dst_block_ids, int block_dim) -> ()");
+  cache_ops.impl("migrate_kv_cache_blocks", torch::kCUDA,
+                 &migrate_kv_cache_blocks);
 
   // Reshape the key and value tensors and cache them.
   cache_ops.def(

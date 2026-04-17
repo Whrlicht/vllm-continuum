@@ -463,8 +463,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vllm will log stats at this interval in seconds
     # If not set, vllm will log stats every 10 seconds.
     "VLLM_LOG_STATS_INTERVAL":
-    lambda: val if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10.")))
-        > 0. else 10.,
+    lambda: val if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "1.")))
+        > 0. else 1.,
 
     # Trace function calls
     # If set to 1, vllm will trace function calls
