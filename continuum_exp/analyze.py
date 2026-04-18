@@ -37,6 +37,24 @@ def resolve_input_dir(input_dir_arg: str) -> Path:
     return cwd_candidate
 
 
+def resolve_input_path(path_arg: str) -> Path:
+    """Resolve path from cwd first, then repository root."""
+    raw = Path(path_arg).expanduser()
+    if raw.is_absolute():
+        return raw
+
+    cwd_candidate = (Path.cwd() / raw).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    repo_root = Path(__file__).resolve().parent.parent
+    repo_candidate = (repo_root / raw).resolve()
+    if repo_candidate.exists():
+        return repo_candidate
+
+    return cwd_candidate
+
+
 def load_scheduler_timestamps(input_dir: str) -> Dict[str, List[Dict[str, Any]]]:
     """Load scheduler_timestamps from the input directory."""
     timestamp_file = Path(input_dir) / "scheduler_timestamps"
@@ -100,14 +118,15 @@ def detect_instance_role(instance_dir: Path) -> Optional[str]:
 
 
 def load_companion_role_timestamps(
-        instance_dir: Path) -> Tuple[Optional[str], Optional[Dict[str, List[Dict[str, Any]]]]]:
+    instance_dir: Path
+) -> Tuple[Optional[str], Optional[Dict[str, List[Dict[str, Any]]]], Optional[Path]]:
     """Load companion role scheduler_timestamps under same parent dir.
 
     For prefill_* instance, try decode_* sibling; for decode_*, try prefill_*.
     """
     role = detect_instance_role(instance_dir)
     if role not in ("prefill", "decode"):
-        return None, None
+        return None, None, None
 
     parent = instance_dir.parent
     target_prefix = "decode_" if role == "prefill" else "prefill_"
@@ -116,11 +135,11 @@ def load_companion_role_timestamps(
         if child.is_dir() and child.name.startswith(target_prefix)
         and (child / "scheduler_timestamps").exists())
     if not candidates:
-        return None, None
+        return None, None, None
 
     companion_dir = candidates[0]
     companion_role = "decode" if role == "prefill" else "prefill"
-    return companion_role, load_scheduler_timestamps(str(companion_dir))
+    return companion_role, load_scheduler_timestamps(str(companion_dir)), companion_dir
 
 
 def compute_decode_to_next_prefill_pauses(
@@ -194,6 +213,34 @@ def summarize_distribution(values: List[float]) -> Dict[str, Any]:
         "p95": percentile_sorted(values_sorted, 95),
         "p99": percentile_sorted(values_sorted, 99),
     }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Convert values to float when possible."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    """Convert values to int when possible."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
@@ -811,9 +858,10 @@ def build_round_records(
                                else None)
 
             ttft = _first_not_none(
-                rs.get("first_token_latency"),
-                (first_token_time - arrival_time
-                 if first_token_time is not None and arrival_time is not None else None),
+                prefill_duration,
+                rs.get("prefill_time"),
+                (departure_time - run_start
+                 if departure_time is not None and run_start is not None else None),
             )
             e2e = _first_not_none(
                 rs.get("e2e_latency"),
@@ -930,6 +978,342 @@ def build_round_records(
     return records
 
 
+def _build_round_record_index(
+        round_records: List[Dict[str, Any]]) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    """Index round records by (job_id, round_idx)."""
+    indexed: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for record in round_records:
+        job_id = record.get("job_id")
+        round_idx = _safe_int(record.get("round_idx"))
+        if job_id is None or round_idx is None:
+            continue
+        indexed[(str(job_id), round_idx)] = record
+    return indexed
+
+
+def build_decode_to_next_prefill_start_breakdown(
+    round_records: List[Dict[str, Any]],
+    client_output: Optional[Dict[str, Any]],
+    decode_round_records: Optional[List[Dict[str, Any]]] = None,
+    decode_monitoring: Optional[Dict[str, Any]] = None,
+    allow_approximate_decode_finish: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Build four-stage breakdown for decode-end -> next-prefill-start.
+
+    Stage 1: decode finish -> client receives response end.
+    Stage 2: client simulated tool call sleep.
+    Stage 3: client sends next request -> proxy receives request.
+    Stage 4: proxy receives request -> prefill starts running.
+    """
+    if not client_output:
+        return None
+
+    trajectories = client_output.get("results")
+    if not isinstance(trajectories, list):
+        return None
+
+    config = client_output.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    preferred_job_id_field = config.get("job_id_field")
+    if preferred_job_id_field not in ("traj_id", "instance_id"):
+        preferred_job_id_field = "traj_id"
+
+    round_record_index = _build_round_record_index(round_records)
+    decode_round_record_index = _build_round_record_index(decode_round_records
+                                                          or [])
+    decode_finish_by_request_id: Dict[str, float] = {}
+    decode_finish_by_proxy_request_id: Dict[str, float] = {}
+    if isinstance(decode_monitoring, dict):
+        request_stats = decode_monitoring.get("request_stats")
+        if isinstance(request_stats, dict):
+            for request_key, stat_obj in request_stats.items():
+                if not isinstance(stat_obj, dict):
+                    continue
+                finish_time = _safe_float(stat_obj.get("finish_time"))
+                if finish_time is None:
+                    continue
+                request_id = _first_not_none(stat_obj.get("request_id"),
+                                             request_key)
+                if request_id is not None:
+                    request_id_str = str(request_id)
+                    decode_finish_by_request_id[request_id_str] = finish_time
+                    if request_id_str.startswith("chatcmpl-"):
+                        decode_finish_by_proxy_request_id.setdefault(
+                            request_id_str[len("chatcmpl-"):], finish_time)
+
+                proxy_request_id = stat_obj.get("proxy_request_id")
+                if proxy_request_id is not None:
+                    decode_finish_by_proxy_request_id[str(
+                        proxy_request_id)] = finish_time
+
+        request_meta = decode_monitoring.get("request_meta")
+        if isinstance(request_meta, dict):
+            for request_key, meta_obj in request_meta.items():
+                if not isinstance(meta_obj, dict):
+                    continue
+                proxy_request_id = meta_obj.get("proxy_request_id")
+                if proxy_request_id is None:
+                    continue
+                finish_time = decode_finish_by_request_id.get(str(request_key))
+                if finish_time is None:
+                    request_id = meta_obj.get("request_id")
+                    if request_id is not None:
+                        finish_time = decode_finish_by_request_id.get(
+                            str(request_id))
+                if finish_time is not None:
+                    decode_finish_by_proxy_request_id.setdefault(
+                        str(proxy_request_id), finish_time)
+    stage_values: Dict[str, List[float]] = {
+        "decode_to_client_response_end_s": [],
+        "client_tool_sleep_s": [],
+        "client_send_to_proxy_receive_s": [],
+        "proxy_receive_to_prefill_run_start_s": [],
+        "total_decode_to_next_prefill_start_s": [],
+        "observed_decode_to_next_prefill_start_s": [],
+    }
+    queue_by_next_round: Dict[int, List[float]] = {}
+    transition_records: List[Dict[str, Any]] = []
+
+    transitions_scanned = 0
+    transitions_with_round_match = 0
+    transitions_complete = 0
+    transitions_with_stage4_queue = 0
+
+    for trajectory in trajectories:
+        if not isinstance(trajectory, dict):
+            continue
+        rounds = trajectory.get("rounds")
+        if not isinstance(rounds, list) or len(rounds) < 2:
+            continue
+
+        job_id_candidates: List[str] = []
+        for key in (preferred_job_id_field, "traj_id", "instance_id"):
+            value = trajectory.get(key)
+            if value is None:
+                continue
+            candidate = str(value)
+            if candidate and candidate not in job_id_candidates:
+                job_id_candidates.append(candidate)
+        if not job_id_candidates:
+            continue
+
+        for idx in range(len(rounds) - 1):
+            current = rounds[idx]
+            nxt = rounds[idx + 1]
+            if not isinstance(current, dict) or not isinstance(nxt, dict):
+                continue
+
+            transitions_scanned += 1
+
+            from_round_idx = _safe_int(
+                _first_not_none(current.get("assistant_round_index"),
+                                current.get("round_index"), idx))
+            to_round_idx = _safe_int(
+                _first_not_none(nxt.get("assistant_round_index"),
+                                nxt.get("round_index"), idx + 1))
+            if from_round_idx is None or to_round_idx is None:
+                continue
+
+            matched_job_id = None
+            matched_round = None
+            for job_id in job_id_candidates:
+                maybe_round = round_record_index.get((job_id, to_round_idx))
+                if maybe_round is not None:
+                    matched_job_id = job_id
+                    matched_round = maybe_round
+                    break
+
+            if matched_round is None or matched_job_id is None:
+                continue
+            transitions_with_round_match += 1
+
+            decode_finish = _safe_float(current.get("decode_server_finish_time"))
+            decode_finish_source = None
+            if decode_finish is not None:
+                decode_finish_source = "client_monitoring_enrich"
+            client_response_end = _safe_float(current.get("request_end_time"))
+            stage_decode_to_client_end = None
+
+            stage_client_sleep = _safe_float(current.get("actual_sleep_time_s"))
+            if stage_client_sleep is None:
+                stage_client_sleep = _safe_float(
+                    current.get("client_inter_round_gap_to_next_request_s"))
+
+            route = nxt.get("disagg_route")
+            proxy_recv = None
+            if isinstance(route, dict):
+                proxy_recv = _safe_float(route.get("proxy_req_recv_ts"))
+            if proxy_recv is None:
+                proxy_recv = _safe_float(nxt.get("proxy_req_recv_ts"))
+
+            stage_client_to_proxy = _safe_float(
+                nxt.get("client_send_to_proxy_receive_s"))
+            if stage_client_to_proxy is None:
+                next_request_start = _safe_float(nxt.get("request_start_time"))
+                if proxy_recv is not None and next_request_start is not None:
+                    stage_client_to_proxy = proxy_recv - next_request_start
+
+            if decode_finish is None:
+                response_id = current.get("response_id")
+                if response_id is not None:
+                    decode_finish = decode_finish_by_request_id.get(
+                        str(response_id))
+                    if decode_finish is not None:
+                        decode_finish_source = "decode_monitoring_request_id"
+
+            if decode_finish is None:
+                current_route = current.get("disagg_route")
+                proxy_request_id = None
+                if isinstance(current_route, dict):
+                    proxy_request_id = current_route.get("proxy_request_id")
+                if proxy_request_id is None and isinstance(route, dict):
+                    proxy_request_id = route.get("proxy_request_id")
+                if proxy_request_id is not None:
+                    decode_finish = decode_finish_by_proxy_request_id.get(
+                        str(proxy_request_id))
+                    if decode_finish is not None:
+                        decode_finish_source = "decode_monitoring_proxy_request_id"
+
+            if decode_finish is None and allow_approximate_decode_finish \
+                    and decode_round_record_index:
+                decode_round = decode_round_record_index.get(
+                    (matched_job_id, from_round_idx))
+                if decode_round is not None:
+                    decode_finish = _safe_float(
+                        _first_not_none(
+                            decode_round.get("departure_time"),
+                            decode_round.get("finish_time"),
+                        ))
+                    if decode_finish is not None:
+                        decode_finish_source = "decode_scheduler_round_departure"
+
+            if decode_finish is not None and client_response_end is not None:
+                stage_decode_to_client_end = client_response_end - decode_finish
+
+            prefill_run_start = _safe_float(matched_round.get("run_start"))
+            stage_proxy_to_prefill_start = None
+            if proxy_recv is not None and prefill_run_start is not None:
+                stage_proxy_to_prefill_start = prefill_run_start - proxy_recv
+            if stage_proxy_to_prefill_start is None:
+                proxy_to_arrival = _safe_float(
+                    nxt.get("proxy_receive_to_prefill_arrival_s"))
+                queue_wait = _safe_float(
+                    matched_round.get("queue_wait_to_first_schedule"))
+                if proxy_to_arrival is not None and queue_wait is not None:
+                    stage_proxy_to_prefill_start = proxy_to_arrival + queue_wait
+
+            # Stage-4 queue samples can be useful even when other stages are
+            # unavailable (e.g., interrupted client output without full joins).
+            if (stage_proxy_to_prefill_start is not None
+                    and stage_proxy_to_prefill_start >= 0):
+                queue_by_next_round.setdefault(to_round_idx, []).append(
+                    stage_proxy_to_prefill_start)
+                transitions_with_stage4_queue += 1
+
+            observed_total = None
+            if decode_finish is not None and prefill_run_start is not None:
+                observed_total = prefill_run_start - decode_finish
+
+            segments = [
+                stage_decode_to_client_end,
+                stage_client_sleep,
+                stage_client_to_proxy,
+                stage_proxy_to_prefill_start,
+            ]
+            if any(seg is None for seg in segments):
+                continue
+            if any(seg < 0 for seg in segments):
+                continue
+            if observed_total is not None and observed_total < 0:
+                continue
+
+            transitions_complete += 1
+            total = sum(segments)
+
+            stage_values["decode_to_client_response_end_s"].append(
+                stage_decode_to_client_end)
+            stage_values["client_tool_sleep_s"].append(stage_client_sleep)
+            stage_values["client_send_to_proxy_receive_s"].append(
+                stage_client_to_proxy)
+            stage_values["proxy_receive_to_prefill_run_start_s"].append(
+                stage_proxy_to_prefill_start)
+            stage_values["total_decode_to_next_prefill_start_s"].append(total)
+            if observed_total is not None:
+                stage_values["observed_decode_to_next_prefill_start_s"].append(
+                    observed_total)
+
+            transition_records.append({
+                "job_id": matched_job_id,
+                "from_round_idx": from_round_idx,
+                "to_round_idx": to_round_idx,
+                "decode_finish_source": decode_finish_source,
+                "decode_to_client_response_end_s": stage_decode_to_client_end,
+                "client_tool_sleep_s": stage_client_sleep,
+                "client_send_to_proxy_receive_s": stage_client_to_proxy,
+                "proxy_receive_to_prefill_run_start_s":
+                    stage_proxy_to_prefill_start,
+                "total_decode_to_next_prefill_start_s": total,
+                "observed_decode_to_next_prefill_start_s": observed_total,
+            })
+
+    stage_distributions = {
+        key: summarize_distribution(values)
+        for key, values in stage_values.items()
+    }
+
+    gantt_snapshots: Dict[str, Dict[str, float]] = {}
+    for metric_name in ("mean", "p50", "p95"):
+        gantt_snapshots[metric_name] = {
+            "decode_to_client_response_end_s":
+                stage_distributions["decode_to_client_response_end_s"][metric_name],
+            "client_tool_sleep_s":
+                stage_distributions["client_tool_sleep_s"][metric_name],
+            "client_send_to_proxy_receive_s":
+                stage_distributions["client_send_to_proxy_receive_s"][metric_name],
+            "proxy_receive_to_prefill_run_start_s":
+                stage_distributions["proxy_receive_to_prefill_run_start_s"][metric_name],
+            "total_decode_to_next_prefill_start_s":
+                stage_distributions["total_decode_to_next_prefill_start_s"][metric_name],
+        }
+
+    queue_time_by_next_round = []
+    for round_idx in sorted(queue_by_next_round):
+        dist = summarize_distribution(queue_by_next_round[round_idx])
+        queue_time_by_next_round.append({
+            "next_round_idx": round_idx,
+            "count": dist["count"],
+            "mean": dist["mean"],
+            "p50": dist["p50"],
+            "p95": dist["p95"],
+            "min": dist["min"],
+            "max": dist["max"],
+        })
+
+    return {
+        "description": (
+            "Breakdown of decode-end to next-prefill-start latency into four "
+            "stages: decode->client_end, client_sleep, client->proxy, "
+            "proxy->prefill_start."
+        ),
+        "stage_order": [
+            "decode_to_client_response_end_s",
+            "client_tool_sleep_s",
+            "client_send_to_proxy_receive_s",
+            "proxy_receive_to_prefill_run_start_s",
+        ],
+        "transitions_scanned": transitions_scanned,
+        "transitions_with_prefill_round_match": transitions_with_round_match,
+        "transitions_complete": transitions_complete,
+        "transitions_with_stage4_queue": transitions_with_stage4_queue,
+        "client_job_id_field": preferred_job_id_field,
+        "stage_distributions_seconds": stage_distributions,
+        "gantt_snapshots_seconds": gantt_snapshots,
+        "queue_time_by_next_round_seconds": queue_time_by_next_round,
+        "records": transition_records,
+    }
+
+
 def summarize_records_by_group(
         records: List[Dict[str, Any]], group_key: str,
         numeric_fields: List[str]) -> Dict[str, Any]:
@@ -1043,8 +1427,11 @@ def calculate_monitoring_metrics(
     finish_times = []
 
     for rs in request_stats:
-        if rs.get("first_token_latency") is not None:
-            ttft_values.append(rs["first_token_latency"])
+        # TTFT chart semantic in this repo: prefill execution time only
+        # (scheduled/run start -> first token), excluding queueing delay.
+        # Decode role should not emit TTFT values.
+        if instance_role != "decode" and rs.get("prefill_time") is not None:
+            ttft_values.append(rs["prefill_time"])
         if rs.get("e2e_latency") is not None:
             e2e_values.append(rs["e2e_latency"])
         decode_time = rs.get("decode_time")
@@ -1121,6 +1508,7 @@ def calculate_monitoring_metrics(
             for round_obj in rounds:
                 arrival_time = round_obj.get("arrival_time")
                 run_start = round_obj.get("run_start")
+                first_token_time = round_obj.get("first_token_time")
                 departure_time = round_obj.get("departure_time")
                 num_gen = round_obj.get("num_generation_tokens")
 
@@ -1133,8 +1521,16 @@ def calculate_monitoring_metrics(
                     stage_latency = departure_time - arrival_time
                     if stage_latency >= 0:
                         fallback_stage_latency.append(stage_latency)
-                        if instance_role == "prefill":
-                            fallback_prefill_latency.append(stage_latency)
+
+                if instance_role == "prefill" and run_start is not None:
+                    prefill_end = None
+                    if first_token_time is not None and first_token_time >= run_start:
+                        prefill_end = first_token_time
+                    elif departure_time is not None and departure_time >= run_start:
+                        # Legacy timestamps may miss first_token_time.
+                        prefill_end = departure_time
+                    if prefill_end is not None:
+                        fallback_prefill_latency.append(prefill_end - run_start)
 
                 if instance_role == "decode" and \
                         run_start is not None and departure_time is not None and \
@@ -1177,7 +1573,10 @@ def calculate_monitoring_metrics(
         result["metric_fallback"] = {
             "used_scheduler_fallback": True,
             "instance_role": instance_role,
-            "ttft_semantics": "prefill_stage_latency_departure_minus_arrival",
+            "ttft_semantics": (
+                "prefill_execution_latency_(first_token_or_departure)_"
+                "minus_run_start"
+            ),
             "tbt_semantics": (
                 "decode_stage_duration_div_num_generation_tokens "
                 "(or decode_stage_duration if token count missing)"),
@@ -1212,7 +1611,7 @@ def save_results(results: Dict[str, Any], output_dir: str):
     monitoring_metrics = results.get("monitoring_metrics") or {}
     if monitoring_metrics:
         print("\n=== Monitoring Metrics ===")
-        print("TTFT (s) p50/p95/p99:",
+        print("Prefill execution (no queue, s) p50/p95/p99:",
               f"{monitoring_metrics['ttft_seconds']['p50']:.4f}/"
               f"{monitoring_metrics['ttft_seconds']['p95']:.4f}/"
               f"{monitoring_metrics['ttft_seconds']['p99']:.4f}")
@@ -1243,7 +1642,7 @@ def save_results(results: Dict[str, Any], output_dir: str):
 
     grouped = (results.get("grouped_metrics") or {}).get("by_ttl_state") or {}
     if grouped:
-        print("\n=== TTFT by TTL State (p95/p99) ===")
+        print("\n=== Prefill Execution by TTL State (p95/p99) ===")
         for state, stats in grouped.items():
             ttft_stats = stats.get("ttft") or {}
             print(
@@ -1254,13 +1653,27 @@ def save_results(results: Dict[str, Any], output_dir: str):
 
     top_ttft = (results.get("tail_analysis") or {}).get("top_ttft_requests") or []
     if top_ttft:
-        print("\n=== Top 5 Slow TTFT Requests ===")
+        print("\n=== Top 5 Slow Prefill-Execution Requests ===")
         for row in top_ttft[:5]:
             print(
                 f"job={row.get('job_id')}, round={row.get('round_idx')}, "
                 f"ttft={row.get('ttft')}, e2e={row.get('e2e')}, "
                 f"queue_wait={row.get('queue_wait_to_first_schedule')}, "
                 f"ttl_state={row.get('ttl_state')}, round_type={row.get('round_type')}"
+            )
+
+    transition_breakdown = results.get("decode_to_next_prefill_start_breakdown")
+    if transition_breakdown:
+        print("\n=== Decode->Next Prefill Start Breakdown (s) ===")
+        snapshots = transition_breakdown.get("gantt_snapshots_seconds") or {}
+        for key in ("mean", "p50", "p95"):
+            row = snapshots.get(key) or {}
+            print(
+                f"{key}: decode->client={row.get('decode_to_client_response_end_s', 0):.4f}, "
+                f"sleep={row.get('client_tool_sleep_s', 0):.4f}, "
+                f"client->proxy={row.get('client_send_to_proxy_receive_s', 0):.4f}, "
+                f"proxy->prefill_start={row.get('proxy_receive_to_prefill_run_start_s', 0):.4f}, "
+                f"total={row.get('total_decode_to_next_prefill_start_s', 0):.4f}"
             )
     print("=" * 35)
 
@@ -1294,19 +1707,61 @@ def main():
         help=("Analyze all instance subdirectories under --input-dir that "
               "contain scheduler_timestamps")
     )
+    parser.add_argument(
+        "--client-output",
+        type=str,
+        default="output/multiturn_trace_client.json",
+        help=("Path to multiturn_trace_client.json for cross-stage "
+              "decode->next-prefill-start breakdown")
+    )
+    parser.add_argument(
+        "--disable-client-breakdown",
+        action="store_true",
+        help=("Disable decode->next-prefill-start 4-stage breakdown "
+              "that depends on client output JSON")
+    )
 
     args = parser.parse_args()
 
     input_dir = resolve_input_dir(args.input_dir)
     output_dir = Path(args.output_dir)
 
+    client_output_payload: Optional[Dict[str, Any]] = None
+    client_output_path: Optional[Path] = None
+    if not args.disable_client_breakdown:
+        candidate = resolve_input_path(args.client_output)
+        client_output_path = candidate
+        if candidate.exists():
+            try:
+                with candidate.open("r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    client_output_payload = loaded
+                    print(f"Loaded client output for breakdown: {candidate}")
+                else:
+                    print(
+                        "Warning: client output JSON root is not an object; "
+                        "skip decode->next-prefill-start breakdown.")
+            except (OSError, json.JSONDecodeError) as exc:
+                print(
+                    "Warning: failed to load client output JSON "
+                    f"({candidate}): {exc}; skip decode->next-prefill-start breakdown.")
+        else:
+            print(
+                "Warning: client output file not found "
+                f"({candidate}); skip decode->next-prefill-start breakdown.")
+
     def _run_one(instance_input_dir: Path, instance_output_dir: Path) -> None:
         print(f"Loading scheduler_timestamps from {instance_input_dir}...")
         timestamps = load_scheduler_timestamps(str(instance_input_dir))
         monitoring = load_monitoring_timestamps(str(instance_input_dir))
         instance_role = detect_instance_role(instance_input_dir)
-        companion_role, companion_timestamps = load_companion_role_timestamps(
-            instance_input_dir)
+        companion_role, companion_timestamps, companion_dir = \
+            load_companion_role_timestamps(instance_input_dir)
+        companion_monitoring = None
+        if companion_dir is not None:
+            companion_monitoring = load_monitoring_timestamps(
+                str(companion_dir))
 
         print(f"Calculating job durations for {len(timestamps)} jobs...")
         results = calculate_average_duration(timestamps)
@@ -1369,6 +1824,30 @@ def main():
                 round_records, "was_preempted", grouped_numeric_fields),
         }
         results["tail_analysis"] = build_tail_analysis(round_records, top_k=20)
+
+        decode_round_records_for_breakdown: Optional[List[Dict[str, Any]]] = None
+        if instance_role == "prefill" and companion_role == "decode" \
+                and companion_timestamps is not None:
+            companion_job_round_metrics = calculate_job_round_metrics(
+                companion_timestamps)
+            decode_round_records_for_breakdown = build_round_records(
+                companion_timestamps,
+                companion_job_round_metrics,
+                monitoring=None,
+            )
+
+        if instance_role == "prefill" and client_output_payload is not None:
+            breakdown = build_decode_to_next_prefill_start_breakdown(
+                round_records,
+                client_output_payload,
+                decode_round_records=decode_round_records_for_breakdown,
+                decode_monitoring=companion_monitoring,
+                allow_approximate_decode_finish=False,
+            )
+            if breakdown is not None:
+                if client_output_path is not None:
+                    breakdown["client_output_path"] = str(client_output_path)
+                results["decode_to_next_prefill_start_breakdown"] = breakdown
 
         save_results(results, str(instance_output_dir))
 

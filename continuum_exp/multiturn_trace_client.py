@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -73,6 +74,8 @@ class ClientConfig:
     prefill_monitoring_path: str
     decode_monitoring_path: str
     enable_monitoring_enrich: bool
+    pid_file: str
+    enable_pid_file: bool
 
 
 def parse_args() -> ClientConfig:
@@ -95,6 +98,17 @@ def parse_args() -> ClientConfig:
     parser.add_argument("--output-dir",
                         default="output",
                         help="Directory to write output JSON")
+    parser.add_argument(
+        "--pid-file",
+        default="output/.multiturn_trace_client.pid",
+        help=("PID file path for external orchestration. "
+              "Launcher can use this PID to stop client gracefully."),
+    )
+    parser.add_argument(
+        "--disable-pid-file",
+        action="store_true",
+        help="Disable writing the client PID file.",
+    )
     parser.add_argument("--max-trajectories",
                         type=int,
                         default=0,
@@ -200,7 +214,48 @@ def parse_args() -> ClientConfig:
         prefill_monitoring_path=ns.prefill_monitoring_path,
         decode_monitoring_path=ns.decode_monitoring_path,
         enable_monitoring_enrich=not ns.disable_monitoring_enrich,
+        pid_file=ns.pid_file,
+        enable_pid_file=not ns.disable_pid_file,
     )
+
+
+def _resolve_path(path_str: str) -> Path:
+    p = Path(path_str).expanduser()
+    if p.is_absolute():
+        return p
+    return (Path.cwd() / p).resolve()
+
+
+def write_pid_file(cfg: ClientConfig) -> Optional[Path]:
+    if not cfg.enable_pid_file:
+        return None
+
+    pid_path = _resolve_path(cfg.pid_file)
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = pid_path.with_name(
+            f"{pid_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n")
+        os.replace(tmp_path, pid_path)
+        return pid_path
+    except OSError as exc:
+        print(f"Warning: failed to write pid file {pid_path}: {exc}")
+        return None
+
+
+def cleanup_pid_file(pid_path: Optional[Path]) -> None:
+    if pid_path is None:
+        return
+    try:
+        if not pid_path.exists():
+            return
+        text = pid_path.read_text(encoding="utf-8").strip()
+        if text and text != str(os.getpid()):
+            return
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _flatten_content_to_text(value: Any) -> str:
@@ -701,102 +756,108 @@ async def run_single_trajectory(
     if cfg.max_rounds_per_trajectory > 0:
         rounds = rounds[:cfg.max_rounds_per_trajectory]
     per_round: list[dict[str, Any]] = []
+    interrupted = False
 
-    for i, round_spec in enumerate(rounds):
-        prompt_messages = build_round_prompt_messages(
-            sample.messages,
-            round_spec.assistant_message_index,
-        )
-
-        req_start = time.time()
-        ok = True
-        err_msg = ""
-        raw_response: dict[str, Any] = {}
-        output_text = ""
-        disagg_route: dict[str, Any] | None = None
-
-        try:
-            raw_response = await chat_once(
-                cfg,
-                session,
-                prompt_messages,
-                sample.traj_id,
-                sample.instance_id,
-                round_spec.assistant_round_index,
+    try:
+        for i, round_spec in enumerate(rounds):
+            prompt_messages = build_round_prompt_messages(
+                sample.messages,
+                round_spec.assistant_message_index,
             )
-            output_text = extract_output_text(raw_response)
-            route_meta = raw_response.get("_disagg_route")
-            if isinstance(route_meta, dict):
-                disagg_route = route_meta
-        except Exception as e:  # noqa: BLE001
-            ok = False
-            err_msg = str(e)
 
-        req_end = time.time()
-        expected_output = extract_expected_assistant_output(
-            sample.messages,
-            round_spec.assistant_message_index,
-        )
-        comparison = compare_text(expected_output, output_text)
+            req_start = time.time()
+            ok = True
+            err_msg = ""
+            raw_response: dict[str, Any] = {}
+            output_text = ""
+            disagg_route: dict[str, Any] | None = None
 
-        round_result = {
-            "round_index": i,
-            "request_start_time": req_start,
-            "request_end_time": req_end,
-            "request_latency_s": req_end - req_start,
-            "execution_time_seconds": round_spec.execution_time_seconds,
-            "assistant_round_index": round_spec.assistant_round_index,
-            "assistant_message_index": round_spec.assistant_message_index,
-            "response_id": (raw_response.get("id")
-                             if isinstance(raw_response, dict) else None),
-            "output": output_text,
-            "comparison": asdict(comparison),
-            "ok": ok,
-            "error": err_msg,
-        }
-        if disagg_route:
-            round_result["disagg_route"] = disagg_route
+            try:
+                raw_response = await chat_once(
+                    cfg,
+                    session,
+                    prompt_messages,
+                    sample.traj_id,
+                    sample.instance_id,
+                    round_spec.assistant_round_index,
+                )
+                output_text = extract_output_text(raw_response)
+                route_meta = raw_response.get("_disagg_route")
+                if isinstance(route_meta, dict):
+                    disagg_route = route_meta
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                err_msg = str(e)
 
-        if cfg.output_mode == "full":
-            round_result["prompt_messages"] = prompt_messages
-            round_result["expected_assistant_output"] = expected_output
-            round_result["raw_response"] = raw_response
-        else:
-            # Concise mode: keep lightweight diagnostics only.
-            round_result["prompt_message_count"] = len(prompt_messages)
-            round_result["prompt_tail_roles"] = [
-                m.get("role", "unknown") for m in prompt_messages[-6:]
-            ]
-            round_result["expected_output_length"] = len(expected_output)
-            usage = raw_response.get("usage") if isinstance(raw_response,
-                                                             dict) else None
-            if isinstance(usage, dict):
-                round_result["usage"] = {
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "total_tokens": usage.get("total_tokens"),
-                }
+            req_end = time.time()
+            expected_output = extract_expected_assistant_output(
+                sample.messages,
+                round_spec.assistant_message_index,
+            )
+            comparison = compare_text(expected_output, output_text)
 
-        per_round.append(round_result)
+            round_result = {
+                "round_index": i,
+                "request_start_time": req_start,
+                "request_end_time": req_end,
+                "request_latency_s": req_end - req_start,
+                "execution_time_seconds": round_spec.execution_time_seconds,
+                "assistant_round_index": round_spec.assistant_round_index,
+                "assistant_message_index": round_spec.assistant_message_index,
+                "response_id": (raw_response.get("id")
+                                 if isinstance(raw_response, dict) else None),
+                "output": output_text,
+                "comparison": asdict(comparison),
+                "ok": ok,
+                "error": err_msg,
+            }
+            if disagg_route:
+                round_result["disagg_route"] = disagg_route
 
-        if not ok:
-            break
+            if cfg.output_mode == "full":
+                round_result["prompt_messages"] = prompt_messages
+                round_result["expected_assistant_output"] = expected_output
+                round_result["raw_response"] = raw_response
+            else:
+                # Concise mode: keep lightweight diagnostics only.
+                round_result["prompt_message_count"] = len(prompt_messages)
+                round_result["prompt_tail_roles"] = [
+                    m.get("role", "unknown") for m in prompt_messages[-6:]
+                ]
+                round_result["expected_output_length"] = len(expected_output)
+                usage = raw_response.get("usage") if isinstance(raw_response,
+                                                                 dict) else None
+                if isinstance(usage, dict):
+                    round_result["usage"] = {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                    }
 
-        # Delay to next round based on trace execution_time_seconds.
-        if i < len(rounds) - 1 and round_spec.execution_time_seconds > 0:
-            sleep_start = time.time()
-            await asyncio.sleep(round_spec.execution_time_seconds)
-            sleep_end = time.time()
-            round_result["sleep_start_time"] = sleep_start
-            round_result["sleep_end_time"] = sleep_end
-            round_result["actual_sleep_time_s"] = sleep_end - sleep_start
-            round_result["sleep_overrun_s"] = (
-                (sleep_end - sleep_start) - round_spec.execution_time_seconds)
+            per_round.append(round_result)
+
+            if not ok:
+                break
+
+            # Delay to next round based on trace execution_time_seconds.
+            if i < len(rounds) - 1 and round_spec.execution_time_seconds > 0:
+                sleep_start = time.time()
+                await asyncio.sleep(round_spec.execution_time_seconds)
+                sleep_end = time.time()
+                round_result["sleep_start_time"] = sleep_start
+                round_result["sleep_end_time"] = sleep_end
+                round_result["actual_sleep_time_s"] = sleep_end - sleep_start
+                round_result["sleep_overrun_s"] = (
+                    (sleep_end - sleep_start) - round_spec.execution_time_seconds)
+    except asyncio.CancelledError:
+        interrupted = True
 
     _annotate_client_inter_round_gaps(per_round)
 
     end_ts = time.time()
-    return {
+    success = (not interrupted and len(per_round) == len(rounds)
+               and all(r.get("ok", False) for r in per_round))
+    result = {
         "traj_id": sample.traj_id,
         "instance_id": sample.instance_id,
         "num_rounds_requested": len(rounds),
@@ -805,17 +866,22 @@ async def run_single_trajectory(
         "end_time": end_ts,
         "duration_s": end_ts - start_ts,
         "rounds": per_round,
-        "success": all(r.get("ok", False) for r in per_round),
+        "success": success,
     }
+    if interrupted:
+        result["interrupted"] = True
+        result["interrupt_reason"] = "cancelled_by_ctrl_c"
+    return result
 
 
 async def run_fixed_dispatch(
     samples: list[TrajectorySample],
     cfg: ClientConfig,
     session: aiohttp.ClientSession,
+    results_sink: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     sem = asyncio.Semaphore(cfg.concurrency)
-    results: list[dict[str, Any]] = []
+    results = results_sink if results_sink is not None else []
 
     async def worker(sample: TrajectorySample) -> None:
         async with sem:
@@ -831,10 +897,11 @@ async def run_poisson_dispatch(
     samples: list[TrajectorySample],
     cfg: ClientConfig,
     session: aiohttp.ClientSession,
+    results_sink: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     sem = asyncio.Semaphore(cfg.poisson_max_concurrency)
     launched: list[asyncio.Task] = []
-    results: list[dict[str, Any]] = []
+    results = results_sink if results_sink is not None else []
 
     async def guarded_run(sample: TrajectorySample) -> None:
         async with sem:
@@ -925,9 +992,19 @@ async def async_main(cfg: ClientConfig) -> int:
         async with aiohttp.ClientSession(connector=connector,
                                          timeout=timeout) as session:
             if cfg.dispatch_mode == "fixed":
-                results = await run_fixed_dispatch(samples, cfg, session)
+                results = await run_fixed_dispatch(
+                    samples,
+                    cfg,
+                    session,
+                    results_sink=results,
+                )
             else:
-                results = await run_poisson_dispatch(samples, cfg, session)
+                results = await run_poisson_dispatch(
+                    samples,
+                    cfg,
+                    session,
+                    results_sink=results,
+                )
         t1 = time.time()
 
         timing_enrichment_summary = _enrich_results_with_monitoring(cfg, results)
@@ -948,11 +1025,18 @@ async def async_main(cfg: ClientConfig) -> int:
         return 0
     except asyncio.CancelledError:
         t1 = time.time()
-        timing_enrichment_summary = {
-            "enabled": False,
-            "enriched": False,
-            "reason": "interrupted_by_ctrl_c",
-        }
+        try:
+            timing_enrichment_summary = _enrich_results_with_monitoring(cfg, results)
+            if isinstance(timing_enrichment_summary, dict):
+                timing_enrichment_summary["run_interrupted"] = True
+        except Exception as exc:  # noqa: BLE001
+            timing_enrichment_summary = {
+                "enabled": False,
+                "enriched": False,
+                "reason": "interrupted_enrichment_failed",
+                "error": str(exc),
+                "run_interrupted": True,
+            }
         out_path = dump_output(
             cfg,
             results,
@@ -969,7 +1053,15 @@ async def async_main(cfg: ClientConfig) -> int:
 
 def main() -> None:
     cfg = parse_args()
-    code = asyncio.run(async_main(cfg))
+    pid_path = write_pid_file(cfg)
+    try:
+        try:
+            code = asyncio.run(async_main(cfg))
+        except KeyboardInterrupt:
+            # Keep existing interrupted output (if already dumped) and exit quietly.
+            code = 130
+    finally:
+        cleanup_pid_file(pid_path)
     raise SystemExit(code)
 
 

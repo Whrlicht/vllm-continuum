@@ -50,7 +50,7 @@ def summarize_results(results: Dict[str, Any], top_k: int) -> str:
     monitoring = results.get("monitoring_metrics") or {}
     if monitoring:
         lines.append(_section("Latency"))
-        lines.append(_line("TTFT p50/p95/p99",
+        lines.append(_line("Prefill exec(no queue) p50/p95/p99",
                            f"{_fmt_sec(_get(monitoring, 'ttft_seconds.p50'))} / "
                            f"{_fmt_sec(_get(monitoring, 'ttft_seconds.p95'))} / "
                            f"{_fmt_sec(_get(monitoring, 'ttft_seconds.p99'))}"))

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="1"
+PREFILL_GPUS="5"
 DECODE_GPUS="6"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
@@ -34,19 +34,24 @@ GET_RETRY_INTERVAL_S=0.005
 DTYPE="float16"
 # Keep 0 as "auto": use model's own max context length.
 MAX_MODEL_LEN=0
-MAX_NUM_BATCHED_TOKENS=248328
+MAX_NUM_BATCHED_TOKENS=265944
 MAX_NUM_SEQS=256
 SEED=1024
 LICHT=false
 
 WAIT_TIMEOUT_SECONDS=1200
+SHUTDOWN_GRACE_SECONDS=20
+CLIENT_STOP_GRACE_SECONDS=20
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/swe_bench_sample_100_with_timings.json"
 PROXY_SCRIPT="${SCRIPT_DIR}/disagg_proxy_p2p_nccl_xpyd_prod.py"
+CLIENT_PID_FILE="${REPO_ROOT}/output/.multiturn_trace_client.pid"
+STOP_CLIENT_ON_EXIT=true
 
 PIDS=()
+EXPECTED_TIMESTAMP_FILES=()
 
 usage() {
   cat <<EOF
@@ -77,6 +82,14 @@ Options:
   --trace-replay-path PATH     Trace replay JSON path for workers
                                (default: ${TRACE_REPLAY_PATH})
   --wait-timeout SECONDS       Wait timeout for each worker endpoint (default: ${WAIT_TIMEOUT_SECONDS})
+  --shutdown-grace-seconds N   Grace window per signal phase before force kill
+                               (default: ${SHUTDOWN_GRACE_SECONDS})
+  --client-pid-file PATH       PID file for multiturn_trace_client.py
+                               (default: ${CLIENT_PID_FILE})
+  --no-stop-client-on-exit     Do not signal client process on launcher exit
+  --client-stop-grace-seconds N
+                               Grace time for client shutdown before escalation
+                               (default: ${CLIENT_STOP_GRACE_SECONDS})
   -h, --help                   Show this help
 
 Notes:
@@ -155,6 +168,22 @@ while [[ $# -gt 0 ]]; do
       WAIT_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
+    --shutdown-grace-seconds)
+      SHUTDOWN_GRACE_SECONDS="$2"
+      shift 2
+      ;;
+    --client-pid-file)
+      CLIENT_PID_FILE="$2"
+      shift 2
+      ;;
+    --no-stop-client-on-exit)
+      STOP_CLIENT_ON_EXIT=false
+      shift
+      ;;
+    --client-stop-grace-seconds)
+      CLIENT_STOP_GRACE_SECONDS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -200,15 +229,130 @@ fi
 cleanup() {
   set +e
   trap - INT TERM EXIT
+
+  stop_client_if_needed() {
+    if [[ "${STOP_CLIENT_ON_EXIT}" != "true" ]]; then
+      return 0
+    fi
+
+    if [[ ! -f "${CLIENT_PID_FILE}" ]]; then
+      return 0
+    fi
+
+    local client_pid
+    client_pid="$(head -n 1 "${CLIENT_PID_FILE}" | tr -cd '0-9')"
+    if [[ -z "${client_pid}" ]]; then
+      echo "Client PID file malformed: ${CLIENT_PID_FILE}"
+      return 0
+    fi
+
+    if ! kill -0 "${client_pid}" 2>/dev/null; then
+      echo "Client PID ${client_pid} is not running; removing stale pid file"
+      rm -f "${CLIENT_PID_FILE}" 2>/dev/null || true
+      return 0
+    fi
+
+    local cmdline=""
+    if [[ -r "/proc/${client_pid}/cmdline" ]]; then
+      cmdline="$(tr '\0' ' ' < "/proc/${client_pid}/cmdline" 2>/dev/null || true)"
+    fi
+    if [[ "${cmdline}" != *"multiturn_trace_client.py"* ]]; then
+      echo "PID ${client_pid} from ${CLIENT_PID_FILE} is not multiturn_trace_client.py; skip client stop"
+      return 0
+    fi
+
+    echo "Stopping client process ${client_pid} (grace=${CLIENT_STOP_GRACE_SECONDS}s)..."
+    kill -INT "${client_pid}" 2>/dev/null || true
+
+    local deadline=$((SECONDS + CLIENT_STOP_GRACE_SECONDS))
+    while kill -0 "${client_pid}" 2>/dev/null && (( SECONDS < deadline )); do
+      sleep 1
+    done
+
+    if kill -0 "${client_pid}" 2>/dev/null; then
+      kill -TERM "${client_pid}" 2>/dev/null || true
+      deadline=$((SECONDS + CLIENT_STOP_GRACE_SECONDS))
+      while kill -0 "${client_pid}" 2>/dev/null && (( SECONDS < deadline )); do
+        sleep 1
+      done
+    fi
+
+    if kill -0 "${client_pid}" 2>/dev/null; then
+      kill -KILL "${client_pid}" 2>/dev/null || true
+    fi
+
+    rm -f "${CLIENT_PID_FILE}" 2>/dev/null || true
+  }
+
+  all_timestamps_ready() {
+    MISSING_TIMESTAMP_FILES=()
+    if [[ ${#EXPECTED_TIMESTAMP_FILES[@]} -eq 0 ]]; then
+      return 0
+    fi
+
+    local f
+    for f in "${EXPECTED_TIMESTAMP_FILES[@]}"; do
+      if [[ ! -s "${f}" ]]; then
+        MISSING_TIMESTAMP_FILES+=("${f}")
+      fi
+    done
+
+    [[ ${#MISSING_TIMESTAMP_FILES[@]} -eq 0 ]]
+  }
+
+  wait_for_groups_and_timestamps() {
+    local timeout="$1"
+    local deadline=$((SECONDS + timeout))
+    while (( SECONDS < deadline )); do
+      local alive=0
+      for pid in "${PIDS[@]}"; do
+        if kill -0 -- "-${pid}" 2>/dev/null; then
+          alive=1
+          break
+        fi
+      done
+      if (( alive == 0 )); then
+        if all_timestamps_ready; then
+          return 0
+        fi
+      fi
+      sleep 1
+    done
+    return 1
+  }
+
+  stop_client_if_needed
+
   if [[ ${#PIDS[@]} -gt 0 ]]; then
-    echo "Stopping ${#PIDS[@]} processes..."
+    echo "Stopping ${#PIDS[@]} processes (grace=${SHUTDOWN_GRACE_SECONDS}s)..."
+
+    # 1) First attempt: SIGINT (lets vLLM run shutdown hooks and dump files).
     for pid in "${PIDS[@]}"; do
       # Each service is started with setsid, so its PID is also its PGID.
-      kill -- "-${pid}" 2>/dev/null || true
+      kill -INT -- "-${pid}" 2>/dev/null || true
     done
-    sleep 1
+    wait_for_groups_and_timestamps "${SHUTDOWN_GRACE_SECONDS}" || true
+
+    # 2) Second attempt: SIGTERM for any survivors.
     for pid in "${PIDS[@]}"; do
-      kill -9 -- "-${pid}" 2>/dev/null || true
+      if kill -0 -- "-${pid}" 2>/dev/null; then
+        kill -TERM -- "-${pid}" 2>/dev/null || true
+      fi
+    done
+    wait_for_groups_and_timestamps "${SHUTDOWN_GRACE_SECONDS}" || true
+
+    if ! all_timestamps_ready; then
+      echo "Warning: timestamp files still missing before force kill:"
+      for f in "${MISSING_TIMESTAMP_FILES[@]}"; do
+        echo "  - ${f}"
+      done
+    fi
+
+    # 3) Last resort: SIGKILL.
+    for pid in "${PIDS[@]}"; do
+      if kill -0 -- "-${pid}" 2>/dev/null; then
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+      fi
     done
   fi
   wait 2>/dev/null || true
@@ -259,6 +403,10 @@ echo "  MAX_MODEL_LEN=${MAX_MODEL_LEN} (0 means auto/model default)"
 echo "  MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS} (0 means auto)"
 echo "  LICHT=${LICHT}"
 echo "  TRACE_REPLAY_PATH=${TRACE_REPLAY_PATH}"
+echo "  SHUTDOWN_GRACE_SECONDS=${SHUTDOWN_GRACE_SECONDS}"
+echo "  CLIENT_PID_FILE=${CLIENT_PID_FILE}"
+echo "  STOP_CLIENT_ON_EXIT=${STOP_CLIENT_ON_EXIT}"
+echo "  CLIENT_STOP_GRACE_SECONDS=${CLIENT_STOP_GRACE_SECONDS}"
 echo "  PROXY_DISCOVERY=tcp://${PROXY_DISCOVERY_HOST}:${PROXY_DISCOVERY_PORT}"
 echo "  PROXY_API=http://${PROXY_API_HOST}:${PROXY_API_PORT}"
 echo ""
@@ -270,6 +418,7 @@ cd "${SCRIPT_DIR}"
 rm -rf "${SCRIPT_DIR}/continuum_exp"/prefill_* "${SCRIPT_DIR}/continuum_exp"/decode_* 2>/dev/null || true
 
 mkdir -p "${SCRIPT_DIR}/continuum_exp"
+EXPECTED_TIMESTAMP_FILES=()
 
 echo "Starting proxy..."
 setsid python3 "${PROXY_SCRIPT}" \
@@ -303,6 +452,10 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
   prefill_output_dir="${SCRIPT_DIR}/continuum_exp/prefill_${http_port}"
   rm -rf "${prefill_output_dir}"
   mkdir -p "${prefill_output_dir}"
+  EXPECTED_TIMESTAMP_FILES+=(
+    "${prefill_output_dir}/scheduler_timestamps"
+    "${prefill_output_dir}/monitoring_timestamps"
+  )
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid vllm serve "${MODEL_PATH}" \
     --enforce-eager \
@@ -344,6 +497,10 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
   decode_output_dir="${SCRIPT_DIR}/continuum_exp/decode_${http_port}"
   rm -rf "${decode_output_dir}"
   mkdir -p "${decode_output_dir}"
+  EXPECTED_TIMESTAMP_FILES+=(
+    "${decode_output_dir}/scheduler_timestamps"
+    "${decode_output_dir}/monitoring_timestamps"
+  )
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid vllm serve "${MODEL_PATH}" \
     --enforce-eager \
