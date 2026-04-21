@@ -258,6 +258,10 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
 
+        if outputs.scheduler_stats is not None:
+            monitoring_recorder.record_scheduler_stats_from_snapshot(
+                outputs.scheduler_stats)
+
         # 4) Record stats
         if self.stat_logger is not None:
             assert outputs.scheduler_stats is not None

@@ -27,7 +27,7 @@ DECODE_GPU_MEMORY_UTILIZATION=0.95
 # DistServe-style direct block migration mode.
 # Decode actively pops bridge metadata and migrates blocks from prefill.
 KV_SEND_TYPE="BLOCK_MIGRATE"
-REQUEST_COMPLETION_TIMEOUT_S=300
+REQUEST_COMPLETION_TIMEOUT_S=600
 GET_RETRY_TIMEOUT_S=60
 GET_RETRY_INTERVAL_S=0.005
 
@@ -42,6 +42,7 @@ LICHT=false
 WAIT_TIMEOUT_SECONDS=1200
 SHUTDOWN_GRACE_SECONDS=20
 CLIENT_STOP_GRACE_SECONDS=20
+FAIL_ON_WAIT_TIMEOUT=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -82,6 +83,8 @@ Options:
   --trace-replay-path PATH     Trace replay JSON path for workers
                                (default: ${TRACE_REPLAY_PATH})
   --wait-timeout SECONDS       Wait timeout for each worker endpoint (default: ${WAIT_TIMEOUT_SECONDS})
+  --fail-on-wait-timeout       Exit launcher if any worker readiness check times out
+                               (default: continue running and wait for Ctrl+C)
   --shutdown-grace-seconds N   Grace window per signal phase before force kill
                                (default: ${SHUTDOWN_GRACE_SECONDS})
   --client-pid-file PATH       PID file for multiturn_trace_client.py
@@ -168,6 +171,10 @@ while [[ $# -gt 0 ]]; do
       WAIT_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
+    --fail-on-wait-timeout)
+      FAIL_ON_WAIT_TIMEOUT=true
+      shift
+      ;;
     --shutdown-grace-seconds)
       SHUTDOWN_GRACE_SECONDS="$2"
       shift 2
@@ -223,6 +230,11 @@ fi
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "curl command not found"
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq command not found"
   exit 1
 fi
 
@@ -286,6 +298,8 @@ cleanup() {
 
   all_timestamps_ready() {
     MISSING_TIMESTAMP_FILES=()
+    INVALID_MONITORING_TIMESTAMP_FILES=()
+    PENDING_MONITORING_TMP_FILES=()
     if [[ ${#EXPECTED_TIMESTAMP_FILES[@]} -eq 0 ]]; then
       return 0
     fi
@@ -294,10 +308,35 @@ cleanup() {
     for f in "${EXPECTED_TIMESTAMP_FILES[@]}"; do
       if [[ ! -s "${f}" ]]; then
         MISSING_TIMESTAMP_FILES+=("${f}")
+        continue
+      fi
+
+      if [[ "$(basename "${f}")" == "monitoring_timestamps" ]]; then
+        if ! jq -e . "${f}" >/dev/null 2>&1; then
+          INVALID_MONITORING_TIMESTAMP_FILES+=("${f}")
+        fi
+        if compgen -G "${f}.tmp.*" >/dev/null; then
+          PENDING_MONITORING_TMP_FILES+=("${f}")
+        fi
       fi
     done
 
-    [[ ${#MISSING_TIMESTAMP_FILES[@]} -eq 0 ]]
+    [[ ${#MISSING_TIMESTAMP_FILES[@]} -eq 0 && \
+       ${#INVALID_MONITORING_TIMESTAMP_FILES[@]} -eq 0 && \
+       ${#PENDING_MONITORING_TMP_FILES[@]} -eq 0 ]]
+  }
+
+  print_timestamp_integrity_issues() {
+    local f
+    for f in "${MISSING_TIMESTAMP_FILES[@]}"; do
+      echo "  - missing/empty: ${f}"
+    done
+    for f in "${INVALID_MONITORING_TIMESTAMP_FILES[@]}"; do
+      echo "  - invalid JSON (jq failed): ${f}"
+    done
+    for f in "${PENDING_MONITORING_TMP_FILES[@]}"; do
+      echo "  - tmp still present: ${f}.tmp.*"
+    done
   }
 
   wait_for_groups_and_timestamps() {
@@ -342,18 +381,23 @@ cleanup() {
     wait_for_groups_and_timestamps "${SHUTDOWN_GRACE_SECONDS}" || true
 
     if ! all_timestamps_ready; then
-      echo "Warning: timestamp files still missing before force kill:"
-      for f in "${MISSING_TIMESTAMP_FILES[@]}"; do
-        echo "  - ${f}"
-      done
+      echo "Warning: strong timestamp integrity check not yet satisfied:"
+      print_timestamp_integrity_issues
+      echo "Waiting extra ${SHUTDOWN_GRACE_SECONDS}s for graceful finalization..."
+      wait_for_groups_and_timestamps "${SHUTDOWN_GRACE_SECONDS}" || true
     fi
 
-    # 3) Last resort: SIGKILL.
-    for pid in "${PIDS[@]}"; do
-      if kill -0 -- "-${pid}" 2>/dev/null; then
-        kill -KILL -- "-${pid}" 2>/dev/null || true
-      fi
-    done
+    # 3) Last resort: SIGKILL (only after strong integrity checks pass).
+    if all_timestamps_ready; then
+      for pid in "${PIDS[@]}"; do
+        if kill -0 -- "-${pid}" 2>/dev/null; then
+          kill -KILL -- "-${pid}" 2>/dev/null || true
+        fi
+      done
+    else
+      echo "Skipping SIGKILL to avoid truncating monitoring dumps."
+      print_timestamp_integrity_issues
+    fi
   fi
   wait 2>/dev/null || true
 }
@@ -403,6 +447,7 @@ echo "  MAX_MODEL_LEN=${MAX_MODEL_LEN} (0 means auto/model default)"
 echo "  MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS} (0 means auto)"
 echo "  LICHT=${LICHT}"
 echo "  TRACE_REPLAY_PATH=${TRACE_REPLAY_PATH}"
+echo "  FAIL_ON_WAIT_TIMEOUT=${FAIL_ON_WAIT_TIMEOUT}"
 echo "  SHUTDOWN_GRACE_SECONDS=${SHUTDOWN_GRACE_SECONDS}"
 echo "  CLIENT_PID_FILE=${CLIENT_PID_FILE}"
 echo "  STOP_CLIENT_ON_EXIT=${STOP_CLIENT_ON_EXIT}"
@@ -520,18 +565,38 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
   PIDS+=("$!")
 done
 
+READY_TIMEOUT_PORTS=()
+
 echo "Waiting prefill workers..."
 for port in "${PREFILL_PORTS[@]}"; do
-  wait_for_http_ready "${port}" "${WAIT_TIMEOUT_SECONDS}"
+  if ! wait_for_http_ready "${port}" "${WAIT_TIMEOUT_SECONDS}"; then
+    READY_TIMEOUT_PORTS+=("prefill:${port}")
+  fi
 done
 
 echo "Waiting decode workers..."
 for port in "${DECODE_PORTS[@]}"; do
-  wait_for_http_ready "${port}" "${WAIT_TIMEOUT_SECONDS}"
+  if ! wait_for_http_ready "${port}" "${WAIT_TIMEOUT_SECONDS}"; then
+    READY_TIMEOUT_PORTS+=("decode:${port}")
+  fi
 done
 
 echo ""
-echo "All services are ready."
+if [[ ${#READY_TIMEOUT_PORTS[@]} -gt 0 ]]; then
+  echo "Warning: readiness check timed out for the following endpoints:"
+  for item in "${READY_TIMEOUT_PORTS[@]}"; do
+    echo "  - ${item}"
+  done
+
+  if [[ "${FAIL_ON_WAIT_TIMEOUT}" == "true" ]]; then
+    echo "Configured with --fail-on-wait-timeout, exiting launcher."
+    exit 1
+  fi
+
+  echo "Continuing to run existing processes; launcher will wait until Ctrl+C."
+else
+  echo "All services are ready."
+fi
 echo "Proxy endpoint: http://127.0.0.1:${PROXY_API_PORT}"
 echo "Per-instance timestamps directory: ${SCRIPT_DIR}/continuum_exp"
 echo ""

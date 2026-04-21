@@ -102,7 +102,7 @@ class Scheduler(SchedulerInterface):
     # Update these constants directly if you need to retune the strategy.
     LICHT_PREFILL_SCORE_A = 3.0
     LICHT_PREFILL_SCORE_B = 1.0
-    LICHT_PREFILL_SCORE_TMAX_S = 2.0
+    LICHT_PREFILL_SCORE_TMAX_S = 120.0
 
     def __init__(
         self,
@@ -391,9 +391,12 @@ class Scheduler(SchedulerInterface):
             now_monotonic,
         )
         twait = max(now_monotonic - wait_start, 0.0)
-        wait_term = min(twait / self.LICHT_PREFILL_SCORE_TMAX_S, 1.0)
+        # LICHT score form: A * log(1 + k_i)
+        #                 + B * exp(-k_i) * max(twait - tmax, 0)
+        wait_term = max(twait - self.LICHT_PREFILL_SCORE_TMAX_S, 0.0)
+        round_decay = math.exp(-ki)
         return (self.LICHT_PREFILL_SCORE_A * math.log1p(ki)
-                + self.LICHT_PREFILL_SCORE_B * wait_term)
+                + self.LICHT_PREFILL_SCORE_B * round_decay * wait_term)
 
     def _peek_waiting_request(self) -> Request:
         if self.licht_prefill_sched_enabled:
@@ -1568,19 +1571,11 @@ class Scheduler(SchedulerInterface):
         num_preempted = sum(
             1 for req in self.waiting
             if req.status == RequestStatus.PREEMPTED)
-        monitoring_recorder.record_scheduler_stats(
-            timestamp=time.time(),
-            num_running=len(self.running),
-            num_waiting=len(self.waiting),
-            num_waiting_for_remote_kvs=num_waiting_for_remote_kvs,
-            num_preempted=num_preempted,
-            kv_cache_usage=self.kv_cache_manager.usage,
-            prefix_cache_queries=prefix_cache_stats.queries,
-            prefix_cache_hits=prefix_cache_stats.hits,
-        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            num_waiting_for_remote_kvs=num_waiting_for_remote_kvs,
+            num_preempted=num_preempted,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,

@@ -10,6 +10,11 @@ import time
 from collections import defaultdict
 from typing import Any, Optional
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
 
 class MonitoringRecorder:
     """Lightweight recorder for offline analysis.
@@ -80,6 +85,24 @@ class MonitoringRecorder:
             "prefix_cache_hits": prefix_cache_hits,
         })
 
+    def record_scheduler_stats_from_snapshot(self,
+                                             scheduler_stats: Any) -> None:
+        if scheduler_stats is None:
+            return
+
+        prefix_cache_stats = getattr(scheduler_stats, "prefix_cache_stats", None)
+        self.record_scheduler_stats(
+            timestamp=time.time(),
+            num_running=int(getattr(scheduler_stats, "num_running_reqs", 0)),
+            num_waiting=int(getattr(scheduler_stats, "num_waiting_reqs", 0)),
+            num_waiting_for_remote_kvs=int(
+                getattr(scheduler_stats, "num_waiting_for_remote_kvs", 0)),
+            num_preempted=int(getattr(scheduler_stats, "num_preempted", 0)),
+            kv_cache_usage=float(getattr(scheduler_stats, "kv_cache_usage", 0.0)),
+            prefix_cache_queries=int(getattr(prefix_cache_stats, "queries", 0)),
+            prefix_cache_hits=int(getattr(prefix_cache_stats, "hits", 0)),
+        )
+
     def record_iteration_stats(self, iteration_stats: Any) -> None:
         self.iteration_stats.append({
             "timestamp": iteration_stats.iteration_timestamp,
@@ -141,41 +164,61 @@ class MonitoringRecorder:
         output_dir = self._get_output_dir()
         os.makedirs(output_dir, exist_ok=True)
         final_path = os.path.join(output_dir, "monitoring_timestamps")
+        lock_path = f"{final_path}.lock"
         tmp_path = f"{final_path}.tmp.{os.getpid()}.{time.time_ns()}"
-        existing: dict[str, Any] = {}
-        if os.path.exists(final_path):
+
+        # Multiple processes (API + engine core) can dump concurrently.
+        # Locking keeps read-merge-write atomic and avoids data loss.
+        with builtins.open(lock_path, "a") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                with builtins.open(final_path, "r") as f:
-                    existing = json.load(f)
-            except Exception:
-                existing = {}
+                existing: dict[str, Any] = {}
+                if os.path.exists(final_path):
+                    try:
+                        with builtins.open(final_path, "r") as f:
+                            existing = json.load(f)
+                    except Exception:
+                        existing = {}
 
-        merged_request_meta = dict(existing.get("request_meta") or {})
-        merged_request_meta.update(self.request_meta)
+                merged_request_meta = dict(existing.get("request_meta") or {})
+                merged_request_meta.update(self.request_meta)
 
-        merged_request_stats = dict(existing.get("request_stats") or {})
-        merged_request_stats.update(self.request_stats)
+                merged_request_stats = dict(existing.get("request_stats") or {})
+                merged_request_stats.update(self.request_stats)
 
-        merged_scheduler_stats = list(existing.get("scheduler_stats") or [])
-        merged_scheduler_stats.extend(self.scheduler_stats)
+                merged_scheduler_stats = list(existing.get("scheduler_stats") or [])
+                merged_scheduler_stats.extend(self.scheduler_stats)
 
-        merged_iteration_stats = list(existing.get("iteration_stats") or [])
-        merged_iteration_stats.extend(self.iteration_stats)
+                merged_iteration_stats = list(existing.get("iteration_stats") or [])
+                merged_iteration_stats.extend(self.iteration_stats)
 
-        merged_tool_call_times = dict(existing.get("tool_call_times") or {})
-        for job_id, entries in self.tool_call_times.items():
-            merged_tool_call_times.setdefault(job_id, [])
-            merged_tool_call_times[job_id].extend(entries)
+                merged_tool_call_times = dict(existing.get("tool_call_times") or {})
+                for job_id, entries in self.tool_call_times.items():
+                    merged_tool_call_times.setdefault(job_id, [])
+                    merged_tool_call_times[job_id].extend(entries)
 
-        with builtins.open(tmp_path, "w") as f:
-            json.dump({
-                "request_meta": merged_request_meta,
-                "request_stats": merged_request_stats,
-                "scheduler_stats": merged_scheduler_stats,
-                "iteration_stats": merged_iteration_stats,
-                "tool_call_times": merged_tool_call_times,
-            }, f, indent=2)
-        os.replace(tmp_path, final_path)
+                with builtins.open(tmp_path, "w") as f:
+                    json.dump({
+                        "request_meta": merged_request_meta,
+                        "request_stats": merged_request_stats,
+                        "scheduler_stats": merged_scheduler_stats,
+                        "iteration_stats": merged_iteration_stats,
+                        "tool_call_times": merged_tool_call_times,
+                    },
+                              f,
+                              indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, final_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 monitoring_recorder = MonitoringRecorder()

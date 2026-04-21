@@ -474,6 +474,10 @@ class AsyncLLM(EngineClient):
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort)
 
+                    if outputs.scheduler_stats is not None:
+                        monitoring_recorder.record_scheduler_stats_from_snapshot(
+                            outputs.scheduler_stats)
+
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
