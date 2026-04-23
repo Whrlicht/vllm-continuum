@@ -3,6 +3,7 @@
 
 import logging
 import os
+import queue as queue_mod
 import threading
 import time
 import typing
@@ -34,6 +35,15 @@ DEFAULT_GET_RETRY_TIMEOUT_S = 30.0
 DEFAULT_GET_RETRY_INTERVAL_S = 0.002
 IPC_HANDLE_SIZE_BYTES = ctypes.sizeof(cudaIpcMemHandle_t)
 DIRECT_BLOCK_SEND_TYPES = {"BLOCK_MIGRATE", "BLOCK_DIRECT", "DISTSERVE"}
+
+# Module-level fast-release channel: listener thread → scheduler (same process).
+# Populated by the producer-side listener on RELEASE; drained by the
+# scheduler via poll_fast_release_queue().
+_fast_release_queue: Optional[queue_mod.SimpleQueue] = None
+
+
+def get_fast_release_queue() -> Optional[queue_mod.SimpleQueue]:
+    return _fast_release_queue
 
 
 @contextmanager
@@ -196,6 +206,20 @@ class P2pNcclEngine:
         self.completed_recving_req_ids: set[str] = set()
         self.completed_release_req_ids: set[str] = set()
 
+        # Per-request delay-free timestamps collected on the worker side.
+        # {req_id: {event_name: timestamp}}
+        self._delay_free_ts: dict[str, dict[str, float]] = {}
+
+        # Bridge data pushed proactively from prefill (Change 2).
+        self._prefetched_bridges: dict[str, list[int]] = {}
+
+        # Fast-release channel: only initialised on the producer side
+        # so that the scheduler (same process, uniproc) can drain it.
+        if self.config.is_kv_producer:
+            global _fast_release_queue
+            if _fast_release_queue is None:
+                _fast_release_queue = queue_mod.SimpleQueue()
+
         self.nccl_num_channels = self.config.get_from_extra_config(
             "nccl_num_channels", "8")
 
@@ -207,6 +231,15 @@ class P2pNcclEngine:
         if port_offset == 0 and self.proxy_address != "":
             self._ping_thread = threading.Thread(target=self.ping, daemon=True)
             self._ping_thread.start()
+
+        # Background thread that polls cuda migration events and sends
+        # RELEASE immediately, bypassing D-side forward step cadence.
+        self._migration_poll_stop = threading.Event()
+        self._migration_poll_thread: Optional[threading.Thread] = None
+        if self.direct_block_mode:
+            self._migration_poll_thread = threading.Thread(
+                target=self._migration_poll_loop, daemon=True)
+            self._migration_poll_thread.start()
 
         logger.info(
             "💯P2pNcclEngine init, rank:%d, local_rank:%d, http_address:%s, "
@@ -260,6 +293,8 @@ class P2pNcclEngine:
                              context_block_ids: list[int]) -> None:
         with self.state_lock:
             self.bridge_queue[request_id] = context_block_ids
+        self._delay_free_ts.setdefault(request_id, {})[
+            "bridge_staged_ts"] = time.time()
 
     def pop_bridge_request(self,
                            request_id: str,
@@ -280,6 +315,8 @@ class P2pNcclEngine:
                 },
             )
             if payload.get("ret") == 0:
+                self._delay_free_ts.setdefault(request_id, {})[
+                    "bridge_popped_ts"] = time.time()
                 return [int(x) for x in payload.get("context_block_ids", [])]
             return None
 
@@ -293,6 +330,8 @@ class P2pNcclEngine:
                 },
             )
             if payload.get("ret") == 0:
+                self._delay_free_ts.setdefault(request_id, {})[
+                    "bridge_popped_ts"] = time.time()
                 return [int(x) for x in payload.get("context_block_ids", [])]
 
             if time.time() >= deadline:
@@ -348,6 +387,8 @@ class P2pNcclEngine:
                     raise RuntimeError("Remote KV views are not initialized "
                                        f"for {remote_address}")
 
+                self._delay_free_ts.setdefault(request_id, {})[
+                    "migration_launch_ts"] = time.time()
                 event = torch.cuda.Event(blocking=False)
                 with torch.cuda.stream(self.recv_stream):
                     for layer_name, dst_kv_cache in self.kv_caches.items():
@@ -552,21 +593,123 @@ class P2pNcclEngine:
         sock.send(msgpack.dumps(payload))
         return msgpack.loads(sock.recv())
 
-    def _send_release_callback(self, request_id: str,
-                               remote_address: str) -> None:
-        payload = self._rpc(
-            remote_address,
-            {
-                "cmd": "RELEASE",
+    # ------------------------------------------------------------------
+    # Background migration poll thread (Change 1)
+    # ------------------------------------------------------------------
+
+    def _migration_poll_loop(self) -> None:
+        """Dedicated thread: poll cuda events, send RELEASE immediately."""
+        poll_socks: dict[str, zmq.Socket] = {}
+        poll_ctx = zmq.Context()
+
+        while not self._migration_poll_stop.is_set():
+            done: list[tuple[str, str]] = []
+            with self.state_lock:
+                for req_id, (event, addr) in list(
+                        self.pending_migrations.items()):
+                    if event.query():
+                        done.append((req_id, addr))
+
+            if not done:
+                self._migration_poll_stop.wait(0.001)
+                continue
+
+            migration_complete_ts = time.time()
+            for req_id, addr in done:
+                decode_ts = self._delay_free_ts.pop(req_id, {})
+                decode_ts["migration_complete_ts"] = migration_complete_ts
+                decode_ts["release_callback_sent_ts"] = time.time()
+                self._poll_thread_send_release(
+                    poll_ctx, poll_socks, req_id, addr, decode_ts)
+
+            with self.state_lock:
+                for req_id, _ in done:
+                    self.pending_migrations.pop(req_id, None)
+                    self.completed_recving_req_ids.add(req_id)
+
+        # Cleanup sockets on exit.
+        for s in poll_socks.values():
+            s.close(linger=0)
+        poll_ctx.term()
+
+    def _poll_thread_send_release(
+        self,
+        ctx: zmq.Context,
+        socks: dict[str, zmq.Socket],
+        request_id: str,
+        remote_address: str,
+        extra_ts: Optional[dict[str, float]],
+    ) -> None:
+        """Send RELEASE via the poll-thread's own ZMQ socket."""
+        if remote_address not in socks:
+            sock = ctx.socket(zmq.DEALER)
+            identity = f"{self.zmq_address}#poll"
+            sock.setsockopt_string(zmq.IDENTITY, identity)
+            sock.connect(f"tcp://{remote_address}")
+            socks[remote_address] = sock
+        sock = socks[remote_address]
+        rpc_payload: dict[str, Any] = {
+            "cmd": "RELEASE",
+            "request_id": request_id,
+        }
+        if extra_ts:
+            rpc_payload["timestamps"] = extra_ts
+        sock.send(msgpack.dumps(rpc_payload))
+        resp = msgpack.loads(sock.recv())
+        if resp.get("ret") != 0:
+            logger.warning(
+                "Poll-thread RELEASE failed, req:%s remote:%s resp:%s",
+                request_id, remote_address, resp)
+
+    # ------------------------------------------------------------------
+    # Prefetched bridge helpers (Change 2)
+    # ------------------------------------------------------------------
+
+    def pop_prefetched_bridge(self, request_id: str) -> Optional[list[int]]:
+        """Return and remove prefetched bridge data (thread-safe)."""
+        with self.state_lock:
+            return self._prefetched_bridges.pop(request_id, None)
+
+    def push_bridge_to_decode(self, request_id: str,
+                              context_block_ids: list[int],
+                              decode_address: str) -> None:
+        """Proactively push bridge data to decode (avoids BRIDGE_POP)."""
+        try:
+            self._rpc(decode_address, {
+                "cmd": "BRIDGE_PUSH",
                 "request_id": request_id,
-            },
-        )
+                "context_block_ids": context_block_ids,
+            })
+        except Exception:
+            logger.debug(
+                "Bridge push to %s failed for %s, decode will fallback "
+                "to BRIDGE_POP", decode_address, request_id)
+
+    # ------------------------------------------------------------------
+
+    def _send_release_callback(self, request_id: str,
+                               remote_address: str,
+                               extra_ts: Optional[dict[str, float]] = None,
+                               ) -> None:
+        rpc_payload: dict[str, Any] = {
+            "cmd": "RELEASE",
+            "request_id": request_id,
+        }
+        if extra_ts:
+            rpc_payload["timestamps"] = extra_ts
+        payload = self._rpc(remote_address, rpc_payload)
         if payload.get("ret") != 0:
             logger.warning(
                 "🚧[BLOCK]Release callback failed, request_id:%s, "
                 "remote:%s, payload:%s", request_id, remote_address, payload)
 
     def _poll_completed_migrations(self) -> None:
+        # When the background poll thread is active, it handles cuda event
+        # polling and RELEASE sending directly — skip here to avoid
+        # double-processing.
+        if self._migration_poll_thread is not None:
+            return
+
         if not self.pending_migrations:
             return
 
@@ -581,8 +724,15 @@ class P2pNcclEngine:
         if not done:
             return
 
+        migration_complete_ts = time.time()
         for request_id, remote_address in done:
-            self._send_release_callback(request_id, remote_address)
+            # Gather all decode-side timestamps for this request and
+            # carry them inside the RELEASE RPC to the prefill side.
+            decode_ts = self._delay_free_ts.pop(request_id, {})
+            decode_ts["migration_complete_ts"] = migration_complete_ts
+            decode_ts["release_callback_sent_ts"] = time.time()
+            self._send_release_callback(request_id, remote_address,
+                                        extra_ts=decode_ts)
 
         with self.state_lock:
             for request_id, _ in done:
@@ -751,10 +901,39 @@ class P2pNcclEngine:
                     }
                 self.router_socket.send_multipart(
                     [remote_address, msgpack.dumps(payload)])
+            elif data["cmd"] == "BRIDGE_PUSH":
+                request_id = data["request_id"]
+                context_block_ids = data.get("context_block_ids")
+                if context_block_ids is not None:
+                    with self.state_lock:
+                        self._prefetched_bridges[request_id] = context_block_ids
+                    self.router_socket.send_multipart(
+                        [remote_address, msgpack.dumps({"ret": 0})])
+                else:
+                    self.router_socket.send_multipart(
+                        [remote_address, msgpack.dumps({"ret": 1})])
             elif data["cmd"] == "RELEASE":
                 request_id = data["request_id"]
-                with self.state_lock:
-                    self.completed_release_req_ids.add(request_id)
+                release_received_ts = time.time()
+                # Store timestamps carried by the decode-side RELEASE RPC
+                # plus the local receive timestamp.
+                ts_entry = self._delay_free_ts.setdefault(request_id, {})
+                ts_entry["release_received_ts"] = release_received_ts
+                remote_ts = data.get("timestamps")
+                if remote_ts and isinstance(remote_ts, dict):
+                    ts_entry.update(remote_ts)
+                # Fast-release channel: push to module-level queue so that the
+                # scheduler can drain it without waiting for the next forward
+                # step's get_finished().  When the queue is active, do NOT
+                # add to completed_release_req_ids — the fast path handles
+                # block release exclusively, avoiding a race with the old
+                # get_finished() path.
+                if _fast_release_queue is not None:
+                    _fast_release_queue.put_nowait(
+                        (request_id, ts_entry.copy()))
+                else:
+                    with self.state_lock:
+                        self.completed_release_req_ids.add(request_id)
                 self.router_socket.send_multipart(
                     [remote_address, msgpack.dumps({"ret": 0})])
             elif data["cmd"] == "PUT":
@@ -989,37 +1168,91 @@ class P2pNcclEngine:
                 self.completed_recving_req_ids.clear()
 
             if self.config.is_kv_producer:
-                # Producer can free blocks only after decode confirms migration
-                # completion via release callback.
-                for request_id in finished_req_ids:
-                    if request_id in self.completed_release_req_ids:
-                        finished_sending.add(request_id)
-                        self.completed_release_req_ids.discard(request_id)
-                        self.pending_release_deadlines.pop(request_id, None)
-                    elif request_id not in self.pending_release_deadlines:
-                        self.pending_release_deadlines[
-                            request_id] = now + self.request_completion_timeout_s
+                # Producer can free local request state only after decode
+                # sends RELEASE. This is required for bridge metadata/KV
+                # correctness in direct block migration.
+                if _fast_release_queue is not None:
+                    # Fast-release path: RELEASE is consumed by scheduler via
+                    # _fast_release_queue, so completed_release_req_ids is not
+                    # populated. Track completion using release_received_ts
+                    # written by the listener thread.
+                    for request_id in finished_req_ids:
+                        ts = self._delay_free_ts.get(request_id)
+                        if ts is not None and "release_received_ts" in ts:
+                            finished_sending.add(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            ts.setdefault("finished_sending_ts", now)
+                        elif request_id not in self.pending_release_deadlines:
+                            self.pending_release_deadlines[
+                                request_id] = (
+                                    now + self.request_completion_timeout_s)
 
-                for request_id, deadline in list(
-                        self.pending_release_deadlines.items()):
-                    if request_id in self.completed_release_req_ids:
-                        finished_sending.add(request_id)
-                        self.completed_release_req_ids.discard(request_id)
-                        self.pending_release_deadlines.pop(request_id, None)
-                    elif now >= deadline:
-                        logger.warning(
-                            "⚠️KV release callback timeout, request_id:%s, "
-                            "rank:%d; keep waiting to avoid dropping "
-                            "unreleased direct-migrate KV", request_id,
-                            self.rank)
-                        # Keep waiting for decode release callback. Do not
-                        # mark sending finished here, otherwise producer may
-                        # free/reuse blocks before decode migration consumes
-                        # them.
-                        self.pending_release_deadlines[
-                            request_id] = now + self.request_completion_timeout_s
+                    for request_id, deadline in list(
+                            self.pending_release_deadlines.items()):
+                        ts = self._delay_free_ts.get(request_id)
+                        if ts is not None and "release_received_ts" in ts:
+                            finished_sending.add(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            ts.setdefault("finished_sending_ts", now)
+                        elif now >= deadline:
+                            logger.warning(
+                                "⚠️RELEASE timeout (%.0fs), force-freeing "
+                                "blocks for request_id:%s, rank:%d",
+                                self.request_completion_timeout_s,
+                                request_id, self.rank)
+                            finished_sending.add(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            ts = self._delay_free_ts.setdefault(
+                                request_id, {})
+                            ts.setdefault("finished_sending_ts", now)
+                            ts["release_timeout"] = True
 
-                pending_sending = set(self.pending_release_deadlines.keys())
+                    pending_sending = set(
+                        self.pending_release_deadlines.keys())
+                else:
+                    # Old path: producer can free blocks only after decode
+                    # confirms migration via release callback.
+                    for request_id in finished_req_ids:
+                        if request_id in self.completed_release_req_ids:
+                            finished_sending.add(request_id)
+                            self.completed_release_req_ids.discard(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            self._delay_free_ts.setdefault(
+                                request_id, {})["finished_sending_ts"] = now
+                        elif request_id not in self.pending_release_deadlines:
+                            self.pending_release_deadlines[
+                                request_id] = (
+                                    now + self.request_completion_timeout_s)
+
+                    for request_id, deadline in list(
+                            self.pending_release_deadlines.items()):
+                        if request_id in self.completed_release_req_ids:
+                            finished_sending.add(request_id)
+                            self.completed_release_req_ids.discard(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            self._delay_free_ts.setdefault(
+                                request_id, {})["finished_sending_ts"] = now
+                        elif now >= deadline:
+                            logger.warning(
+                                "⚠️RELEASE timeout (%.0fs), force-freeing "
+                                "blocks for request_id:%s, rank:%d",
+                                self.request_completion_timeout_s,
+                                request_id, self.rank)
+                            finished_sending.add(request_id)
+                            self.pending_release_deadlines.pop(
+                                request_id, None)
+                            self._delay_free_ts.setdefault(
+                                request_id, {})["finished_sending_ts"] = now
+                            self._delay_free_ts.setdefault(
+                                request_id, {})["release_timeout"] = True
+
+                    pending_sending = set(
+                        self.pending_release_deadlines.keys())
             else:
                 # Consumer does not wait for release callbacks and should not
                 # report finished_sending from timeout paths.
@@ -1073,6 +1306,8 @@ class P2pNcclEngine:
                 if self._request_is_transfer_complete(request_id, "send"):
                     finished_sending.add(request_id)
                     self.pending_sending_deadlines.pop(request_id, None)
+                    self._delay_free_ts.setdefault(request_id, {})[
+                        "send_complete_ts"] = now
                 elif now >= deadline:
                     sent = len(
                         self.send_request_id_to_tensor_ids.get(request_id,
@@ -1121,6 +1356,16 @@ class P2pNcclEngine:
             self._cleanup_request_state(request_id, no_compile_layers)
 
         return finished_sending or None, finished_recving or None
+
+    def pop_delay_free_timestamps(
+            self, req_ids: set[str]) -> dict[str, dict[str, float]]:
+        """Return and clear delay-free timestamps for the given requests."""
+        result: dict[str, dict[str, float]] = {}
+        for req_id in req_ids:
+            ts = self._delay_free_ts.pop(req_id, None)
+            if ts:
+                result[req_id] = ts
+        return result
 
     def ping(self):
         sock = self.context.socket(zmq.DEALER)

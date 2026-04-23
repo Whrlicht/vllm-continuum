@@ -174,11 +174,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     remote_address = pending_remote_address
                     decoding_block_ids = pending_decoding_block_ids
                 else:
-                    context_block_ids = self.p2p_nccl_engine.pop_bridge_request(
-                        req_meta.request_id,
-                        remote_address,
-                        timeout_s=0.0,
-                    )
+                    # Check prefetched bridge data first (Change 2),
+                    # fall back to BRIDGE_POP if not available.
+                    context_block_ids = \
+                        self.p2p_nccl_engine.pop_prefetched_bridge(
+                            req_meta.request_id)
+                    if context_block_ids is None:
+                        context_block_ids = \
+                            self.p2p_nccl_engine.pop_bridge_request(
+                                req_meta.request_id,
+                                remote_address,
+                                timeout_s=0.0,
+                            )
                     if context_block_ids is None:
                         # Metadata may not be staged yet on producer side.
                         # Keep waiting-for-remote-kv state and retry next step.
@@ -382,6 +389,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 for request_id, context_block_ids in self._pending_bridge_reqs:
                     self.p2p_nccl_engine.stage_bridge_request(
                         request_id, context_block_ids)
+                    # Proactively push bridge data to decode so it doesn't
+                    # need to issue a BRIDGE_POP RPC (Change 2).
+                    try:
+                        ip, port = self.parse_request_id(request_id,
+                                                         is_prefill=True)
+                        decode_address = f"{ip}:{port + self._rank}"
+                        self.p2p_nccl_engine.push_bridge_to_decode(
+                            request_id, context_block_ids, decode_address)
+                    except Exception:
+                        pass  # Decode will fallback to BRIDGE_POP
                 self._pending_bridge_reqs.clear()
                 return
             self.p2p_nccl_engine.wait_for_sent()
@@ -406,6 +423,33 @@ class P2pNcclConnector(KVConnectorBase_V1):
             self._vllm_config.compilation_config.static_forward_context)
         return self.p2p_nccl_engine.get_finished(finished_req_ids,
                                                  no_compile_layers)
+
+    def pop_delay_free_timestamps(
+            self, req_ids: set[str]) -> dict[str, dict[str, float]]:
+        if self.p2p_nccl_engine is not None:
+            return self.p2p_nccl_engine.pop_delay_free_timestamps(req_ids)
+        return {}
+
+    @staticmethod
+    def poll_fast_releases() -> list[tuple[str, dict[str, float]]]:
+        """Drain the fast-release queue (scheduler-side, Change 3).
+
+        Returns a list of (request_id, timestamps) for requests whose
+        RELEASE has been received by the listener thread.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
+            get_fast_release_queue)
+        q = get_fast_release_queue()
+        if q is None:
+            return []
+        released: list[tuple[str, dict[str, float]]] = []
+        while True:
+            try:
+                item = q.get_nowait()
+                released.append(item)
+            except Exception:
+                break
+        return released
 
     # ==============================
     # Scheduler-side methods

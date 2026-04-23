@@ -218,3 +218,13 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
+
+# Experiment logs (large, not for version control)
+/continuum_exp/*
+!/continuum_exp/analyze.py
+!/continuum_exp/multiturn_trace_client.py
+!/continuum_exp/summarize_results.py
+!/continuum_exp/trace_replay_continuum_vs_vllm_report.md
+!/continuum_exp/visualize_results.py
+
+/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/continuum_exp

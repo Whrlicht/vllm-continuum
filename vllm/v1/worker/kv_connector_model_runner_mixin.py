@@ -130,4 +130,11 @@ class KVConnectorModelRunnerMixin:
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids))
 
+            pop_ts = getattr(kv_connector, "pop_delay_free_timestamps", None)
+            if pop_ts is not None:
+                req_ids = output.finished_sending or set()
+                ts = pop_ts(req_ids)
+                if ts:
+                    output.delay_free_timestamps = ts
+
             kv_connector.clear_connector_metadata()

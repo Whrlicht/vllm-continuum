@@ -6,6 +6,8 @@ from __future__ import annotations
 import itertools
 import math
 import os
+import queue as queue_mod
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -242,6 +244,26 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
+        # Requests already freed via the fast-release side-channel (Change 3).
+        self._fast_released_req_ids: set[str] = set()
+
+        # --- Delay-free block tracking (admission control) ---
+        # Number of blocks currently held by delay-free requests (waiting
+        # for RELEASE from decode).  Used by schedule() to avoid evicting
+        # running requests when delay-free blocks will be freed soon.
+        self._num_delay_free_blocks: int = 0
+        self._delay_free_req_ids: set[str] = set()
+
+        # --- Background block-free thread (Change 5) ---
+        # Lock protects kv_cache_manager.free / allocate_slots from
+        # concurrent access by the background thread and the main loop.
+        self._kv_free_lock = threading.Lock()
+        # Deferred cleanup items produced by the background thread.
+        # Each item: (request_id, timestamps_dict)
+        # The main thread drains this at schedule()/update_from_output() to
+        # do non-block cleanup (del requests, pin logic, monitoring).
+        self._deferred_frees: queue_mod.SimpleQueue = queue_mod.SimpleQueue()
+        self._bg_free_thread: Optional[threading.Thread] = None
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -284,6 +306,13 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        # Start background free thread if KV connector is active (producer).
+        if (self.connector is not None
+                and getattr(self.connector, "is_producer", False)):
+            self._bg_free_thread = threading.Thread(
+                target=self._bg_free_loop, daemon=True)
+            self._bg_free_thread.start()
 
     def pop_running_request_based_on_last_step(self, request: Request) -> tuple[Request, bool]:
         """Pop a request from running queue based on job_id level FCFS and last step."""
@@ -334,7 +363,8 @@ class Scheduler(SchedulerInterface):
     def unpin_request(self, request: Request, end_time: float) -> None:
         self.pinned_requests.remove((request, end_time))
         self.continuum_recorder.request_unpinned(request)
-        self.kv_cache_manager.free(request)
+        with self._kv_free_lock:
+            self.kv_cache_manager.free(request)
 
     # TODO (Hanchen) this needs to be called at the beginning of each step to clean up pinned request based on system time
     # The LRU is handled by kv cache mangager through a reference counter
@@ -452,7 +482,22 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-        
+
+        # Change 3: fast-release side-channel — drain RELEASE signals that
+        # arrived between forward steps and free blocks immediately.
+        self._poll_fast_releases()
+
+        # Change 6 (bug fix): ensure delay-free request IDs are included in
+        # finished_req_ids so they are passed to the worker-side
+        # get_finished().  Without this, empty iterations (no scheduled
+        # tokens) pass an empty finished_req_ids set, so the worker's
+        # get_finished() never checks RELEASE status for these requests.
+        # This makes _update_from_kv_xfer_finished a reliable fallback
+        # path for freeing delay-free blocks, in addition to the bg
+        # thread path.
+        if self._delay_free_req_ids:
+            self.finished_req_ids.update(self._delay_free_req_ids)
+
         self.unpin_requests_regular()
         
         #Qiuyang (DEBUG) logging all running queue jobs and waiting queue jobs
@@ -527,16 +572,24 @@ class Scheduler(SchedulerInterface):
             
             logger.debug(f"Trying to schedule request {request.request_id} for {num_new_tokens} tokens")
             while True:
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_lookahead_tokens=self.num_lookahead_tokens)
+                with self._kv_free_lock:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens)
                 if new_blocks is not None:
                     logger.debug(f"New blocks: {new_blocks}")
                 else:
                     logger.debug(f"New blocks is None")
-                
+
                 if new_blocks is None:
+                    # Delay-free admission control: if there are
+                    # delay-free blocks that will be freed soon, skip
+                    # preemption and defer this request to the next step.
+                    if self._num_delay_free_blocks > 0:
+                        can_schedule = False
+                        break
+
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     is_unpin = False
@@ -554,11 +607,11 @@ class Scheduler(SchedulerInterface):
                     elif self.policy == SchedulingPolicy.CONTINUUM:
                         #NOTE (Hanchen) we need to not evict last step requests
                         preempted_req, is_unpin = self.pop_running_request_based_on_last_step(request)
-                        
+
                         #TODO (Hanchen) we need to add a check unpin requests with the same job id.
                         if preempted_req in scheduled_running_reqs:
                             scheduled_running_reqs.remove(preempted_req)
-                    
+
                         if preempted_req.request_id in num_scheduled_tokens:
                             del num_scheduled_tokens[preempted_req.request_id]
                         if preempted_req.request_id in req_to_new_blocks:
@@ -568,7 +621,8 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
 
-                    self.kv_cache_manager.free(preempted_req)
+                    with self._kv_free_lock:
+                        self.kv_cache_manager.free(preempted_req)
                     self.encoder_cache_manager.free(preempted_req)
                     if is_unpin:
                         pass
@@ -783,26 +837,32 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens = 0
 
                 # NOTE (Hanchen) This is allocating new slots. We have already decided to schedule this request
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                with self._kv_free_lock:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
 
                 if new_blocks is None:
                     #print(f"Request {request.request_id} cannot be scheduled due to no slots")
                     # The request cannot be scheduled.
+                    # Delay-free admission control: if delay-free blocks
+                    # will be freed soon, wait instead of evicting pinned.
+                    if self._num_delay_free_blocks > 0:
+                        break
                     # TODO (Hanchen) need to add preemption logic here for CONTINUUM
                     if len(self.running) == 0 and self.pinned_requests:
                         if self.policy == SchedulingPolicy.CONTINUUM:
                             preempted_req, _ = self.pop_running_request_based_on_last_step(request)
                             if preempted_req in scheduled_running_reqs:
                                 scheduled_running_reqs.remove(preempted_req)
-                            self.kv_cache_manager.free(preempted_req)
+                            with self._kv_free_lock:
+                                self.kv_cache_manager.free(preempted_req)
                             self.encoder_cache_manager.free(preempted_req)
                     break
 
@@ -1204,6 +1264,17 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # Drain deferred frees from bg thread — blocks are already freed,
+        # this handles del requests / pin / monitoring.
+        if self._bg_free_thread is not None:
+            self._drain_deferred_frees()
+
+        # Change 4: process KV transfer completions first so that blocks
+        # are freed before we process new outputs (reduces scheduling lag).
+        if model_runner_output.kv_connector_output:
+            self._update_from_kv_xfer_finished(
+                model_runner_output.kv_connector_output)
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1324,11 +1395,6 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
-
-        # KV Connector: update state for finished KV Transfers.
-        if model_runner_output.kv_connector_output:
-            self._update_from_kv_xfer_finished(
-                model_runner_output.kv_connector_output)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -1522,16 +1588,43 @@ class Scheduler(SchedulerInterface):
 
         if not delay_free_blocks:
             self._free_blocks(request)
+        else:
+            # Track delay-free blocks for admission control.
+            block_ids = self.kv_cache_manager.get_block_ids(
+                request.request_id)
+            n = sum(len(ids) for ids in block_ids)
+            self._num_delay_free_blocks += n
+            self._delay_free_req_ids.add(request.request_id)
+            monitoring_recorder.record_delay_free_start(
+                request.request_id,
+                getattr(request, "job_id", None))
 
         return kv_xfer_params
 
+    def _dec_delay_free_counter(self, request: Request) -> None:
+        """Decrement delay-free block counter before freeing blocks.
+
+        Must be called BEFORE kv_cache_manager.free() because free()
+        removes blocks from req_to_blocks.
+        """
+        req_id = request.request_id
+        if req_id in self._delay_free_req_ids:
+            block_ids = self.kv_cache_manager.get_block_ids(req_id)
+            n = sum(len(ids) for ids in block_ids)
+            self._num_delay_free_blocks -= n
+            self._delay_free_req_ids.discard(req_id)
+
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        # Decrement delay-free counter first — must happen before any
+        # early return (e.g. Continuum pin) and before kv_cache_manager.free().
+        self._dec_delay_free_counter(request)
+
         #NOTE (Hanchen) this is called when the request is finished
         for req, end_time in self.pinned_requests:
             if req.job_id == request.job_id:
                 self.unpin_request(req, end_time)
-        
+
         # TODO (Hanchen) check if we want to pin this memory here for how long, pin them on scheduler level.
         #############
         if self.policy == SchedulingPolicy.CONTINUUM and not request.is_last_step:
@@ -1545,7 +1638,8 @@ class Scheduler(SchedulerInterface):
                 return
         #############
 
-        self.kv_cache_manager.free(request)
+        with self._kv_free_lock:
+            self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:
@@ -1684,9 +1778,199 @@ class Scheduler(SchedulerInterface):
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.
+        worker_ts = kv_connector_output.delay_free_timestamps or {}
         for req_id in (kv_connector_output.finished_recving or ()):
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in (kv_connector_output.finished_sending or ()):
+            # Skip if already freed by the fast-release side-channel.
+            if req_id in self._fast_released_req_ids:
+                self._fast_released_req_ids.discard(req_id)
+                continue
+            # Guard: request may have been freed by another path (bg
+            # thread + _drain_deferred_frees) between get_finished()
+            # returning and this code running.
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            self._free_blocks(self.requests[req_id])
+            monitoring_recorder.record_delay_free_end(
+                req_id, worker_ts.get(req_id))
+            self._free_blocks(request)
+
+    def _poll_fast_releases(self) -> None:
+        """Change 3+5: drain deferred frees produced by the background
+        block-free thread, then fall back to direct queue drain if no
+        background thread is running.
+
+        When the bg thread is active, it continuously drains
+        _fast_release_queue, frees KV blocks under _kv_free_lock, and
+        pushes cleanup items into _deferred_frees.  This method only
+        handles the deferred cleanup (del requests, pin, monitoring).
+
+        When the bg thread is NOT active (no connector, not producer),
+        this method drains _fast_release_queue directly as before.
+        """
+        # --- Path A: bg thread is active, drain its deferred output ---
+        if self._bg_free_thread is not None:
+            self._drain_deferred_frees()
+            return
+
+        # --- Path B: no bg thread, direct drain (original Change 3) ---
+        if self.connector is None:
+            return
+        poll_fn = getattr(self.connector, "poll_fast_releases", None)
+        if poll_fn is None:
+            return
+        released = poll_fn()
+        if not released:
+            return
+        now = time.time()
+        for req_id, ts in released:
+            request = self.requests.get(req_id)
+            if request is None or not request.is_finished():
+                continue
+            ts.setdefault("finished_sending_ts", now)
+            monitoring_recorder.record_delay_free_end(req_id, ts)
+            self._free_blocks(request)
+            self._fast_released_req_ids.add(req_id)
+
+    # ------------------------------------------------------------------
+    # Background block-free thread (Change 5)
+    # ------------------------------------------------------------------
+
+    def _bg_free_loop(self) -> None:
+        """Background thread: drain fast-release queue and free KV blocks.
+
+        This thread runs concurrently with execute_model().  It acquires
+        _kv_free_lock only for the brief kv_cache_manager.free() call,
+        so contention with the main thread (which holds the lock during
+        allocate_slots in schedule()) is near-zero — they run in
+        different phases of the engine core loop.
+
+        After freeing blocks, it pushes a deferred cleanup item so that
+        the main thread can handle del requests, pin logic, and
+        monitoring at the next drain point.
+
+        IMPORTANT: A RELEASE can arrive (via fast-release queue) BEFORE
+        update_from_output() marks the request as finished.  This happens
+        when migration completes within the same engine-core loop iteration.
+        We must NOT discard these items — instead we keep them in a local
+        pending buffer and retry on the next poll cycle.
+        """
+        poll_fn = getattr(self.connector, "poll_fast_releases", None)
+        if poll_fn is None:
+            logger.warning("bg_free_loop: connector has no poll_fast_releases")
+            return
+
+        is_continuum = (self.policy == SchedulingPolicy.CONTINUUM)
+        # Pending items where the request was not yet finished when we
+        # first saw the RELEASE.  Retried every poll cycle.
+        # Each item: (req_id, ts_dict, first_seen_time)
+        pending: list[tuple[str, dict, float]] = []
+        # Max time to keep a pending item before discarding.
+        # Handles the case where the request was force-freed by timeout                                                 
+        # in get_finished() and no longer exists in self.requests.                                                      
+        _PENDING_STALENESS_S = 30.0   
+
+        while True:
+            # Block until at least one item is available.
+            released = poll_fn()
+            if not released and not pending:
+                # poll_fn returned empty and no pending — sleep briefly.
+                time.sleep(0.001)
+                continue
+
+            # Merge newly released items with pending retries.
+            now = time.time()
+            to_process: list[tuple[str, dict, float]] = list(pending)
+            pending = []
+            if released:
+                for req_id, ts in released:
+                    to_process.append((req_id, ts, now))
+
+            for req_id, ts, first_seen in to_process:
+                request = self.requests.get(req_id)
+                if request is None:
+                    # Request not in dict — might have been freed by
+                    # another path (e.g. timeout or Change 6 fallback)
+                    # or not yet added.
+                    if now - first_seen < _PENDING_STALENESS_S:
+                        pending.append((req_id, ts, first_seen))
+                    else:
+                        logger.debug(
+                            "bg_free_loop: discarding stale pending "
+                            "item %s (%.1fs old)", req_id,                                                              
+                            now - first_seen)   
+                    continue
+                if not request.is_finished():
+                    # RELEASE arrived before update_from_output() marked
+                    # the request finished.  Keep for retry.
+                    if now - first_seen < _PENDING_STALENESS_S:
+                        pending.append((req_id, ts, first_seen))
+                    else:
+                        logger.warning(
+                            "bg_free_loop: discarding item %s — "
+                            "request not finished after %.1fs",
+                            req_id, now - first_seen)
+                    continue
+
+                # Check if Continuum pin logic might keep blocks alive.
+                # If so, do NOT free blocks here — defer to main thread.
+                might_pin = (is_continuum
+                             and not getattr(request, "is_last_step", True))
+                if might_pin:
+                    # blocks_freed = False → main thread will call _free_blocks
+                    self._deferred_frees.put_nowait((req_id, ts, False))
+                    continue
+
+                # Safe to free blocks in bg thread.
+                self._dec_delay_free_counter(request)
+                with self._kv_free_lock:
+                    self.kv_cache_manager.free(request)
+                # Set block_freed_ts AFTER actual free so it accurately
+                # reflects when blocks were returned to the pool.
+                # (Previously set before checks via setdefault, which
+                # was misleading when the item went to pending instead.)
+                ts.setdefault("block_freed_ts", time.time())
+                # blocks_freed = True → main thread only does cleanup
+                self._deferred_frees.put_nowait((req_id, ts, True))
+
+    def _drain_deferred_frees(self) -> None:
+        """Main-thread: process deferred items from the bg free thread.
+
+        Each item is (req_id, timestamps, blocks_freed).
+        - blocks_freed=True:  bg thread already called kv_cache_manager.free(),
+                              main thread only does del requests + monitoring.
+        - blocks_freed=False: bg thread skipped free (request may need pin),
+                              main thread calls full _free_blocks().
+        """
+        now = time.time()
+        while True:
+            try:
+                item = self._deferred_frees.get_nowait()
+            except Exception:
+                break
+
+            req_id, ts, blocks_freed = item
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+
+            # Record timestamps for monitoring.
+            ts.setdefault("finished_sending_ts", ts.get("block_freed_ts", now))
+            monitoring_recorder.record_delay_free_end(req_id, ts)
+
+            if not blocks_freed:
+                # Bg thread did NOT free blocks — run full _free_blocks
+                # which handles Continuum pin logic correctly.
+                self._free_blocks(request)
+            else:
+                # Blocks already freed by bg thread.  Only do cleanup.
+                for req, end_time in list(self.pinned_requests):
+                    if req.job_id == request.job_id:
+                        self.unpin_request(req, end_time)
+                        break
+                del self.requests[req_id]
+
+            self._fast_released_req_ids.add(req_id)

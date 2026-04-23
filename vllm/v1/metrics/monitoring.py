@@ -28,6 +28,7 @@ class MonitoringRecorder:
         self.scheduler_stats: list[dict[str, Any]] = []
         self.iteration_stats: list[dict[str, Any]] = []
         self.tool_call_times: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.delay_free_stats: dict[str, dict[str, Any]] = {}
         self.output_dir: Optional[str] = None
 
     def set_output_dir(self, output_dir: str) -> None:
@@ -52,6 +53,119 @@ class MonitoringRecorder:
             "last_func_call": request.last_func_call,
             "this_func_call": request.this_func_call,
         }
+
+    def record_delay_free_start(self, request_id: str,
+                               job_id: Optional[str]) -> None:
+        self.delay_free_stats[request_id] = {
+            "request_id": request_id,
+            "job_id": job_id,
+            "delay_free_start_ts": time.time(),
+        }
+
+    def record_delay_free_end(self, request_id: str,
+                              worker_timestamps: Optional[dict[str,
+                                                               float]] = None
+                              ) -> None:
+        entry = self.delay_free_stats.get(request_id)
+        if entry is None:
+            return
+        now = time.time()
+        entry["deferred_cleanup_ts"] = now
+        start = entry.get("delay_free_start_ts")
+
+        # If bg thread already freed blocks, use block_freed_ts as
+        # the real end time.  Otherwise fall back to now (no bg thread).
+        block_freed = (worker_timestamps or {}).get("block_freed_ts")
+        real_end = block_freed if block_freed is not None else now
+        entry["delay_free_end_ts"] = real_end
+        if start is not None:
+            entry["total_delay_free_duration"] = real_end - start
+            entry["deferred_cleanup_lag"] = now - real_end
+        if worker_timestamps:
+            entry.update(worker_timestamps)
+            #
+            # BLOCK_MIGRATE mode full timeline (with optimizations):
+            #
+            #   bridge_staged_ts        P-worker: block_ids written to
+            #                           bridge_queue (wait_for_save)
+            #   delay_free_start_ts     P-scheduler: marks delay-free
+            #                           (same step, after worker)
+            # --- seg1: wait_migration (start → release_received) ---
+            #   bridge_popped_ts        D-worker: gets bridge data
+            #                           (via BRIDGE_PUSH or BRIDGE_POP)
+            #   migration_launch_ts     D-worker: cudaMemcpy2DAsync issued
+            #   migration_complete_ts   D-worker: cuda event done
+            #                           (poll thread detects immediately)
+            #   release_callback_sent_ts D-poll thread: about to send
+            #                           RELEASE ZMQ RPC
+            #   release_received_ts     P-listener: RELEASE RPC arrived
+            # --- seg2: schedule_wait (release_received → finished_sending) ---
+            #   finished_sending_ts     P-scheduler: _poll_fast_releases()
+            #                           drains queue at start of schedule()
+            # --- seg3: scheduler_free_lag (finished_sending → end) ---
+            #   delay_free_end_ts       P-scheduler: _free_blocks() done
+            #
+            # Non-block (PUT_ASYNC/GET) mode:
+            #   delay_free_start_ts
+            #   send_complete_ts        all layer tensors transferred
+            #   delay_free_end_ts
+            #
+            staged = worker_timestamps.get("bridge_staged_ts")
+            popped = worker_timestamps.get("bridge_popped_ts")
+            launch = worker_timestamps.get("migration_launch_ts")
+            complete = worker_timestamps.get("migration_complete_ts")
+            rel_sent = worker_timestamps.get("release_callback_sent_ts")
+            rel_recv = worker_timestamps.get("release_received_ts")
+            fin_sending = worker_timestamps.get("finished_sending_ts")
+            send_complete = worker_timestamps.get("send_complete_ts")
+
+            # -- BLOCK_MIGRATE: segments that SUM to total --
+            #
+            # total_delay_free = seg1 + seg2
+            #   (delay_free_end = block_freed_ts when bg thread is active)
+            #
+            #   seg1  wait_migration    delay_free_start → release_received
+            #     ├ wait_bridge_pop     delay_free_start → bridge_popped
+            #     ├ cuda_memcpy         bridge_popped    → migration_complete
+            #     └ release_rpc         migration_complete → release_received
+            #   seg2  schedule_wait     release_received → block_freed
+            #
+            #   deferred_cleanup_lag    block_freed → deferred_cleanup_ts
+            #     (blocks already free, just del requests / monitoring)
+            #
+
+            # Segment 1: delay_free_start → release_received
+            if start is not None and rel_recv is not None:
+                entry["wait_migration"] = rel_recv - start
+
+            # Sub-segments of segment 1
+            if start is not None and popped is not None:
+                entry["wait_bridge_pop"] = popped - start
+            if popped is not None and complete is not None:
+                entry["cuda_memcpy_duration"] = complete - popped
+            if complete is not None and rel_recv is not None:
+                entry["release_rpc_total"] = rel_recv - complete
+
+            # Segment 2: release_received → block_freed (bg thread drain)
+            if rel_recv is not None and fin_sending is not None:
+                entry["schedule_wait"] = fin_sending - rel_recv
+
+            # -- Legacy worker-to-worker durations (for reference) --
+            if staged is not None and popped is not None:
+                entry["bridge_wait_duration"] = popped - staged
+            if popped is not None and launch is not None:
+                entry["ipc_setup_duration"] = launch - popped
+            if launch is not None and complete is not None:
+                entry["cuda_memcpy_raw"] = complete - launch
+            if complete is not None and rel_sent is not None:
+                entry["poll_to_release_duration"] = rel_sent - complete
+            if rel_sent is not None and rel_recv is not None:
+                entry["release_rpc_duration"] = rel_recv - rel_sent
+
+            # -- Non-block durations --
+            if start is not None and send_complete is not None:
+                entry["wait_send_complete_duration"] = send_complete - start
+                entry["scheduler_free_lag"] = now - send_complete
 
     def record_tool_call_time(self, job_id: Optional[str], func_call: str,
                               exec_time: float) -> None:
@@ -198,6 +312,10 @@ class MonitoringRecorder:
                     merged_tool_call_times.setdefault(job_id, [])
                     merged_tool_call_times[job_id].extend(entries)
 
+                merged_delay_free_stats = dict(
+                    existing.get("delay_free_stats") or {})
+                merged_delay_free_stats.update(self.delay_free_stats)
+
                 with builtins.open(tmp_path, "w") as f:
                     json.dump({
                         "request_meta": merged_request_meta,
@@ -205,6 +323,7 @@ class MonitoringRecorder:
                         "scheduler_stats": merged_scheduler_stats,
                         "iteration_stats": merged_iteration_stats,
                         "tool_call_times": merged_tool_call_times,
+                        "delay_free_stats": merged_delay_free_stats,
                     },
                               f,
                               indent=2)

@@ -77,6 +77,9 @@ class KVConnectorOutput:
     # [req_ids]
     finished_sending: Optional[set[str]] = None
     finished_recving: Optional[set[str]] = None
+    # Per-request delay-free timestamps from the worker side.
+    # {req_id: {event_name: timestamp}}
+    delay_free_timestamps: Optional[dict[str, dict[str, float]]] = None
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
