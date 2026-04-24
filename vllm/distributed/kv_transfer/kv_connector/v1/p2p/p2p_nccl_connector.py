@@ -174,21 +174,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     remote_address = pending_remote_address
                     decoding_block_ids = pending_decoding_block_ids
                 else:
-                    # Check prefetched bridge data first (Change 2),
-                    # fall back to BRIDGE_POP if not available.
+                    # Pure decode-pull mode: fetch bridge metadata via a
+                    # single non-blocking BRIDGE_POP probe.  If the
+                    # producer has not staged yet, stay in
+                    # WAITING_FOR_REMOTE_KVS and retry next forward step.
                     context_block_ids = \
-                        self.p2p_nccl_engine.pop_prefetched_bridge(
-                            req_meta.request_id)
+                        self.p2p_nccl_engine.pop_bridge_request(
+                            req_meta.request_id,
+                            remote_address,
+                            timeout_s=0.0,
+                        )
                     if context_block_ids is None:
-                        context_block_ids = \
-                            self.p2p_nccl_engine.pop_bridge_request(
-                                req_meta.request_id,
-                                remote_address,
-                                timeout_s=0.0,
-                            )
-                    if context_block_ids is None:
-                        # Metadata may not be staged yet on producer side.
-                        # Keep waiting-for-remote-kv state and retry next step.
                         continue
 
                 migrated = self.p2p_nccl_engine.launch_block_migration(
@@ -386,19 +382,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
             if self.direct_block_mode:
+                # Pure decode-pull mode: only stage bridge metadata
+                # locally.  Decode will fetch via BRIDGE_POP RPC in its
+                # own forward step.
                 for request_id, context_block_ids in self._pending_bridge_reqs:
                     self.p2p_nccl_engine.stage_bridge_request(
                         request_id, context_block_ids)
-                    # Proactively push bridge data to decode so it doesn't
-                    # need to issue a BRIDGE_POP RPC (Change 2).
-                    try:
-                        ip, port = self.parse_request_id(request_id,
-                                                         is_prefill=True)
-                        decode_address = f"{ip}:{port + self._rank}"
-                        self.p2p_nccl_engine.push_bridge_to_decode(
-                            request_id, context_block_ids, decode_address)
-                    except Exception:
-                        pass  # Decode will fallback to BRIDGE_POP
                 self._pending_bridge_reqs.clear()
                 return
             self.p2p_nccl_engine.wait_for_sent()

@@ -265,6 +265,7 @@ class Scheduler(SchedulerInterface):
         self._deferred_frees: queue_mod.SimpleQueue = queue_mod.SimpleQueue()
         self._bg_free_thread: Optional[threading.Thread] = None
 
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         # NOTE: For now we use the same budget for both compute and space.
@@ -1416,13 +1417,25 @@ class Scheduler(SchedulerInterface):
                         finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats)) is not None:
-            # Return stats to only one of the front-ends.
-            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
-                # We must return the stats even if there are no request
-                # outputs this step.
-                engine_core_outputs[0] = eco = EngineCoreOutputs()
-            eco.scheduler_stats = stats
+        # Stats are only emitted when this iteration has real activity,
+        # i.e. at least one request produced a token, a pooler output,
+        # or finished (populated kv_transfer_params).  Empty iterations
+        # (KV-stall spins, no scheduled tokens, no finished requests)
+        # used to emit a stats-only EngineCoreOutputs every loop — at
+        # ~1000/s this saturated the API server output_handler
+        # coroutine (delaying HTTP responses by seconds) and bloated
+        # monitoring_timestamps to multi-GB.  There is no observability
+        # loss worth the cost: during a stall the scheduler state does
+        # not change, so repeated snapshots carry zero new information.
+        # The periodic LoggingStatLogger.log() will reuse the last
+        # snapshot it saw for its per-second summary line.
+        if self.log_stats and engine_core_outputs:
+            stats = self.make_stats(spec_decoding_stats)
+            if stats is not None:
+                # engine_core_outputs is non-empty by the outer check, so
+                # next(iter(...)) always returns a valid EngineCoreOutputs.
+                eco = next(iter(engine_core_outputs.values()))
+                eco.scheduler_stats = stats
 
         return engine_core_outputs
 

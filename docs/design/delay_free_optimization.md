@@ -1,5 +1,17 @@
 # Delay-Free KV Cache Release 优化设计文档
 
+> **📌 后续修订说明**
+>
+> 本文档原设计的 **Change 2（P→D Bridge 主动推送 / BRIDGE_PUSH）已于 2026-04-24 完全移除**。
+> 原因：该优化因 `parse_request_id` 与新 proxy 的 request_id 格式不兼容，自提交以来**从未真正生效**。
+> 系统实际一直运行在纯 decode-pull 模式。删除后 delay-free 耗时无任何变化。
+>
+> 同一次改动还修复了一个影响更大的问题：**空转迭代持续 emit scheduler_stats 造成 API server event loop 拥堵，导致 stall 期间 HTTP 响应延迟飙升至 15-300 秒**。
+>
+> 完整说明见：[empty_iteration_stall_fix.md](./empty_iteration_stall_fix.md)
+>
+> 本文档的 Change 1 / 3 / 4 / 5 仍然有效，是 delay-free 耗时从十几秒降到 ~1s 的关键。Change 2 部分应视为历史记录，**不要按此文档重新引入 BRIDGE_PUSH**。
+
 ## 1. 背景：Disaggregated Serving 中的 Delay-Free 机制
 
 在 Prefill/Decode 分离架构中：
@@ -148,7 +160,13 @@ if self.direct_block_mode:
 
 ---
 
-### 3.2 改动2: P→D Bridge 主动推送
+### 3.2 改动2: P→D Bridge 主动推送 ⚠️ 已移除（2026-04-24）
+
+> **状态**：本节描述的 BRIDGE_PUSH 机制**已完全移除**，系统运行在纯 decode-pull 模式。
+>
+> 移除原因：`wait_for_save` 里调用的 `parse_request_id(request_id, is_prefill=True)` 用的是老 proxy 格式正则 `___decode_addr_(.*):(\d+)`，与新 proxy (`disagg_proxy_p2p_nccl_xpyd_prod.py`) 把 decode 地址放在 `kv_transfer_params["decode_zmq_address"]` 的做法不兼容。`parse_request_id` 对 `chatcmpl-xxx` 类 request_id 永远抛 `ValueError`，被外层 `except Exception: pass` 静默吞掉，**BRIDGE_PUSH 从未真正发送**。硬证据：所有 monitoring 记录都有 `bridge_popped_ts`（该字段仅由 `pop_bridge_request` 写），说明 100% 走 BRIDGE_POP fallback 路径。
+>
+> 删除改动见 [empty_iteration_stall_fix.md §3.2](./empty_iteration_stall_fix.md#32-改动-b彻底移除-bridge_pushchange-2-revert)。下面的原始设计仅作历史参考。
 
 **问题**：Decode 端获取 bridge 数据需要发送同步 `BRIDGE_POP` RPC 到 Prefill，等待 Prefill listener 线程从 `bridge_queue` 中查找并返回。这增加了一个完整的 ZMQ 往返延迟。
 

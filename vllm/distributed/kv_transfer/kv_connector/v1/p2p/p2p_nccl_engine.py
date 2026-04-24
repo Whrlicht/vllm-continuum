@@ -210,9 +210,6 @@ class P2pNcclEngine:
         # {req_id: {event_name: timestamp}}
         self._delay_free_ts: dict[str, dict[str, float]] = {}
 
-        # Bridge data pushed proactively from prefill (Change 2).
-        self._prefetched_bridges: dict[str, list[int]] = {}
-
         # Fast-release channel: only initialised on the producer side
         # so that the scheduler (same process, uniproc) can drain it.
         if self.config.is_kv_producer:
@@ -661,32 +658,6 @@ class P2pNcclEngine:
                 "Poll-thread RELEASE failed, req:%s remote:%s resp:%s",
                 request_id, remote_address, resp)
 
-    # ------------------------------------------------------------------
-    # Prefetched bridge helpers (Change 2)
-    # ------------------------------------------------------------------
-
-    def pop_prefetched_bridge(self, request_id: str) -> Optional[list[int]]:
-        """Return and remove prefetched bridge data (thread-safe)."""
-        with self.state_lock:
-            return self._prefetched_bridges.pop(request_id, None)
-
-    def push_bridge_to_decode(self, request_id: str,
-                              context_block_ids: list[int],
-                              decode_address: str) -> None:
-        """Proactively push bridge data to decode (avoids BRIDGE_POP)."""
-        try:
-            self._rpc(decode_address, {
-                "cmd": "BRIDGE_PUSH",
-                "request_id": request_id,
-                "context_block_ids": context_block_ids,
-            })
-        except Exception:
-            logger.debug(
-                "Bridge push to %s failed for %s, decode will fallback "
-                "to BRIDGE_POP", decode_address, request_id)
-
-    # ------------------------------------------------------------------
-
     def _send_release_callback(self, request_id: str,
                                remote_address: str,
                                extra_ts: Optional[dict[str, float]] = None,
@@ -901,17 +872,6 @@ class P2pNcclEngine:
                     }
                 self.router_socket.send_multipart(
                     [remote_address, msgpack.dumps(payload)])
-            elif data["cmd"] == "BRIDGE_PUSH":
-                request_id = data["request_id"]
-                context_block_ids = data.get("context_block_ids")
-                if context_block_ids is not None:
-                    with self.state_lock:
-                        self._prefetched_bridges[request_id] = context_block_ids
-                    self.router_socket.send_multipart(
-                        [remote_address, msgpack.dumps({"ret": 0})])
-                else:
-                    self.router_socket.send_multipart(
-                        [remote_address, msgpack.dumps({"ret": 1})])
             elif data["cmd"] == "RELEASE":
                 request_id = data["request_id"]
                 release_received_ts = time.time()

@@ -84,51 +84,50 @@ class MonitoringRecorder:
         if worker_timestamps:
             entry.update(worker_timestamps)
             #
-            # BLOCK_MIGRATE mode full timeline (with optimizations):
+            # BLOCK_MIGRATE (decode-pull) mode timeline:
             #
-            #   bridge_staged_ts        P-worker: block_ids written to
-            #                           bridge_queue (wait_for_save)
             #   delay_free_start_ts     P-scheduler: marks delay-free
-            #                           (same step, after worker)
-            # --- seg1: wait_migration (start → release_received) ---
-            #   bridge_popped_ts        D-worker: gets bridge data
-            #                           (via BRIDGE_PUSH or BRIDGE_POP)
+            #   bridge_popped_ts        D-worker: pulls bridge metadata
+            #                           via BRIDGE_POP RPC
             #   migration_launch_ts     D-worker: cudaMemcpy2DAsync issued
             #   migration_complete_ts   D-worker: cuda event done
             #                           (poll thread detects immediately)
-            #   release_callback_sent_ts D-poll thread: about to send
-            #                           RELEASE ZMQ RPC
             #   release_received_ts     P-listener: RELEASE RPC arrived
-            # --- seg2: schedule_wait (release_received → finished_sending) ---
-            #   finished_sending_ts     P-scheduler: _poll_fast_releases()
-            #                           drains queue at start of schedule()
-            # --- seg3: scheduler_free_lag (finished_sending → end) ---
-            #   delay_free_end_ts       P-scheduler: _free_blocks() done
+            #   finished_sending_ts     P-scheduler: bg free thread drains
+            #                           queue, kv_cache_manager.free() done
+            #   delay_free_end_ts       P-scheduler: block_freed_ts
+            #                           (== finished_sending_ts when bg
+            #                           thread is active)
+            #
+            # bridge_staged_ts is also recorded by P-worker at wait_for_save
+            # for bookkeeping, but it is anchored at CPU-time before GPU
+            # forward sync, so "staged → popped" is NOT a meaningful
+            # delay-free metric (it includes whatever GPU work happened
+            # between wait_for_save and update_from_output).  Always use
+            # wait_bridge_pop = popped - delay_free_start_ts instead.
             #
             # Non-block (PUT_ASYNC/GET) mode:
             #   delay_free_start_ts
             #   send_complete_ts        all layer tensors transferred
             #   delay_free_end_ts
             #
-            staged = worker_timestamps.get("bridge_staged_ts")
             popped = worker_timestamps.get("bridge_popped_ts")
             launch = worker_timestamps.get("migration_launch_ts")
             complete = worker_timestamps.get("migration_complete_ts")
-            rel_sent = worker_timestamps.get("release_callback_sent_ts")
             rel_recv = worker_timestamps.get("release_received_ts")
             fin_sending = worker_timestamps.get("finished_sending_ts")
             send_complete = worker_timestamps.get("send_complete_ts")
 
             # -- BLOCK_MIGRATE: segments that SUM to total --
             #
-            # total_delay_free = seg1 + seg2
+            # total_delay_free = wait_migration + schedule_wait
             #   (delay_free_end = block_freed_ts when bg thread is active)
             #
-            #   seg1  wait_migration    delay_free_start → release_received
+            #   wait_migration    delay_free_start → release_received
             #     ├ wait_bridge_pop     delay_free_start → bridge_popped
             #     ├ cuda_memcpy         bridge_popped    → migration_complete
-            #     └ release_rpc         migration_complete → release_received
-            #   seg2  schedule_wait     release_received → block_freed
+            #     └ release_rpc_total   migration_complete → release_received
+            #   schedule_wait     release_received → block_freed
             #
             #   deferred_cleanup_lag    block_freed → deferred_cleanup_ts
             #     (blocks already free, just del requests / monitoring)
@@ -150,17 +149,9 @@ class MonitoringRecorder:
             if rel_recv is not None and fin_sending is not None:
                 entry["schedule_wait"] = fin_sending - rel_recv
 
-            # -- Legacy worker-to-worker durations (for reference) --
-            if staged is not None and popped is not None:
-                entry["bridge_wait_duration"] = popped - staged
+            # -- IPC resolve cost (kept for rare "launch hang" debugging) --
             if popped is not None and launch is not None:
                 entry["ipc_setup_duration"] = launch - popped
-            if launch is not None and complete is not None:
-                entry["cuda_memcpy_raw"] = complete - launch
-            if complete is not None and rel_sent is not None:
-                entry["poll_to_release_duration"] = rel_sent - complete
-            if rel_sent is not None and rel_recv is not None:
-                entry["release_rpc_duration"] = rel_recv - rel_sent
 
             # -- Non-block durations --
             if start is not None and send_complete is not None:
