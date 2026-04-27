@@ -117,6 +117,11 @@ class Request:
         self.arrival_time = arrival_time if arrival_time is not None else \
             time.time()
 
+        # How many times this request has been preempted (driven back to
+        # waiting from running).  Read/written only on the LICHT preempt
+        # path; non-LICHT scheduling never touches this field.
+        self.preempt_count: int = 0
+
         self.status = RequestStatus.WAITING
         self.use_structured_output = False
         self.events: list[EngineCoreEvent] = []

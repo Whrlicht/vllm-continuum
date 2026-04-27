@@ -664,7 +664,29 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._requests_need_load.pop(request.request_id, None)
         self._pending_failed_block_migrations.pop(request.request_id, None)
         if self.is_producer and self.direct_block_mode:
-            return len(block_ids) > 0, None
+            # Bug 4 fix: only treat this request as delay-free (waiting
+            # for decode RELEASE) if its bridge metadata was actually
+            # staged.  request_finished fires on two paths:
+            #   - natural completion → prefill finished, bridge staged,
+            #     decode will migrate KV and send RELEASE → delay-free ✓
+            #   - external abort (finish_requests, e.g. client 300s
+            #     timeout) → prefill may have been mid-chunk, bridge
+            #     never staged → decode never sees this request, no
+            #     RELEASE will ever come → must NOT be marked delay-free
+            # Before this fix the second case leaked into delay-free
+            # and locked KV blocks for request_completion_timeout_s
+            # (600s), starving the admission control and triggering
+            # engine-wide stalls.
+            bridge_staged = (
+                self.p2p_nccl_engine is not None
+                and self.p2p_nccl_engine.was_bridge_staged(
+                    request.request_id))
+            if not bridge_staged:
+                logger.debug(
+                    "[REQUEST_FINISHED] req=%s aborted before bridge "
+                    "staged; freeing blocks immediately",
+                    request.request_id)
+            return (bridge_staged and len(block_ids) > 0), None
 
         send_type = str(
             self.config.get_from_extra_config("send_type",

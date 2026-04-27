@@ -293,6 +293,22 @@ class P2pNcclEngine:
         self._delay_free_ts.setdefault(request_id, {})[
             "bridge_staged_ts"] = time.time()
 
+    def was_bridge_staged(self, request_id: str) -> bool:
+        """Return True iff stage_bridge_request has ever been called for
+        this request_id (i.e. bridge metadata was published to decode).
+
+        Used by the connector's request_finished hook to distinguish:
+          - normal completion (bridge staged, wait for decode RELEASE)
+          - mid-prefill abort   (bridge never staged, free blocks now)
+
+        Reads _delay_free_ts (single writer on the connector forward
+        thread via stage_bridge_request).  We do not acquire state_lock
+        because a miss here only degrades to "treat as abort", which is
+        safe (free blocks locally; decode never saw this request anyway).
+        """
+        ts = self._delay_free_ts.get(request_id)
+        return ts is not None and "bridge_staged_ts" in ts
+
     def pop_bridge_request(self,
                            request_id: str,
                            remote_address: str,

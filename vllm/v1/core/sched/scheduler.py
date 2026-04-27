@@ -105,6 +105,17 @@ class Scheduler(SchedulerInterface):
     LICHT_PREFILL_SCORE_A = 3.0
     LICHT_PREFILL_SCORE_B = 1.0
     LICHT_PREFILL_SCORE_TMAX_S = 120.0
+    # Power-law shape for the round_decay term used in
+    # _compute_licht_prefill_score.  alpha=0.5 → decay = 1/sqrt(1+k),
+    # which keeps mid-round (k=4–15) requests reachable by hunger
+    # compensation.  The previous exp(-k) form created a "death valley"
+    # where k>=5 requests effectively had zero recovery slope.
+    LICHT_PREFILL_ROUND_DECAY_ALPHA = 0.5
+    # Min-run grace for LICHT preempt selector: requests admitted into
+    # the running pool within the last GRACE_S seconds are excluded from
+    # the eviction candidate set, so a freshly-admitted request gets at
+    # least one productive prefill chunk before it can be evicted again.
+    LICHT_PREEMPT_MIN_RUN_GRACE_S = 15.0
 
     def __init__(
         self,
@@ -207,6 +218,10 @@ class Scheduler(SchedulerInterface):
         self.licht_decode_fcfs_enabled = (self.licht_enabled
                                           and self.instance_role == "decode")
         self.licht_waiting_round_start_ts: dict[str, float] = {}
+        # Wall-clock timestamp of the most recent admission into running.
+        # Used by _pick_preempt_victim_licht to enforce a min-run grace
+        # so that just-admitted requests are not immediately evicted.
+        self.licht_running_admit_ts: dict[str, float] = {}
         if self.licht_enabled:
             logger.info(
                 "LICHT mode enabled (instance_role=%s). "
@@ -216,10 +231,13 @@ class Scheduler(SchedulerInterface):
             if self.licht_prefill_sched_enabled:
                 logger.info(
                     "LICHT prefill scheduler params: a=%.1f, b=%.1f, "
-                    "Tmax=%.1fs",
+                    "Tmax=%.1fs, round_decay=1/(1+k)^%.2f, "
+                    "preempt_grace=%.1fs",
                     self.LICHT_PREFILL_SCORE_A,
                     self.LICHT_PREFILL_SCORE_B,
                     self.LICHT_PREFILL_SCORE_TMAX_S,
+                    self.LICHT_PREFILL_ROUND_DECAY_ALPHA,
+                    self.LICHT_PREEMPT_MIN_RUN_GRACE_S,
                 )
 
         # Initialize ToolCallEstimator with tokenizer config
@@ -388,13 +406,17 @@ class Scheduler(SchedulerInterface):
     def _reset_licht_waiting_state(
         self,
         request: Request,
-        now_monotonic: Optional[float] = None,
+        now_monotonic: Optional[float] = None,  # kept for back-compat; ignored
     ) -> None:
+        # Plan B: wait_start is always the request's arrival_time; it is
+        # never reset on preempt.  T_wait therefore accumulates
+        # monotonically from arrival, spanning both waiting and running
+        # periods.  This prevents a preempted request's hunger compensation
+        # from collapsing to zero when it is driven back to waiting.
         if not self.licht_enabled:
             return
-        if now_monotonic is None:
-            now_monotonic = time.monotonic()
-        self.licht_waiting_round_start_ts[request.request_id] = now_monotonic
+        self.licht_waiting_round_start_ts[request.request_id] = (
+            request.arrival_time)
 
     def _drop_licht_waiting_state(self, request_id: str) -> None:
         if not self.licht_enabled:
@@ -402,40 +424,52 @@ class Scheduler(SchedulerInterface):
         self.licht_waiting_round_start_ts.pop(request_id, None)
 
     def _ensure_licht_waiting_start_timestamps(self) -> None:
+        # Plan B: any waiting request without a recorded wait_start should
+        # fall back to its arrival_time (not now), so that requests that
+        # have been sitting in the waiting queue for a while retain their
+        # accumulated T_wait even if the bookkeeping was dropped somewhere.
         if not self.licht_prefill_sched_enabled:
             return
-        now_monotonic = time.monotonic()
         for req in self.waiting:
-            req_id = req.request_id
-            self.licht_waiting_round_start_ts.setdefault(req_id,
-                                                         now_monotonic)
+            self.licht_waiting_round_start_ts.setdefault(
+                req.request_id, req.arrival_time)
 
     def _compute_licht_prefill_score(
         self,
         request: Request,
-        now_monotonic: float,
+        now: float,
     ) -> float:
         # k_i is the request's real agent/dialog round from API metadata.
+        # NOTE: `now` must be a wall-clock timestamp (time.time()),
+        # because wait_start is stored as request.arrival_time which is
+        # also wall-clock.  Mixing in time.monotonic() here would yield
+        # garbage T_wait values.
         ki = max(request.agent_round, 0)
         wait_start = self.licht_waiting_round_start_ts.get(
             request.request_id,
-            now_monotonic,
+            request.arrival_time,
         )
-        twait = max(now_monotonic - wait_start, 0.0)
+        twait = max(now - wait_start, 0.0)
         # LICHT score form: A * log(1 + k_i)
-        #                 + B * exp(-k_i) * max(twait - tmax, 0)
+        #                 + B * (1 + k_i)^(-alpha) * max(twait - tmax, 0)
+        # The previous form used exp(-k_i) for round_decay, which collapsed
+        # to ~0.007 by k=5 and effectively flat-lined the hunger
+        # compensation for mid-round requests (the "death valley" k=4–15).
+        # The power-law form decays much more slowly (e.g. alpha=0.5 gives
+        # 0.45 at k=4 and 0.30 at k=10), so a stuck mid-round request can
+        # still climb past higher-round neighbours within ~120s of waiting.
         wait_term = max(twait - self.LICHT_PREFILL_SCORE_TMAX_S, 0.0)
-        round_decay = math.exp(-ki)
+        round_decay = (1.0 + ki) ** (-self.LICHT_PREFILL_ROUND_DECAY_ALPHA)
         return (self.LICHT_PREFILL_SCORE_A * math.log1p(ki)
                 + self.LICHT_PREFILL_SCORE_B * round_decay * wait_term)
 
     def _peek_waiting_request(self) -> Request:
         if self.licht_prefill_sched_enabled:
-            now_monotonic = time.monotonic()
+            now = time.time()
             return max(
                 self.waiting,
                 key=lambda req: (
-                    self._compute_licht_prefill_score(req, now_monotonic),
+                    self._compute_licht_prefill_score(req, now),
                     -req.arrival_time,
                     req.request_id,
                 ),
@@ -457,6 +491,93 @@ class Scheduler(SchedulerInterface):
                                              self.connector)
 
         raise ValueError(f"Invalid policy: {self.policy}")
+
+    def _pick_preempt_victim_licht(
+        self,
+        scheduler_request: Request,
+    ) -> Optional[Request]:
+        """LICHT-aware preempt victim selection.
+
+        Symmetric counterpart to _peek_waiting_request: where the selector
+        admits the highest-scoring waiter, this method evicts the running
+        request that is cheapest to evict under a weighted three-factor
+        model.  Each factor is rank-normalised within the current running
+        pool to [0, 1] (low = "more evictable"), then combined:
+
+            EvictScore = 0.5 * rank_credit
+                       + 0.2 * rank_preempt_count
+                       + 0.3 * rank_real_computed
+
+        - rank_credit:       LICHT prefill score (low → low priority)
+        - rank_preempt_count: how many times already victimised
+                              (low → hasn't been hit yet, fresh target)
+        - rank_real_computed: computed tokens beyond prefix-cache hit
+                              (low → little GPU work to throw away)
+
+        scheduler_request is excluded from the pool (no self-preempt).
+        Returns None iff the pool is empty (only the caller left in
+        running).
+        """
+        candidates = [r for r in self.running if r is not scheduler_request]
+        if not candidates:
+            return None
+
+        now = time.time()
+        # Min-run grace (P0 fix): exclude requests admitted within the
+        # last LICHT_PREEMPT_MIN_RUN_GRACE_S seconds.  Without this, a
+        # request that LICHT just selected from waiting (rank_credit
+        # high enough to win admission) is immediately the lowest-ranked
+        # member of running on rank_credit AND rank_computed (computed=0,
+        # has done no work yet), so the next allocate_slots failure
+        # evicts it back out — the same "admit-then-evict" thrash that
+        # FCFS-pop-tail used to cause, just via a different path.
+        grace_s = self.LICHT_PREEMPT_MIN_RUN_GRACE_S
+        seasoned = [
+            r for r in candidates
+            if (now - self.licht_running_admit_ts.get(r.request_id, 0.0))
+                >= grace_s
+        ]
+        if seasoned:
+            candidates = seasoned
+        # else: every running request is within grace.  Fall back to the
+        # full pool — we still need to free a block somewhere, and the
+        # weighted score below will pick the least-bad option.
+        if len(candidates) == 1:
+            return candidates[0]
+        n = len(candidates)
+
+        def _real_computed(r: Request) -> int:
+            # Strip prefix-cache contribution: that KV wasn't recomputed
+            # on our GPU, so losing it costs nothing.
+            cached = r.num_cached_tokens if r.num_cached_tokens > 0 else 0
+            return max(r.num_computed_tokens - cached, 0)
+
+        # Ascending rank → index 0 means "most evictable" on that axis.
+        by_credit = sorted(
+            candidates,
+            key=lambda r: self._compute_licht_prefill_score(r, now),
+        )
+        by_preempt = sorted(candidates, key=lambda r: r.preempt_count)
+        by_computed = sorted(candidates, key=_real_computed)
+
+        rank_credit = {id(r): i / (n - 1) for i, r in enumerate(by_credit)}
+        rank_preempt = {id(r): i / (n - 1) for i, r in enumerate(by_preempt)}
+        rank_computed = {
+            id(r): i / (n - 1)
+            for i, r in enumerate(by_computed)
+        }
+
+        def _evict_score(r: Request) -> float:
+            return (0.5 * rank_credit[id(r)]
+                    + 0.2 * rank_preempt[id(r)]
+                    + 0.3 * rank_computed[id(r)])
+
+        # Tie-break: prefer evicting the newer arrival, then request_id
+        # for deterministic ordering.
+        return min(
+            candidates,
+            key=lambda r: (_evict_score(r), -r.arrival_time, r.request_id),
+        )
 
     def _pop_waiting_request(self, request: Request) -> None:
         # LICHT custom selection may not choose queue head, so remove by object.
@@ -618,6 +739,29 @@ class Scheduler(SchedulerInterface):
                         if preempted_req.request_id in req_to_new_blocks:
                             del req_to_new_blocks[preempted_req.request_id]
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
+                    elif self.licht_prefill_sched_enabled:
+                        # LICHT-aware preempt (Bug 2 fix): pick the
+                        # cheapest-to-evict running request by a weighted
+                        # rank of LICHT credit, preempt_count and real
+                        # computed tokens.  Symmetric to
+                        # _peek_waiting_request, so preempts no longer
+                        # victimise the exact requests LICHT just picked
+                        # (which under FCFS-pop-tail were always at the
+                        # running tail).
+                        preempted_req = self._pick_preempt_victim_licht(
+                            request)
+                        if preempted_req is None:
+                            # Only `request` is in running; fall through
+                            # to the self-preempt path below.
+                            preempted_req = request
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
+                        if preempted_req.request_id in num_scheduled_tokens:
+                            del num_scheduled_tokens[preempted_req.request_id]
+                        if preempted_req.request_id in req_to_new_blocks:
+                            del req_to_new_blocks[preempted_req.request_id]
+                        self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
                     else:
                         preempted_req = self.running.pop()
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
@@ -630,11 +774,24 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req.status = RequestStatus.PREEMPTED
                         preempted_req.num_computed_tokens = 0
+                        # Drop this victim's admit timestamp so that when
+                        # it is later re-admitted the grace window starts
+                        # fresh from the new admission moment.
+                        self.licht_running_admit_ts.pop(
+                            preempted_req.request_id, None)
+                        # Accumulate victim count for the LICHT preempt
+                        # selector.  Unconditional: non-LICHT paths never
+                        # read this field, so the write is harmless.
+                        preempted_req.preempt_count += 1
                         if self.log_stats:
                             preempted_req.record_event(
                                 EngineCoreEventType.PREEMPTED, scheduled_timestamp)
 
                         self.waiting.prepend_request(preempted_req)
+                        # Plan B: _reset_licht_waiting_state now always
+                        # sets wait_start back to request.arrival_time, so
+                        # this call is idempotent (T_wait continues to
+                        # accumulate from arrival and is never zeroed).
                         self._reset_licht_waiting_state(preempted_req)
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
@@ -892,6 +1049,12 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.running.append(request)
+                if self.licht_prefill_sched_enabled:
+                    # Stamp the admission time so the LICHT preempt
+                    # selector can grant a min-run grace window before
+                    # this request becomes evictable again.
+                    self.licht_running_admit_ts[request.request_id] = (
+                        time.time())
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -1588,6 +1751,7 @@ class Scheduler(SchedulerInterface):
         self.tool_call_estimator.request_finished(request)
         self.continuum_recorder.request_finished(request)
         self._drop_licht_waiting_state(request.request_id)
+        self.licht_running_admit_ts.pop(request.request_id, None)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
