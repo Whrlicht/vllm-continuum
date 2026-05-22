@@ -1,0 +1,25 @@
+{
+  "features": [
+    "num_scheduled_tokens",
+    "num_new_admits",
+    "num_new_admit_tokens",
+    "num_generation_tokens",
+    "num_running",
+    "num_waiting",
+    "num_finished_requests",
+    "kv_cache_usage",
+    "prefix_cache_hits"
+  ],
+  "weights": {
+    "num_scheduled_tokens": 8.141755931268201e-05,
+    "num_new_admits": -0.12309369692831892,
+    "num_new_admit_tokens": 4.347072739082912e-05,
+    "num_generation_tokens": 0.04780879976781795,
+    "num_running": -0.25641656785231814,
+    "num_waiting": 0.05679087185769108,
+    "num_finished_requests": 0.04780879585013168,
+    "kv_cache_usage": 1.7291446440124763,
+    "prefix_cache_hits": 4.24316035577369e-05,
+    "bias": 2.766640502173061
+  }
+}

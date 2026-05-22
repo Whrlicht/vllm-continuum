@@ -27,8 +27,25 @@ class MonitoringRecorder:
         self.request_stats: dict[str, dict[str, Any]] = {}
         self.scheduler_stats: list[dict[str, Any]] = []
         self.iteration_stats: list[dict[str, Any]] = []
+        # Per-scheduler-step compute log.  Recorded INSIDE schedule()
+        # with the actual num_scheduled_tokens (sum of chunked-prefill +
+        # decode tokens that GPU will execute this step), which is the
+        # real "compute load" for the upcoming worker.execute call.
+        # Differs from iteration_stats.num_prompt_tokens which counts
+        # finished-prefill prompt lengths, not per-step compute.
+        self.step_compute_log: list[dict[str, Any]] = []
         self.tool_call_times: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.delay_free_stats: dict[str, dict[str, Any]] = {}
+        # LICHTV2 admit-event log: per-admit snapshot used by offline
+        # simulator to verify block-accounting (evictable_prefix /
+        # allocate_slots / free-pool / anchor).  See record_licht_admit_event.
+        self.licht_admit_events: list[dict[str, Any]] = []
+        # LICHTV2 admit-probe log: per `_licht_v2_can_admit` call (success
+        # AND failure), so the offline simulator can read the true
+        # evictable_prefix at every sim_step it probes a candidate —
+        # not just at the step where the candidate finally got admitted.
+        # See record_licht_admit_probe.
+        self.licht_admit_probes: list[dict[str, Any]] = []
         self.output_dir: Optional[str] = None
 
     def set_output_dir(self, output_dir: str) -> None:
@@ -158,6 +175,90 @@ class MonitoringRecorder:
                 entry["wait_send_complete_duration"] = send_complete - start
                 entry["scheduler_free_lag"] = now - send_complete
 
+    def record_licht_admit_event(
+        self,
+        *,
+        request_id: str,
+        job_id: Optional[str],
+        agent_round: Optional[int],
+        evictable_prefix: int,
+        new_blocks_allocated: int,
+        free_blocks_before_admit: int,
+        num_computed_at_admit: int,
+        num_new_tokens: int,
+        num_running_before: int,
+    ) -> None:
+        """Snapshot every LICHTV2 successful admit.
+
+        Captures the four block-accounting quantities the offline
+        simulator currently approximates (and therefore drifts on):
+          - evictable_prefix: count of prefix-cache blocks that were in
+            the free queue at admit and got touched by allocate_slots.
+          - new_blocks_allocated: total blocks returned by allocate_slots
+            (i.e. what kv_cache_manager physically charged to this admit).
+          - free_blocks_before_admit: block_pool.get_num_free_blocks()
+            snapshot taken before allocate_slots ran (the simulator's
+            current_free should match this each step).
+          - num_computed_at_admit: anchor (hit_length-equivalent) the
+            scheduler stamped for this admit.
+        Plus context fields so the simulator can join per-admit by
+        request_id and aggregate per traj / step.
+        """
+        self.licht_admit_events.append({
+            "request_id": request_id,
+            "job_id": job_id,
+            "agent_round": agent_round,
+            "timestamp": time.time(),
+            "evictable_prefix": int(evictable_prefix),
+            "new_blocks_allocated": int(new_blocks_allocated),
+            "free_blocks_before_admit": int(free_blocks_before_admit),
+            "num_computed_at_admit": int(num_computed_at_admit),
+            "num_new_tokens": int(num_new_tokens),
+            "num_running_before": int(num_running_before),
+        })
+
+    def record_licht_admit_probe(
+        self,
+        *,
+        request_id: str,
+        job_id: Optional[str],
+        agent_round: Optional[int],
+        evictable_prefix: int,
+        free_blocks_before_admit: int,
+        num_computed_at_probe: int,
+        num_new_tokens: int,
+        num_running_before: int,
+        will_admit: bool,
+    ) -> None:
+        """Snapshot every LICHTV2 `_licht_v2_can_admit` invocation.
+
+        Unlike record_licht_admit_event (only successful admits), this is
+        fired for EVERY probe — including the failures that send the
+        candidate to the skipped-list.  Without this, the offline
+        simulator can only read evictable_prefix at the step a request
+        was finally admitted, and is forced to assume that value also
+        holds at every earlier sim_step it probes the same request —
+        which is wrong whenever other running requests come/go and
+        change the ref_cnt of the candidate's prefix blocks between
+        those steps.
+
+        Fields beyond evictable_prefix (free_blocks, anchor,
+        num_new_tokens, num_running_before) are the matching contextual
+        snapshot needed to verify the simulator's per-step ledger.
+        """
+        self.licht_admit_probes.append({
+            "request_id": request_id,
+            "job_id": job_id,
+            "agent_round": agent_round,
+            "timestamp": time.time(),
+            "evictable_prefix": int(evictable_prefix),
+            "free_blocks_before_admit": int(free_blocks_before_admit),
+            "num_computed_at_probe": int(num_computed_at_probe),
+            "num_new_tokens": int(num_new_tokens),
+            "num_running_before": int(num_running_before),
+            "will_admit": bool(will_admit),
+        })
+
     def record_tool_call_time(self, job_id: Optional[str], func_call: str,
                               exec_time: float) -> None:
         if job_id is None:
@@ -215,6 +316,26 @@ class MonitoringRecorder:
             "num_generation_tokens": iteration_stats.num_generation_tokens,
             "num_finished_requests": len(iteration_stats.finished_requests),
             "num_preempted_reqs": iteration_stats.num_preempted_reqs,
+        })
+
+    def record_step_compute(self, *, step_id: int,
+                             num_scheduled_tokens: int,
+                             num_running: int,
+                             num_waiting: int,
+                             num_new_admits: int,
+                             num_new_admit_tokens: int) -> None:
+        """Per-scheduler-step compute log.  Called from Scheduler.schedule()
+        right after the admit pass — records what worker.execute() is
+        ABOUT to do this step.  num_scheduled_tokens is the true per-step
+        compute load (chunked-prefill chunks + decode tokens)."""
+        self.step_compute_log.append({
+            "ts": time.time(),
+            "step_id": int(step_id),
+            "num_scheduled_tokens": int(num_scheduled_tokens),
+            "num_running": int(num_running),
+            "num_waiting": int(num_waiting),
+            "num_new_admits": int(num_new_admits),
+            "num_new_admit_tokens": int(num_new_admit_tokens),
         })
 
     def record_finished_request(self, req_state: Any, finish_reason: Any,
@@ -307,6 +428,18 @@ class MonitoringRecorder:
                     existing.get("delay_free_stats") or {})
                 merged_delay_free_stats.update(self.delay_free_stats)
 
+                merged_licht_admit_events = list(
+                    existing.get("licht_admit_events") or [])
+                merged_licht_admit_events.extend(self.licht_admit_events)
+
+                merged_licht_admit_probes = list(
+                    existing.get("licht_admit_probes") or [])
+                merged_licht_admit_probes.extend(self.licht_admit_probes)
+
+                merged_step_compute_log = list(
+                    existing.get("step_compute_log") or [])
+                merged_step_compute_log.extend(self.step_compute_log)
+
                 with builtins.open(tmp_path, "w") as f:
                     json.dump({
                         "request_meta": merged_request_meta,
@@ -315,6 +448,9 @@ class MonitoringRecorder:
                         "iteration_stats": merged_iteration_stats,
                         "tool_call_times": merged_tool_call_times,
                         "delay_free_stats": merged_delay_free_stats,
+                        "licht_admit_events": merged_licht_admit_events,
+                        "licht_admit_probes": merged_licht_admit_probes,
+                        "step_compute_log": merged_step_compute_log,
                     },
                               f,
                               indent=2)

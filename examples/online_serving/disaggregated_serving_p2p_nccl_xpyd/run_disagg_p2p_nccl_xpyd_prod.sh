@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="5"
-DECODE_GPUS="2"
+PREFILL_GPUS="4"
+DECODE_GPUS="5"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -20,6 +20,11 @@ PREFILL_HTTP_PORT_BASE=20003
 DECODE_HTTP_PORT_BASE=20005
 PREFILL_KV_PORT_BASE=21001
 DECODE_KV_PORT_BASE=22001
+# LICHT-V3 StepEvent channel: prefill scheduler PUBLISHes its per-step
+# state here; the decode-side ShadowScheduler SUBSCRIBEs to run the
+# K_queue (stage1/2) + step-time predictors.  prefill[i] binds base+i*2;
+# decode[i] connects to the matching prefill (round-robin if D>P).
+STEP_EVENT_PORT_BASE=25001
 
 PREFILL_GPU_MEMORY_UTILIZATION=0.95
 DECODE_GPU_MEMORY_UTILIZATION=0.95
@@ -38,6 +43,8 @@ MAX_NUM_BATCHED_TOKENS=265944
 MAX_NUM_SEQS=256
 SEED=1024
 LICHT=false
+LICHT_V2=false
+LICHT_V3=false
 
 WAIT_TIMEOUT_SECONDS=1200
 SHUTDOWN_GRACE_SECONDS=20
@@ -46,7 +53,11 @@ FAIL_ON_WAIT_TIMEOUT=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/swe_bench_sample_100_with_timings.json"
+TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/swe_bench_sample_300_tool_clean_with_timings.json"
+# LICHT-V3 tool-time predictor bundle (tool_call_time): bash family → ML
+# p50/p95, editor/submit family → bucket-median 查表.  Unset/missing →
+# the predictor degrades to a constant fallback.  Override: --tool-predictor-dir.
+TOOL_PREDICTOR_DIR="${REPO_ROOT}/tool_call_time/runs/run_2902_v2"
 PROXY_SCRIPT="${SCRIPT_DIR}/disagg_proxy_p2p_nccl_xpyd_prod.py"
 CLIENT_PID_FILE="${REPO_ROOT}/output/.multiturn_trace_client.pid"
 STOP_CLIENT_ON_EXIT=true
@@ -80,6 +91,11 @@ Options:
   --max-num-batched-tokens N   0=auto, >0=override
   --licht                      Enable LICHT algorithm switch
                                (prefill dynamic priority + decode FCFS)
+  --licht-v2                   Enable LICHT-V2 (prefill timeline scheduler)
+  --licht-v3                   Enable LICHT-V3 (LICHT-V2 timeline + the
+                               tool/K_queue/step predictors)
+  --tool-predictor-dir PATH    LICHT-V3 tool-time predictor bundle dir
+                               (default: ${TOOL_PREDICTOR_DIR})
   --trace-replay-path PATH     Trace replay JSON path for workers
                                (default: ${TRACE_REPLAY_PATH})
   --wait-timeout SECONDS       Wait timeout for each worker endpoint (default: ${WAIT_TIMEOUT_SECONDS})
@@ -163,6 +179,18 @@ while [[ $# -gt 0 ]]; do
       LICHT=true
       shift
       ;;
+    --licht-v2)
+      LICHT_V2=true
+      shift
+      ;;
+    --licht-v3)
+      LICHT_V3=true
+      shift
+      ;;
+    --tool-predictor-dir)
+      TOOL_PREDICTOR_DIR="$2"
+      shift 2
+      ;;
     --trace-replay-path)
       TRACE_REPLAY_PATH="$2"
       shift 2
@@ -202,6 +230,25 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# LICHT-V3 = LICHT-V2 timeline + the three predictors.  The K_queue
+# (stage1/2) and step-time predictors live in the decode-side
+# ShadowScheduler, which only initialises when this env var is set.
+# Without it, only the tool-time predictor (v3_predictions.jsonl) writes;
+# v3_shadow_predictions.jsonl and v3_step_time.jsonl stay empty.  Export
+# so the decode worker (a setsid child) inherits it.
+if [[ "${LICHT_V3}" == "true" ]]; then
+  export LICHT_V3_USE_SHADOW_SCHED=1
+  # Tool-time predictor bundle (bash→ML p50/p95, editor/submit→bucket 查表).
+  # Without this the predictor runs in constant-fallback mode.
+  if [[ -f "${TOOL_PREDICTOR_DIR}/bundle.json" ]]; then
+    export LICHT_V3_TOOL_PREDICTOR_DIR="${TOOL_PREDICTOR_DIR}"
+  else
+    echo "WARN: tool predictor bundle not found at ${TOOL_PREDICTOR_DIR}/bundle.json"
+    echo "      → tool-time prediction will use the constant fallback."
+    echo "      Set a valid dir with --tool-predictor-dir, e.g. tool_call_time/runs/run_2902_v2"
+  fi
+fi
 
 if [[ ! -f "${PROXY_SCRIPT}" ]]; then
   echo "Proxy script not found: ${PROXY_SCRIPT}"
@@ -446,6 +493,9 @@ echo "  GET_RETRY_INTERVAL_S=${GET_RETRY_INTERVAL_S}"
 echo "  MAX_MODEL_LEN=${MAX_MODEL_LEN} (0 means auto/model default)"
 echo "  MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS} (0 means auto)"
 echo "  LICHT=${LICHT}"
+echo "  LICHT_V2=${LICHT_V2}"
+echo "  LICHT_V3=${LICHT_V3}"
+echo "  TOOL_PREDICTOR_DIR=${TOOL_PREDICTOR_DIR}"
 echo "  TRACE_REPLAY_PATH=${TRACE_REPLAY_PATH}"
 echo "  FAIL_ON_WAIT_TIMEOUT=${FAIL_ON_WAIT_TIMEOUT}"
 echo "  SHUTDOWN_GRACE_SECONDS=${SHUTDOWN_GRACE_SECONDS}"
@@ -493,6 +543,19 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
   if [[ "${LICHT}" == "true" ]]; then
     PREFILL_EXTRA_ARGS+=(--licht)
   fi
+  if [[ "${LICHT_V2}" == "true" ]]; then
+    PREFILL_EXTRA_ARGS+=(--licht-v2)
+  fi
+  if [[ "${LICHT_V3}" == "true" ]]; then
+    PREFILL_EXTRA_ARGS+=(--licht-v3)
+  fi
+  # LICHT-V3: prefill PUBLISHes StepEvents so the decode shadow can record
+  # K_queue + step-time predictions.  Export (NOT inline via a variable —
+  # bash only treats LITERAL `VAR=val cmd` as an assignment) so the
+  # backgrounded `setsid vllm serve` child inherits it.  Per-worker port.
+  if [[ "${LICHT_V3}" == "true" ]]; then
+    export LICHT_V3_STEP_EVENT_PUB_ADDR="tcp://0.0.0.0:$((STEP_EVENT_PORT_BASE + i * 2))"
+  fi
 
   prefill_output_dir="${SCRIPT_DIR}/continuum_exp/prefill_${http_port}"
   rm -rf "${prefill_output_dir}"
@@ -537,6 +600,19 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
   fi
   if [[ "${LICHT}" == "true" ]]; then
     DECODE_EXTRA_ARGS+=(--licht)
+  fi
+  if [[ "${LICHT_V2}" == "true" ]]; then
+    DECODE_EXTRA_ARGS+=(--licht-v2)
+  fi
+  if [[ "${LICHT_V3}" == "true" ]]; then
+    DECODE_EXTRA_ARGS+=(--licht-v3)
+  fi
+  # LICHT-V3: decode shadow SUBSCRIBEs to the matching prefill's StepEvent
+  # channel (round-robin if there are more decodes than prefills).  Export
+  # so the backgrounded `setsid vllm serve` child inherits it.
+  if [[ "${LICHT_V3}" == "true" ]]; then
+    pf_idx=$(( i % ${#PREFILL_GPU_ARRAY[@]} ))
+    export LICHT_V3_STEP_EVENT_SUB_ADDR="tcp://${PROXY_IP_FOR_WORKERS}:$((STEP_EVENT_PORT_BASE + pf_idx * 2))"
   fi
 
   decode_output_dir="${SCRIPT_DIR}/continuum_exp/decode_${http_port}"

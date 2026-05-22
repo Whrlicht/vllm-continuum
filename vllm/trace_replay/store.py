@@ -33,7 +33,7 @@ class TraceStore:
             return Path(configured)
 
         default_path = Path.cwd() / "trace_data" / \
-            "swe_bench_sample_100_with_timings.json"
+            "swe_bench_sample_300_tool_clean_with_timings.json"
         if default_path.exists():
             return default_path
         return None

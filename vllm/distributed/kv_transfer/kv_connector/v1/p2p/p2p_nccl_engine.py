@@ -46,6 +46,9 @@ def get_fast_release_queue() -> Optional[queue_mod.SimpleQueue]:
     return _fast_release_queue
 
 
+# 回传 REMOVED (2026-05-21): no P6 push-back completion done-queue.
+
+
 @contextmanager
 def set_p2p_nccl_context(num_channels: str):
     original_values: dict[str, Any] = {}
@@ -165,6 +168,14 @@ class P2pNcclEngine:
         self.recv_request_id_to_tensor_ids: dict[str, set[str]] = {}
         self.socks: dict[str, Any] = {}  # remote_address: client socket
         self.comms: dict[str, Any] = {}  # remote_address: (ncclComm_t, rank)
+        # ZMQ DEALER sockets in self.socks are NOT thread-safe.  Pre-v3,
+        # _rpc was called concurrently from worker / migration-poll /
+        # bg-free threads.  With v3 also doing RPCs via the bridge's
+        # `_ensure_remote_kv_views` path, the race grew enough to
+        # crash on `pipe.cpp:186` assertion.  Guard `_rpc` send+recv
+        # pairs with a single lock per engine; loopback RPC is sub-ms,
+        # so serialising is cheap.
+        self._rpc_lock = threading.Lock()
 
         self.buffer_size = 0
         self.buffer_size_threshold = float(self.config.kv_buffer_size)
@@ -201,6 +212,11 @@ class P2pNcclEngine:
         self.remote_ipc_ptrs: dict[str, dict[str, ctypes.c_void_p]] = {}
         self.remote_kv_views: dict[str, dict[str, torch.Tensor]] = {}
         self.remote_ipc_epochs: dict[str, int] = {}
+        # `_v3_views_lock` guards the remote_kv_views dict against
+        # invalidation (which closes IPC handles) racing the normal
+        # forward's view access.  (回传 stream / async RPC reply queue
+        # removed 2026-05-21.)
+        self._v3_views_lock = threading.Lock()
         self.bridge_queue: dict[str, list[int]] = {}
         self.pending_migrations: dict[str, tuple[torch.cuda.Event, str]] = {}
         self.completed_recving_req_ids: set[str] = set()
@@ -460,13 +476,17 @@ class P2pNcclEngine:
             "Unsupported KV cache layout for block migration, "
             f"shape={tuple(kv_cache.shape)}")
 
+    # 回传 REMOVED (2026-05-21): v3_get_pushback_stream deleted.
+
     def _ensure_remote_kv_views(self,
                                 remote_address: str,
                                 force_refresh: bool = False) -> None:
         if force_refresh:
             self._invalidate_remote_kv_views(remote_address)
-        elif remote_address in self.remote_kv_views:
-            return
+        else:
+            with self._v3_views_lock:
+                if remote_address in self.remote_kv_views:
+                    return
 
         payload = self._rpc(remote_address, {"cmd": "GET_IPC_METADATA"})
         if payload.get("ret") != 0:
@@ -549,17 +569,23 @@ class P2pNcclEngine:
             raise RuntimeError("No compatible remote KV views were created "
                                f"for {remote_address}")
 
-        self.remote_ipc_ptrs[remote_address] = remote_ptrs
-        self.remote_kv_views[remote_address] = remote_views
-        self.remote_ipc_epochs[remote_address] = ipc_epoch
+        with self._v3_views_lock:
+            self.remote_ipc_ptrs[remote_address] = remote_ptrs
+            self.remote_kv_views[remote_address] = remote_views
+            self.remote_ipc_epochs[remote_address] = ipc_epoch
 
     def _invalidate_remote_kv_views(self, remote_address: str) -> None:
-        ptrs_by_layer = self.remote_ipc_ptrs.pop(remote_address, None)
-        self.remote_kv_views.pop(remote_address, None)
-        self.remote_ipc_epochs.pop(remote_address, None)
-
-        if ptrs_by_layer is None or self.cuda_rt is None:
-            return
+        # P8: under the views lock, evict the dict entry AND drain any
+        # in-flight background回传 (which may be copying INTO this mapping)
+        # before closing the IPC handles — otherwise the回传's kernels
+        # would write into freed device memory.
+        with self._v3_views_lock:
+            ptrs_by_layer = self.remote_ipc_ptrs.pop(remote_address, None)
+            self.remote_kv_views.pop(remote_address, None)
+            self.remote_ipc_epochs.pop(remote_address, None)
+            if ptrs_by_layer is None or self.cuda_rt is None:
+                return
+            # 回传 REMOVED: no push-back stream to drain before closing views.
 
         for ptr in ptrs_by_layer.values():
             try:
@@ -603,8 +629,12 @@ class P2pNcclEngine:
         if remote_address not in self.socks:
             self.create_connect(remote_address)
         sock = self.socks[remote_address]
-        sock.send(msgpack.dumps(payload))
-        return msgpack.loads(sock.recv())
+        # ZMQ DEALER sockets are not thread-safe.  Serialise send+recv
+        # so we never have two threads sharing the same socket — that
+        # used to crash on `Assertion failed: rc == 0 (src/pipe.cpp:186)`.
+        with self._rpc_lock:
+            sock.send(msgpack.dumps(payload))
+            return msgpack.loads(sock.recv())
 
     # ------------------------------------------------------------------
     # Background migration poll thread (Change 1)
@@ -850,9 +880,12 @@ class P2pNcclEngine:
                 return None
             time.sleep(self.get_retry_interval_s)
 
+    # 回传 REMOVED (2026-05-21): _v3_flush_responses (async V3 reply queue)
+    # deleted.
+
     def listen_for_requests(self):
         while True:
-            socks = dict(self.poller.poll())
+            socks = dict(self.poller.poll(timeout=20))
             if self.router_socket not in socks:
                 continue
 
@@ -970,6 +1003,8 @@ class P2pNcclEngine:
                     comm, rank = self.comms[remote_address.decode()]
                     self.send(comm, tensor.to(self.device), rank ^ 1,
                               self.send_stream)
+            # 回传 REMOVED (2026-05-21): V3_RESERVE_AND_QUERY /
+            # V3_INSTALL_BLOCKS / V3_ABORT_INSTALL RPC handlers deleted.
             else:
                 logger.warning(
                     "🚧Unexpected, Received message from %s, data:%s",

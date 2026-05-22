@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -57,6 +58,7 @@ class ReqMeta:
 @dataclass
 class P2pNcclConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta]
+    # 回传 REMOVED (2026-05-21): no v3 push-back/offload metadata fields.
 
     def __init__(self):
         self.requests = []
@@ -100,16 +102,25 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._pending_failed_block_migrations: dict[
             str, tuple[list[int], list[int], str]
         ] = {}
+        # 回传 REMOVED (2026-05-21): no v3 push-back/offload queues, bg
+        # thread, tier handles, or push bridge.
 
         self._rank = get_world_group().rank \
             if role == KVConnectorRole.WORKER else 0
         self._local_rank = get_world_group().local_rank \
             if role == KVConnectorRole.WORKER else 0
 
+        # Bind ZMQ ROUTER to config.kv_ip when set (typically localhost
+        # for single-host deployments).  Default `hostname=""` would
+        # fall back to `get_ip()` which returns the machine's outward
+        # interface IP — ZMQ then refuses `127.0.0.1` connections,
+        # which breaks LICHTV3's decode→prefill RPC.  Honouring kv_ip
+        # keeps both directions on the same address.
+        _bind_host = getattr(self.config, "kv_ip", None) or ""
         self.p2p_nccl_engine = P2pNcclEngine(
             local_rank=self._local_rank,
             config=self.config,
-            hostname="",
+            hostname=_bind_host,
             port_offset=self._rank,
         ) if role == KVConnectorRole.WORKER else None
 
@@ -139,6 +150,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         metadata: KVConnectorMetadata = self._get_connector_metadata()
         assert isinstance(metadata, P2pNcclConnectorMetadata)
+
+        # 回传 REMOVED (2026-05-21): no v3 offload/pushback bg work here.
 
         if self.direct_block_mode:
             if self.is_producer:
@@ -486,6 +499,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             self._requests_need_load[request.request_id] = (
                 request, blocks.get_block_ids()[0])
 
+    # 回传 REMOVED (2026-05-21): enqueue_v3_pushback / enqueue_v3_offload /
+    # enqueue_v3_offload_release deleted.
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -500,6 +516,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
 
         meta = P2pNcclConnectorMetadata()
+        # 回传 REMOVED: no v3 push-back/offload drain.
 
         if not self.is_producer and self.direct_block_mode:
             for req_id, (request, local_block_ids) in \

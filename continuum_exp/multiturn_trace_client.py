@@ -93,7 +93,7 @@ def parse_args() -> ClientConfig:
 
     parser.add_argument(
         "--trace-path",
-        default="trace_data/swe_bench_sample_100_with_timings.json",
+        default="trace_data/swe_bench_sample_300_tool_clean_with_timings.json",
         help="Path to trace dataset JSON")
     parser.add_argument("--output-dir",
                         default="output",
@@ -341,12 +341,68 @@ def normalize_chat_message(msg: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"role": role}
 
     content = msg.get("content")
-    if isinstance(content, (str, list)):
-        out["content"] = content
+    if isinstance(content, str):
+        content_str = content
+    elif isinstance(content, list):
+        # Flatten multimodal/structured content list into plain text.
+        pieces: list[str] = []
+        for it in content:
+            if isinstance(it, dict):
+                t = it.get("text")
+                if isinstance(t, str):
+                    pieces.append(t)
+            elif isinstance(it, str):
+                pieces.append(it)
+        content_str = "\n".join(pieces)
+    elif content is None:
+        content_str = ""
     else:
-        out["content"] = _flatten_content_to_text(content)
+        content_str = _flatten_content_to_text(content)
 
-    # Keep prompts schema-minimal for compatibility across chat templates.
+    # Inline tool_call JSON INTO content (see server-side normalizer
+    # for the full rationale).  Llama 3.1's chat template renders ONLY
+    # the structured tool_calls when both content and tool_calls are
+    # present, dropping the thought text.  We want ReAct-style output:
+    # thought (= content) + tool_call together.  Workaround: do not
+    # pass tool_calls as a structured field; stitch the JSON rendering
+    # into content so the template sees plain text and renders the
+    # full assistant turn verbatim.
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        tc_lines: list[str] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            args_raw = fn.get("arguments")
+            args = args_raw
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw)
+                except (json.JSONDecodeError, TypeError):
+                    args = args_raw
+            if name is None:
+                continue
+            tc_lines.append(json.dumps({
+                "name": name,
+                "parameters": args,
+            }, ensure_ascii=False))
+        if tc_lines:
+            if content_str:
+                content_str = content_str + "\n" + "\n".join(tc_lines)
+            else:
+                content_str = "\n".join(tc_lines)
+
+    out["content"] = content_str
+    # tool_call_id (for role=tool) is fine to keep — used by template
+    # to wire responses to call IDs and is not in-place mutated.
+    tool_call_id = msg.get("tool_call_id")
+    if tool_call_id is not None:
+        out["tool_call_id"] = tool_call_id
+    name = msg.get("name")
+    if name is not None:
+        out["name"] = name
     return out
 
 
@@ -362,25 +418,62 @@ def extract_expected_assistant_output(
     messages: list[dict[str, Any]],
     assistant_message_index: int,
 ) -> str:
+    """Return the EXACT string the model is forced to emit for this
+    assistant round under trace_replay.
+
+    Must mirror `normalize_chat_message` byte-for-byte: that function
+    is what the server-side chat template sees, and trace_replay
+    forces the model output to match the chat-templated rendering.
+
+    Rules (kept in lock-step with normalize_chat_message):
+      1. content (str or flattened from list) — as-is
+      2. tool_calls: dropped as a structured field; INLINED into
+         content as Llama-style `{"name", "parameters"}` JSON lines,
+         one per call.  The original OpenAI fields
+         (`id`/`type`/`index`/`execution_time_seconds`/etc.) and the
+         separate `action` text are NOT in the model output, so we
+         must not include them here either.
+    """
     if assistant_message_index < 0 or assistant_message_index >= len(messages):
         return ""
     msg = messages[assistant_message_index]
     content = msg.get("content")
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text = _flatten_content_to_text(content)
-        if text:
-            return text
+        content_str = content
+    elif isinstance(content, list):
+        content_str = _flatten_content_to_text(content)
+    elif content is None:
+        content_str = ""
+    else:
+        content_str = _flatten_content_to_text(content)
 
-    # Fallback for datasets where assistant text is split into other fields.
-    parts: list[str] = []
-    for key in ("thought", "action"):
-        if key in msg:
-            val = _flatten_content_to_text(msg.get(key))
-            if val:
-                parts.append(val)
-    return "\n".join(parts)
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        tc_lines: list[str] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            args_raw = fn.get("arguments")
+            args = args_raw
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw)
+                except (json.JSONDecodeError, TypeError):
+                    args = args_raw
+            if name is None:
+                continue
+            tc_lines.append(json.dumps({
+                "name": name,
+                "parameters": args,
+            }, ensure_ascii=False))
+        if tc_lines:
+            if content_str:
+                content_str = content_str + "\n" + "\n".join(tc_lines)
+            else:
+                content_str = "\n".join(tc_lines)
+    return content_str
 
 
 def _normalize_for_compare(text: str) -> str:

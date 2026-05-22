@@ -137,6 +137,37 @@ class SchedulerConfig:
     KV cache transfer strategy is kept as the default implementation for now.
     """
 
+    licht_v2: bool = False
+    """Enable LICHTV2 mode (mutually exclusive with --licht).
+
+    LICHTV2 replaces LICHT's score-vs-preempt admission with a SLURM-style
+    backfill window over a fixed lookahead horizon (default N=50 scheduler
+    steps).  Per scheduler step:
+      1. Rebuild a per-step future_free / future_alloc timeline based on
+         current running prefill state.
+      2. Walk waiting in LICHT-score order; admit a candidate iff its
+         tentative impact keeps every t in [0, N] non-negative AND respects
+         the per-step alloc budget (max_num_batched_tokens / block_size).
+      3. Long-tail (R > N) candidates require an additional headroom and
+         a hard cap on simultaneous long-tail running requests.
+    Only takes effect on prefill instances; decode keeps default scheduling.
+    """
+
+    licht_v3: bool = False
+    """Enable LICHTV3 mode (mutually exclusive with --licht and --licht-v2).
+
+    LICHTV3 is a strict superset of LICHTV2:
+    - On the prefill instance it reuses the LICHTV2 backfill-window
+      admission unchanged (we never branch inside the v2 code paths).
+    - On the decode instance it activates a new "round-gap KV manager":
+      after every decode round, it consults a tool-call-time predictor
+      and a prefill queue-step predictor, then ranks finished requests
+      by (K_queue asc, T_tool asc) and pre-stages their KV cache across
+      a GPU/CPU/SSD tier so the next round can skip prefill recompute.
+    Decode-side logic is opt-in and bolted on; the v2 prefill scheduler
+    is not modified.
+    """
+
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
 

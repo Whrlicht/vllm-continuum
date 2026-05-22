@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import os
 import queue as queue_mod
@@ -27,6 +28,12 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
+from vllm.v1.core.sched.licht_v3_snapshot import (LichtV3Constants,
+                                                  LichtV3PrefillSnapshot,
+                                                  LichtV3RunningView,
+                                                  LichtV3WaitingView)
+from vllm.v1.core.sched.licht_v3.decode_manager import LichtV3DecodeManager
+from vllm.utils import get_hash_fn_by_name
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
@@ -116,6 +123,21 @@ class Scheduler(SchedulerInterface):
     # the eviction candidate set, so a freshly-admitted request gets at
     # least one productive prefill chunk before it can be evicted again.
     LICHT_PREEMPT_MIN_RUN_GRACE_S = 15.0
+
+    # LICHTV2 backfill-window parameters.
+    # N = lookahead horizon in scheduler steps.  At each scheduler step
+    # we maintain two arrays of length N+1:
+    #   future_free[t]  = predicted physical free blocks at end of step t
+    #   future_alloc[t] = total prefill block alloc at step t (per-step flow)
+    # A waiting candidate j is admitted iff inserting it leaves
+    #   future_free[t] + cum_delta(t) >= threshold for all t in [0, N]
+    # where threshold = LICHTV2_LONG_TAIL_HEADROOM_RATIO * total_blocks
+    # for long-tail (R(j) > N) candidates and 0 otherwise.  Additionally
+    # future_alloc[t] + B_j(t) must not exceed max_num_batched_tokens /
+    # block_size to respect the per-step token budget.
+    LICHTV2_N = 50
+    LICHTV2_LONG_TAIL_HEADROOM_RATIO = 0.025
+    LICHTV2_MAX_LONG_BRIDGE = 2
 
     def __init__(
         self,
@@ -209,24 +231,81 @@ class Scheduler(SchedulerInterface):
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
 
-        # LICHT is a global algorithm switch. For now it only changes
-        # scheduler behavior; KV transfer strategy remains default.
+        # LICHT / LICHTV2 / LICHTV3 are mutually-exclusive scheduling switches.
+        # LICHTV2 reuses LICHT's score-based picker for waiting requests,
+        # so on prefill it implies licht_prefill_sched_enabled.  Decode
+        # is unaffected by LICHTV2 (it always falls back to default FCFS).
+        # LICHTV3 is a strict superset of LICHTV2: it reuses every v2
+        # code path on prefill and only adds opt-in decode-side hooks
+        # for round-gap KV management.  Internally we set
+        # `licht_v2_enabled = True` when v3 is on, so the existing v2
+        # prefill backfill machinery activates without any branching.
         self.instance_role = _resolve_instance_role(vllm_config)
-        self.licht_enabled = self.scheduler_config.licht
+        _v3_flag = bool(getattr(self.scheduler_config, "licht_v3", False))
+        _v2_flag = bool(self.scheduler_config.licht_v2)
+        _v1_flag = bool(self.scheduler_config.licht)
+        if sum([_v1_flag, _v2_flag, _v3_flag]) > 1:
+            raise ValueError(
+                "--licht, --licht-v2 and --licht-v3 are mutually "
+                "exclusive; specify at most one.")
+        # licht_v3 implies licht_v2 prefill behaviour.
+        self.licht_v3_enabled = _v3_flag
+        self.licht_v2_enabled = _v2_flag or _v3_flag
+        self.licht_v2_prefill_sched_enabled = (
+            self.licht_v2_enabled and self.instance_role != "decode")
+        # v3 decode hook flag is set independently of the v2 prefill path
+        # and only fires on decode instances.  It is wired here so that
+        # later v3 decode-side components can gate themselves on it
+        # without touching the licht-v2 derivation above.
+        self.licht_v3_decode_enabled = (self.licht_v3_enabled
+                                        and self.instance_role == "decode")
+        # LICHTV3 decode-side coordinator.  Lazily attached after the
+        # KV cache manager finishes init (so we know block_size and
+        # the real max_num_seqs / num_gpu_blocks).  See the bottom of
+        # __init__.
+        self.licht_v3_decode_manager: Optional[LichtV3DecodeManager] = None
+        # licht_enabled stays true for LICHTV2 on prefill so the existing
+        # score / preempt-victim machinery is reused.  Pure decode
+        # instances under LICHTV2 don't get the LICHT decode-FCFS path.
+        self.licht_enabled = (self.scheduler_config.licht
+                              or self.licht_v2_prefill_sched_enabled)
         self.licht_prefill_sched_enabled = (self.licht_enabled
                                             and self.instance_role != "decode")
-        self.licht_decode_fcfs_enabled = (self.licht_enabled
+        self.licht_decode_fcfs_enabled = (self.scheduler_config.licht
                                           and self.instance_role == "decode")
         self.licht_waiting_round_start_ts: dict[str, float] = {}
         # Wall-clock timestamp of the most recent admission into running.
         # Used by _pick_preempt_victim_licht to enforce a min-run grace
         # so that just-admitted requests are not immediately evicted.
         self.licht_running_admit_ts: dict[str, float] = {}
+        # LICHTV2: snapshot num_computed_tokens at admission so the
+        # timeline can compute B_i(t) / release_blocks(i) consistently
+        # across scheduler steps even as num_computed_tokens advances.
+        self.licht_v2_num_computed_at_admit: dict[str, int] = {}
+        # LICHTV2: count of prefix-cache blocks that were in the free
+        # queue (refcount=0) at admit time and got "touched" by this
+        # request, removing them from the free queue.  This count is
+        # used to model the t=0 free-queue consumption (in addition to
+        # B_at(t=0)) AND the t=R release back to the free queue.
+        # Without this, the timeline under-counts admit-time consumption
+        # for multi-turn workloads that hit prior-turn prefix cache.
+        self.licht_v2_evictable_prefix_at_admit: dict[str, int] = {}
+        # P5b: last-probed (prefix-hit, evictable) per WAITING request, so
+        # the StepEvent can report the real prefix hit for waiting reqs
+        # (their request.num_computed_tokens is still 0 pre-admit).  The
+        # decode-side simulator uses this to model returning requests'
+        # 回传'd prefix.  request_id → (hit_length, evictable_prefix).
+        self._v3_waiting_hit: dict[str, tuple[int, int]] = {}
+        # 回传 REMOVED (2026-05-21): no defer/push-back state on the prefill.
+        # Total number of GPU blocks (denominator for headroom ratio).
+        self._total_kv_blocks = num_gpu_blocks
         if self.licht_enabled:
             logger.info(
-                "LICHT mode enabled (instance_role=%s). "
+                "LICHT mode enabled (instance_role=%s, v2=%s, v3=%s). "
                 "KV transfer strategy currently uses default implementation.",
                 self.instance_role,
+                self.licht_v2_enabled,
+                self.licht_v3_enabled,
             )
             if self.licht_prefill_sched_enabled:
                 logger.info(
@@ -238,6 +317,25 @@ class Scheduler(SchedulerInterface):
                     self.LICHT_PREFILL_SCORE_TMAX_S,
                     self.LICHT_PREFILL_ROUND_DECAY_ALPHA,
                     self.LICHT_PREEMPT_MIN_RUN_GRACE_S,
+                )
+            if self.licht_v2_prefill_sched_enabled:
+                _chunk = max(
+                    1, self.scheduler_config.long_prefill_token_threshold)
+                _max_alloc = (self.scheduler_config.max_num_batched_tokens
+                              // self.block_size)
+                logger.info(
+                    "LICHTV2 prefill backfill params: N=%d, "
+                    "long_tail_headroom=%.1f%% of %d blocks, "
+                    "max_long_bridge=%d, chunk_size=%d tokens, "
+                    "block_size=%d, max_alloc_per_step=%d blocks, "
+                    "release_at=t=R (1-step delay after last alloc)",
+                    self.LICHTV2_N,
+                    self.LICHTV2_LONG_TAIL_HEADROOM_RATIO * 100,
+                    self._total_kv_blocks,
+                    self.LICHTV2_MAX_LONG_BRIDGE,
+                    _chunk,
+                    self.block_size,
+                    _max_alloc,
                 )
 
         # Initialize ToolCallEstimator with tokenizer config
@@ -276,6 +374,12 @@ class Scheduler(SchedulerInterface):
         # Lock protects kv_cache_manager.free / allocate_slots from
         # concurrent access by the background thread and the main loop.
         self._kv_free_lock = threading.Lock()
+        # P9/兜底: held across the ENTIRE schedule() so the install-center's
+        # background drain can run safely DURING the forward (execute_model,
+        # when block_pool is untouched) yet never overlap schedule()'s
+        # allocate_slots/touch (the free_block_queue corruption that crashed
+        # the engine).  RLock = re-entrant on the engine thread.
+        self._schedule_lock = threading.RLock()
         # Deferred cleanup items produced by the background thread.
         # Each item: (request_id, timestamps_dict)
         # The main thread drains this at schedule()/update_from_output() to
@@ -332,6 +436,102 @@ class Scheduler(SchedulerInterface):
             self._bg_free_thread = threading.Thread(
                 target=self._bg_free_loop, daemon=True)
             self._bg_free_thread.start()
+
+        # 回传 REMOVED (2026-05-21): no prefill install center (it only
+        # existed to receive decode→prefill push-backs).
+
+        # LICHTV3 decode-side coordinator: instantiate only on decode
+        # instances under --licht-v3.  Construction is cheap; the tool
+        # predictor model loads lazily on first use.
+        if self.licht_v3_decode_enabled:
+            try:
+                run_dir = os.environ.get(
+                    "LICHT_V3_TOOL_PREDICTOR_DIR") or None
+                default_t = float(os.environ.get(
+                    "LICHT_V3_DEFAULT_T_TOOL_S", "5.0"))
+                mcfg = vllm_config.model_config
+                self.licht_v3_decode_manager = LichtV3DecodeManager(
+                    max_slots=self.scheduler_config.max_num_seqs,
+                    block_size=self.block_size,
+                    tool_predictor_run_dir=run_dir,
+                    default_t_tool_s=default_t,
+                    kv_cache_manager=self.kv_cache_manager,
+                    model_name_or_path=(getattr(mcfg, "tokenizer", None)
+                                         or getattr(mcfg, "model", None)),
+                    tokenizer_mode=getattr(mcfg, "tokenizer_mode", "auto"),
+                    trust_remote_code=getattr(mcfg, "trust_remote_code", False),
+                    tokenizer_revision=getattr(mcfg, "tokenizer_revision", None),
+                )
+                self._v3_retained_requests: dict[str, Request] = {}
+                self.licht_v3_decode_manager.bind_release_retained_cb(
+                    self._v3_release_retained)
+                # 回传 (P1): give the decode manager the SCHEDULER-role
+                # connector so it can enqueue KV push-backs into connector
+                # metadata (executed on the worker during forward).
+                if self.connector is not None:
+                    self.licht_v3_decode_manager.bind_connector(self.connector)
+                logger.info(
+                    "LICHTV3 decode manager wired up on instance_role=%s",
+                    self.instance_role)
+            except Exception as e:
+                logger.warning(
+                    "LICHTV3 decode manager init failed: %s; v3 will be "
+                    "inert on this instance.", e)
+                self.licht_v3_decode_manager = None
+
+        # LICHTV3 K_queue ground-truth logger (prefill side).  Counts the
+        # number of scheduler steps between a request being added to the
+        # waiting queue (add_request) and being moved to scheduled_new_reqs
+        # (admitted to RUNNING).  Writes one JSONL line per admission to
+        # `LICHT_V3_KQUEUE_ACTUAL_LOG`.  Disabled if env var
+        # LICHT_V3_LOG_KQUEUE_ACTUAL=0 or instance is not prefill.
+        self._v3_kqueue_log_enabled = (
+            self.instance_role != "decode"
+            and os.environ.get("LICHT_V3_LOG_KQUEUE_ACTUAL", "1") == "1")
+        self._v3_sched_step: int = 0
+        self._v3_arrival_step: dict[str, int] = {}
+        self._v3_arrival_ts: dict[str, float] = {}
+        self._v3_kqueue_log_path = os.environ.get(
+            "LICHT_V3_KQUEUE_ACTUAL_LOG",
+            "/data/whr/vllm-continuum/output/v3_kqueue_actual.jsonl")
+        if self._v3_kqueue_log_enabled:
+            try:
+                os.makedirs(os.path.dirname(self._v3_kqueue_log_path),
+                            exist_ok=True)
+                # Truncate at startup so each run is self-contained.
+                open(self._v3_kqueue_log_path, "w").close()
+                logger.info(
+                    "LICHTV3 K_queue actual logger enabled on prefill "
+                    "(role=%s) → %s",
+                    self.instance_role, self._v3_kqueue_log_path)
+            except Exception as e:
+                logger.warning(
+                    "LICHTV3 K_queue actual logger disable: %s", e)
+                self._v3_kqueue_log_enabled = False
+
+        # LICHTV3 StepEvent publisher (prefill side).  Publishes one
+        # JSON message per schedule() call so decode-side ShadowScheduler
+        # can mirror prefill state in real time.  Gated by env
+        # LICHT_V3_STEP_EVENT_PUB_ADDR (e.g. "tcp://*:5559") and only
+        # active on prefill instances.
+        self._v3_step_event_pub_addr = os.environ.get(
+            "LICHT_V3_STEP_EVENT_PUB_ADDR", "")
+        self._v3_step_event_pub = None
+        self._v3_step_wall_history: "list[float]" = []  # recent step_end ts
+        if (self._v3_step_event_pub_addr
+                and self.instance_role != "decode"):
+            try:
+                import zmq
+                self._v3_zmq_ctx = zmq.Context()
+                self._v3_step_event_pub = self._v3_zmq_ctx.socket(zmq.PUB)
+                self._v3_step_event_pub.bind(self._v3_step_event_pub_addr)
+                logger.info("LICHTV3 StepEvent pub bound on %s",
+                            self._v3_step_event_pub_addr)
+            except Exception as e:
+                logger.warning("LICHTV3 StepEvent pub bind failed: %s; "
+                               "ShadowScheduler will not receive updates",
+                               e)
+                self._v3_step_event_pub = None
 
     def pop_running_request_based_on_last_step(self, request: Request) -> tuple[Request, bool]:
         """Pop a request from running queue based on job_id level FCFS and last step."""
@@ -592,8 +792,428 @@ class Scheduler(SchedulerInterface):
             return
 
         self.waiting.pop_request()
-    
+
+    # ------------------------------------------------------------------
+    # LICHTV2 backfill-window helpers
+    # ------------------------------------------------------------------
+    # All four helpers below are no-ops unless
+    # licht_v2_prefill_sched_enabled is True.  They share the timeline
+    # state stored on `self`:
+    #   self._licht_v2_future_free  : list[int], length N+1
+    #   self._licht_v2_future_alloc : list[int], length N+1
+    # which are rebuilt at the start of each waiting-loop pass via
+    # _licht_v2_build_timeline().
+
+    def _licht_v2_chunk_size(self) -> int:
+        chunk = self.scheduler_config.long_prefill_token_threshold
+        return chunk if chunk > 0 else self.scheduler_config.max_num_batched_tokens
+
+    def _licht_v2_R_at(self, request: Request, current_offset: int) -> int:
+        """Remaining prefill scheduler steps starting from `current_offset`.
+
+        For running requests, pass `request.num_computed_tokens` so R
+        decreases as the request makes progress.  For a candidate that
+        is about to be admitted, pass the value that will become its
+        num_computed_tokens (typically the prefix-cache hit count).
+        """
+        chunk = self._licht_v2_chunk_size()
+        remaining = max(request.num_tokens - current_offset, 0)
+        if remaining <= 0:
+            return 0
+        return (remaining + chunk - 1) // chunk
+
+    def _licht_v2_release_blocks(
+            self, request: Request, num_computed_at_admit: int) -> int:
+        """Blocks that go back to the free pool when prefill completes.
+
+        Anchored at admission so it stays constant across scheduler
+        steps even as `num_computed_tokens` advances.  Excludes prefix-
+        cache shared portion (those blocks are refcount-managed and
+        don't deterministically return to the free pool).
+        """
+        bs = self.block_size
+        net_tokens = max(request.num_tokens - num_computed_at_admit, 0)
+        return (net_tokens + bs - 1) // bs
+
+    def _licht_v2_B_at(self, request: Request, current_offset: int,
+                       t: int) -> int:
+        """Blocks newly allocated by `request` at future step `t`,
+        relative to NOW (offset = current num_computed for the request).
+
+        B(t) = ⌈cum(t)/block_size⌉ - ⌈cum(t-1)/block_size⌉
+        where cum(t) = current_offset + min(chunk*(t+1), remaining_now).
+
+        For running requests, current_offset must be the current
+        `num_computed_tokens` so already-allocated chunks are not
+        double-counted.  For candidates, current_offset is the
+        will-be-admitted num_computed (= the prefix-cache hit count).
+        """
+        Ri = self._licht_v2_R_at(request, current_offset)
+        if not (0 <= t < Ri):
+            return 0
+        chunk = self._licht_v2_chunk_size()
+        bs = self.block_size
+        remaining_now = max(request.num_tokens - current_offset, 0)
+        cum_t = current_offset + min(chunk * (t + 1), remaining_now)
+        cum_prev = current_offset + (
+            min(chunk * t, remaining_now) if t > 0 else 0)
+        return max(((cum_t + bs - 1) // bs) - ((cum_prev + bs - 1) // bs),
+                   0)
+
+    def _licht_v2_get_admit_anchor(self, request_id: str) -> int:
+        """Look up the num_computed_at_admit snapshot for a running req.
+
+        Falls back to 0 if the request was admitted before LICHTV2 was
+        active (shouldn't happen in normal operation but keeps the math
+        safe).
+        """
+        return self.licht_v2_num_computed_at_admit.get(request_id, 0)
+
+    def _licht_v2_get_evictable_prefix(self, request_id: str) -> int:
+        """Look up the evictable-prefix-blocks snapshot for a running req."""
+        return self.licht_v2_evictable_prefix_at_admit.get(request_id, 0)
+
+    # 回传 REMOVED (2026-05-21): _v3_should_defer_for_pushback and
+    # _v3_full_pushback_prefix_blocks deleted (defer + full-prefix anchor).
+
+    def _licht_v2_count_evictable_prefix(self, new_computed_blocks) -> int:
+        """Count blocks in `new_computed_blocks` that are currently in
+        the free queue (ref_cnt == 0 and not null).
+
+        These are the blocks that allocate_slots()'s
+        get_num_blocks_to_allocate() adds to its required-blocks count
+        (single_type_kv_cache_manager.py:83-86): touching them at admit
+        will remove them from the free queue, so the timeline must
+        subtract them at t=0 in addition to B_at(t=0).
+        """
+        if new_computed_blocks is None:
+            return 0
+        # KVCacheBlocks wraps a tuple of per-group block lists; raw
+        # tuples/lists are also accepted for safety.
+        block_lists = getattr(new_computed_blocks, "blocks",
+                              new_computed_blocks)
+        count = 0
+        for blocks_per_group in block_lists:
+            for blk in blocks_per_group:
+                if blk.ref_cnt == 0 and not blk.is_null:
+                    count += 1
+        return count
+
+    def _licht_v2_build_timeline(self, current_free: int) -> None:
+        """Recompute future_free / future_alloc from current running state.
+
+        IMPORTANT: this MUST be called BEFORE the running loop has
+        allocated any blocks for this scheduler step.  In that ordering:
+
+          - current_free reflects PRE-this-step state
+          - request.num_computed_tokens is also the PRE-this-step value
+          - At timeline t=0 we subtract running's "first future chunk"
+            B_at(stale, 0), which IS this step's chunk — exactly the
+            block that the running loop is about to allocate
+          - future_free[0] therefore predicts the state at the END of
+            this step (post-running-alloc, pre-waiting-alloc)
+
+        Candidates' apply_to_timeline runs after each successful admit
+        in the waiting loop, further decrementing future_free[0..] for
+        each admitted candidate's own this-step alloc.  At end of the
+        scheduler step, future_free[0] should match the actual physical
+        free block count.
+
+        Release events are reflected at t = R (one step after the
+        request's final chunk alloc).  This 1-step delay models the
+        BLOCK_MIGRATE pipeline (last chunk forward → KV migration →
+        RELEASE round-trip → fast_release_poll), which empirically
+        spans one full scheduler step in our setup.  Modeling release
+        any earlier (e.g. at t=R-1) leads to over-optimistic admits
+        and a sharp rise in preempts.
+        """
+        N = self.LICHTV2_N
+        future_free = [0] * (N + 1)
+        future_alloc = [0] * (N + 1)
+        prev = current_free
+
+        # Decode requests' block usage is already excluded from
+        # `current_free`; the timeline assumes decode does not release
+        # blocks within the lookahead horizon (conservative).
+        running_prefill = [
+            r for r in self.running
+            if r.num_computed_tokens < r.num_tokens
+        ]
+
+        for t in range(0, N + 1):
+            delta_free = 0
+            delta_alloc = 0
+            for r in running_prefill:
+                cur = r.num_computed_tokens
+                Ri = self._licht_v2_R_at(r, cur)
+                if t < Ri:
+                    # Alloc event: each in-progress chunk decrements free.
+                    bit = self._licht_v2_B_at(r, cur, t)
+                    delta_free -= bit
+                    delta_alloc += bit
+                elif t == Ri:
+                    # Release event at t = Ri (1-step delay after last
+                    # chunk).  We hand back BOTH the request's net new
+                    # alloc and the evictable prefix blocks it touched
+                    # at admit (the latter were taken out of the free
+                    # queue at admit and now flow back as ref_cnt drops
+                    # to 0).
+                    admit_anchor = self._licht_v2_get_admit_anchor(
+                        r.request_id)
+                    ev = self._licht_v2_get_evictable_prefix(r.request_id)
+                    delta_free += (self._licht_v2_release_blocks(
+                        r, admit_anchor) + ev)
+                # t > Ri: contributes nothing
+            future_free[t] = prev + delta_free
+            future_alloc[t] = delta_alloc
+            prev = future_free[t]
+
+        self._licht_v2_future_free = future_free
+        self._licht_v2_future_alloc = future_alloc
+
+    def _licht_v2_count_long_running(self) -> int:
+        """Count running prefill requests with R(i) > N (long-tail).
+
+        Uses CURRENT num_computed (not admit anchor) so requests that
+        have shrunk below the threshold while running are no longer
+        counted as long-tail.
+        """
+        N = self.LICHTV2_N
+        count = 0
+        for r in self.running:
+            if r.num_computed_tokens >= r.num_tokens:
+                continue
+            if self._licht_v2_R_at(r, r.num_computed_tokens) > N:
+                count += 1
+        return count
+
+    def _licht_v2_can_admit(
+            self, request: Request,
+            num_computed_at_admit: int,
+            evictable_prefix: int = 0) -> bool:
+        """Three-guard admission check against the current timeline.
+
+        Guard 1 (long-tail concurrency cap): if R(j) > N, the number of
+            already-running long-tail requests + 1 must not exceed
+            LICHTV2_MAX_LONG_BRIDGE.
+        Guard 2 (block timeline + headroom): for every t in [0, N],
+            future_free[t] + cum_delta_j(t) >= threshold, with threshold
+            = LICHTV2_LONG_TAIL_HEADROOM_RATIO * total_blocks for
+            long-tail candidates and 0 otherwise.
+        Guard 3 (per-step alloc budget): for every t in [0, R(j)-1],
+            future_alloc[t] + B_j(t) <= max_num_batched_tokens /
+            block_size.
+
+        `evictable_prefix` is the count of prefix-cache blocks currently
+        in the free queue (ref_cnt==0) that this candidate's
+        new_computed_blocks will touch on admit.  These leave the free
+        queue at admit (additional t=0 consumption beyond B_at(0)) and
+        flow back at t=R when the request's ref drops to 0.
+        """
+        N = self.LICHTV2_N
+        # For a candidate, the "current offset" at the moment of admit
+        # equals num_computed_at_admit (= prefix-cache hit count).
+        Rj = self._licht_v2_R_at(request, num_computed_at_admit)
+        if Rj <= 0:
+            # Nothing to schedule (already done) — let the regular path
+            # handle it.
+            return True
+
+        long_tail = Rj > N
+
+        # Guard 1: long-tail concurrency cap.
+        if long_tail:
+            long_count = self._licht_v2_count_long_running()
+            if long_count + 1 > self.LICHTV2_MAX_LONG_BRIDGE:
+                return False
+
+        threshold = (int(self.LICHTV2_LONG_TAIL_HEADROOM_RATIO
+                         * self._total_kv_blocks)
+                     if long_tail else 0)
+        max_alloc_per_step = (
+            self.scheduler_config.max_num_batched_tokens // self.block_size)
+
+        # Guard 2 + Guard 3: walk the horizon with cumulative delta.
+        # Release event at t = Rj (1-step delay after last chunk alloc),
+        # which models the BLOCK_MIGRATE round-trip empirically spanning
+        # one scheduler step.  Alloc at [0, Rj-1] and release at Rj are
+        # mutually exclusive in time, so we use if/elif.
+        cum_delta = 0
+        for t in range(0, N + 1):
+            # One-time prefix-touch consumption at admit step.  Mirrors
+            # what allocate_slots()'s num_evictable_computed_blocks does
+            # to num_blocks_to_allocate.
+            if t == 0:
+                cum_delta -= evictable_prefix
+            bit_j = 0
+            if t < Rj:
+                bit_j = self._licht_v2_B_at(request,
+                                            num_computed_at_admit, t)
+                cum_delta -= bit_j
+            elif t == Rj:
+                cum_delta += (self._licht_v2_release_blocks(
+                    request, num_computed_at_admit) + evictable_prefix)
+            # else: cum_delta unchanged (j has finished and released)
+
+            # Guard 2: block availability (with optional headroom).
+            if self._licht_v2_future_free[t] + cum_delta < threshold:
+                return False
+
+            # Guard 3: per-step alloc budget (only applies during j's
+            # alloc window).
+            if t < Rj:
+                if (self._licht_v2_future_alloc[t] + bit_j
+                        > max_alloc_per_step):
+                    return False
+
+        return True
+
+    def _licht_v2_apply_to_timeline(
+            self, request: Request,
+            num_computed_at_admit: int,
+            evictable_prefix: int = 0) -> None:
+        """Commit `request`'s events into the live timeline.
+
+        MUST mirror exactly the cum_delta accumulation used in
+        `_licht_v2_can_admit`, otherwise subsequent candidates will see
+        an inconsistent timeline.
+        """
+        N = self.LICHTV2_N
+        Rj = self._licht_v2_R_at(request, num_computed_at_admit)
+        if Rj <= 0:
+            return
+
+        cum_delta = 0
+        for t in range(0, N + 1):
+            if t == 0:
+                cum_delta -= evictable_prefix   # mirror can_admit
+            if t < Rj:
+                bit = self._licht_v2_B_at(request,
+                                          num_computed_at_admit, t)
+                cum_delta -= bit
+                self._licht_v2_future_alloc[t] += bit
+            elif t == Rj:
+                cum_delta += (self._licht_v2_release_blocks(
+                    request, num_computed_at_admit) + evictable_prefix)
+            self._licht_v2_future_free[t] += cum_delta
+
+    # ------------------------------------------------------------------
+    # LICHTV3 read-only snapshot API
+    # ------------------------------------------------------------------
+    # Below this line: strictly read-only helpers used by the LICHTV3
+    # decode-side queue-time predictor.  Nothing here mutates scheduler
+    # state, and no licht-v2 code path calls into it.
+
+    def _v3_get_admit_ts(self, request: Request) -> float:
+        """Wall-clock admit timestamp for a running prefill request.
+        Falls back to arrival_time if the request was admitted before
+        the admit-ts bookkeeping was active."""
+        return self.licht_running_admit_ts.get(
+            request.request_id, request.arrival_time)
+
+    def snapshot_for_v3_simulator(
+        self,
+        now: Optional[float] = None,
+    ) -> LichtV3PrefillSnapshot:
+        """Build a read-only snapshot for the LICHTV3 queue-time predictor.
+
+        Safe to call from any thread that has a consistent view of
+        `self.running` / `self.waiting` (i.e. between scheduler steps).
+        Caller is expected to memoise the result for ~100ms to keep
+        snapshot rate low.
+        """
+        if now is None:
+            now = time.time()
+
+        constants = LichtV3Constants(
+            score_a=self.LICHT_PREFILL_SCORE_A,
+            score_b=self.LICHT_PREFILL_SCORE_B,
+            score_tmax_s=self.LICHT_PREFILL_SCORE_TMAX_S,
+            round_decay_alpha=self.LICHT_PREFILL_ROUND_DECAY_ALPHA,
+            lichtv2_horizon_n=self.LICHTV2_N,
+            chunk_size_tokens=self._licht_v2_chunk_size(),
+        )
+
+        running_views: list[LichtV3RunningView] = []
+        for r in self.running:
+            r_remaining = self._licht_v2_R_at(r, r.num_computed_tokens)
+            running_views.append(LichtV3RunningView(
+                request_id=r.request_id,
+                arrival_ts=r.arrival_time,
+                admit_ts=self._v3_get_admit_ts(r),
+                num_prompt_tokens=r.num_prompt_tokens,
+                num_computed_tokens=r.num_computed_tokens,
+                r_remaining_chunks=r_remaining,
+                agent_round=max(r.agent_round, 0),
+            ))
+
+        waiting_views: list[LichtV3WaitingView] = []
+        for r in self.waiting:
+            r_full = self._licht_v2_R_at(r, 0)
+            waiting_views.append(LichtV3WaitingView(
+                request_id=r.request_id,
+                arrival_ts=r.arrival_time,
+                num_prompt_tokens=r.num_prompt_tokens,
+                r_full_chunks=r_full,
+                agent_round=max(r.agent_round, 0),
+            ))
+
+        future_free: Optional[tuple[int, ...]] = None
+        future_alloc: Optional[tuple[int, ...]] = None
+        if (self.licht_v2_prefill_sched_enabled
+                and hasattr(self, "_licht_v2_future_free")
+                and hasattr(self, "_licht_v2_future_alloc")):
+            future_free = tuple(self._licht_v2_future_free)
+            future_alloc = tuple(self._licht_v2_future_alloc)
+
+        # Compute the prefill worker's ZMQ address the same way the
+        # P2pNcclConnector does: `kv_ip` from config (typically
+        # 127.0.0.1) + kv_port.  Decode-side ConnectorBridge reads
+        # this from the snapshot so the LICHTV3 RPC target matches
+        # the engine's ROUTER bind exactly.
+        prefill_kv_zmq_address: Optional[str] = None
+        try:
+            kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+            if (kv_cfg is not None
+                    and self.instance_role != "decode"
+                    and getattr(kv_cfg, "kv_port", None)):
+                from vllm.utils import get_ip
+                host = getattr(kv_cfg, "kv_ip", None) or get_ip()
+                prefill_kv_zmq_address = (
+                    f"{host}:{int(kv_cfg.kv_port)}")
+        except Exception:  # pragma: no cover
+            prefill_kv_zmq_address = None
+
+        return LichtV3PrefillSnapshot(
+            timestamp=now,
+            instance_role=self.instance_role,
+            block_size=self.block_size,
+            free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            total_kv_blocks=self._total_kv_blocks,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            constants=constants,
+            running=tuple(running_views),
+            waiting=tuple(waiting_views),
+            licht_v2_future_free=future_free,
+            licht_v2_future_alloc=future_alloc,
+            prefill_kv_zmq_address=prefill_kv_zmq_address,
+        )
+
     def schedule(self) -> SchedulerOutput:
+        # P9/兜底: hold _schedule_lock across the whole method so the
+        # install-center bg drain (separate thread) can drain reserves
+        # during the forward but never concurrently with allocate_slots.
+        with self._schedule_lock:
+            return self._schedule_impl()
+
+    def _schedule_impl(self) -> SchedulerOutput:
+        # LICHTV3 K_queue actual: increment per-call step counter.  Used
+        # both for stamping arrival_step on add_request and admit_step
+        # when a waiting request is moved into scheduled_new_reqs.
+        if self._v3_kqueue_log_enabled:
+            self._v3_sched_step += 1
+
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -608,6 +1228,15 @@ class Scheduler(SchedulerInterface):
         # Change 3: fast-release side-channel — drain RELEASE signals that
         # arrived between forward steps and free blocks immediately.
         self._poll_fast_releases()
+
+        # 回传 REMOVED: no install center to drain.
+        # LICHTV3 decode side: process GPU-tier release callbacks parked
+        # by the prewarm thread.  Must run on scheduler thread for
+        # block_pool safety (calling _free_blocks from prewarm thread
+        # races with scheduler.allocate_slots → linked-list corruption
+        # → 13 Running reqs stuck at 0 tok/s, observed in production).
+        if self.licht_v3_decode_manager is not None:
+            self.licht_v3_decode_manager.drain_pending_releases()
 
         # Change 6 (bug fix): ensure delay-free request IDs are included in
         # finished_req_ids so they are passed to the worker-side
@@ -643,6 +1272,19 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+
+        # LICHTV2: build the backfill window BEFORE the running loop so
+        # that current_free / num_computed_tokens are both in their
+        # pre-this-step state.  Running's t=0 alloc (= this step's
+        # chunk) is captured by the timeline; admitted candidates'
+        # apply_to_timeline calls later in the waiting loop further
+        # subtract their own this-step allocs.  At end of the scheduler
+        # step, future_free[0] should match actual physical free.
+        if self.licht_v2_prefill_sched_enabled:
+            with self._kv_free_lock:
+                _lv2_current_free = (
+                    self.kv_cache_manager.block_pool.get_num_free_blocks())
+            self._licht_v2_build_timeline(_lv2_current_free)
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -779,6 +1421,13 @@ class Scheduler(SchedulerInterface):
                         # fresh from the new admission moment.
                         self.licht_running_admit_ts.pop(
                             preempted_req.request_id, None)
+                        # LICHTV2: drop the timeline anchor so the
+                        # next admission re-snapshots num_computed and
+                        # evictable-prefix at that moment.
+                        self.licht_v2_num_computed_at_admit.pop(
+                            preempted_req.request_id, None)
+                        self.licht_v2_evictable_prefix_at_admit.pop(
+                            preempted_req.request_id, None)
                         # Accumulate victim count for the LICHT preempt
                         # selector.  Unconditional: non-LICHT paths never
                         # read this field, so the write is harmless.
@@ -845,11 +1494,18 @@ class Scheduler(SchedulerInterface):
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
+        # P5b: fresh per-step stash of probed prefix hits (repopulated by
+        # the can_admit probes below; read by _v3_publish_step_event).
+        self._v3_waiting_hit.clear()
 
         # Next, schedule the WAITING requests.
         # TODO (Hanchen) need to add scheduling logic for returns from functions. It should not be FCFS
         if not preempted_reqs:
             self._ensure_licht_waiting_start_timestamps()
+            # LICHTV2: timeline was already built before the running
+            # loop.  Each successful admit below applies its events to
+            # the same timeline so subsequent candidates see the impact
+            # of earlier ones in the same scheduler step.
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -929,6 +1585,11 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                # 回传 REMOVED (2026-05-21, user request): no defer / no
+                # push-back trigger.  Returning requests admit normally (plain
+                # LICHT-V2 timeline behaviour); the prefix is recomputed if not
+                # cached, exactly like before回传 existed.
+
                 encoder_inputs_to_schedule = None
                 new_encoder_compute_budget = encoder_compute_budget
 
@@ -994,6 +1655,71 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
+                # LICHTV2: capture the evictable-prefix count BEFORE
+                # allocate_slots touches those blocks (after touch,
+                # ref_cnt > 0 and they'd no longer be detected as
+                # evictable).  We reuse this count both for can_admit's
+                # timeline check below and for apply_to_timeline /
+                # snapshot at admit success further down.
+                evictable_prefix_lv2 = 0
+                anchor_lv2 = num_computed_tokens
+                free_blocks_before_admit_lv2 = -1
+                if self.licht_v2_prefill_sched_enabled:
+                    evictable_prefix_lv2 = (
+                        self._licht_v2_count_evictable_prefix(
+                            new_computed_blocks))
+                    # 回传 REMOVED: P11d full-prefix anchor override is gone.
+                    # anchor = actual num_computed (plain LICHT-V2): the
+                    # timeline accounts only what's really cached, since no
+                    # 回传 will bring the rest.
+                    # Snapshot the free-pool BEFORE can_admit so the
+                    # offline simulator gets the same `current_free`
+                    # the scheduler saw at THIS probe (success or fail).
+                    free_blocks_before_admit_lv2 = (
+                        self.kv_cache_manager.block_pool.get_num_free_blocks())
+
+                # LICHTV2: consult the backfill window before attempting
+                # any block allocation.  If the timeline rejects this
+                # candidate, pop it from waiting and stash to skipped so
+                # the loop continues with the next score-ranked candidate
+                # instead of triggering preempt.  The evictable-prefix
+                # count mirrors what allocate_slots's
+                # get_num_blocks_to_allocate() will charge for prefix
+                # touches; passing it keeps can_admit's prediction in
+                # lockstep with the actual block accounting.
+                if (self.licht_v2_prefill_sched_enabled
+                        and not load_kv_async):
+                    can_admit_lv2 = self._licht_v2_can_admit(
+                        request, anchor_lv2, evictable_prefix_lv2)
+                    # LICHTV2 monitoring: probe-level log fired on EVERY
+                    # can_admit call (success or fail).  This is the
+                    # critical fix over the admit-only event log: target
+                    # requests are probed many times before they finally
+                    # admit, and the simulator needs evictable_prefix
+                    # truth at each of those earlier probe steps too —
+                    # not just at the final-admit step.
+                    monitoring_recorder.record_licht_admit_probe(
+                        request_id=request.request_id,
+                        job_id=request.job_id,
+                        agent_round=request.agent_round,
+                        evictable_prefix=evictable_prefix_lv2,
+                        free_blocks_before_admit=
+                            free_blocks_before_admit_lv2,
+                        num_computed_at_probe=anchor_lv2,
+                        num_new_tokens=num_new_tokens,
+                        num_running_before=len(self.running),
+                        will_admit=can_admit_lv2,
+                    )
+                    # P5b: stash this probe's real prefix hit so the
+                    # StepEvent can report it for requests that stay
+                    # WAITING (their num_computed_tokens is 0 pre-admit).
+                    self._v3_waiting_hit[request.request_id] = (
+                        anchor_lv2, evictable_prefix_lv2)
+                    if not can_admit_lv2:
+                        self._pop_waiting_request(request)
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
                 # NOTE (Hanchen) This is allocating new slots. We have already decided to schedule this request
                 with self._kv_free_lock:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1055,16 +1781,90 @@ class Scheduler(SchedulerInterface):
                     # this request becomes evictable again.
                     self.licht_running_admit_ts[request.request_id] = (
                         time.time())
+                if self.licht_v2_prefill_sched_enabled:
+                    # Snapshot the prefix-aware token anchor AND the
+                    # evictable-prefix count captured before
+                    # allocate_slots touched those blocks.  Both are
+                    # reused later: anchor by R/B math, evictable by
+                    # build_timeline's release accounting.  Then commit
+                    # this admit's events into the live timeline so
+                    # subsequent candidates see its impact.
+                    self.licht_v2_num_computed_at_admit[
+                        request.request_id] = anchor_lv2
+                    self.licht_v2_evictable_prefix_at_admit[
+                        request.request_id] = evictable_prefix_lv2
+                    self._licht_v2_apply_to_timeline(
+                        request, anchor_lv2, evictable_prefix_lv2)
+                    # LICHTV2 monitoring: dump the four block-accounting
+                    # quantities the offline simulator needs to verify
+                    # its per-step ledger against ground truth.
+                    new_blocks_count_lv2 = sum(
+                        len(g) for g in new_blocks.blocks)
+                    monitoring_recorder.record_licht_admit_event(
+                        request_id=request.request_id,
+                        job_id=request.job_id,
+                        agent_round=request.agent_round,
+                        evictable_prefix=evictable_prefix_lv2,
+                        new_blocks_allocated=new_blocks_count_lv2,
+                        free_blocks_before_admit=
+                            free_blocks_before_admit_lv2,
+                        num_computed_at_admit=anchor_lv2,
+                        num_new_tokens=num_new_tokens,
+                        num_running_before=len(self.running) - 1,
+                    )
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
                     self.continuum_recorder.request_waiting_to_running(
-                        request, 
+                        request,
                         prompt_length=request.num_prompt_tokens,
                         hit_length=num_computed_tokens
                     )
                     scheduled_new_reqs.append(request)
+                    # LICHTV3 K_queue ground truth: a WAITING request was
+                    # just admitted to RUNNING — write the diff between
+                    # admit step and arrival step.
+                    if self._v3_kqueue_log_enabled:
+                        # NOTE: use get() not pop() — StepEvent emission
+                        # at end of schedule() also needs arrival_step
+                        # for admitted requests.  Stale dict entries are
+                        # overwritten by add_request on re-arrival; no
+                        # cleanup needed for finished reqs in this run.
+                        arr_step = self._v3_arrival_step.get(
+                            request.request_id, None)
+                        arr_ts = self._v3_arrival_ts.get(
+                            request.request_id, None)
+                        if arr_step is not None:
+                            try:
+                                rec = {
+                                    "ts": time.time(),
+                                    "request_id": request.request_id,
+                                    "job_id": getattr(request,
+                                                       "job_id", None),
+                                    "agent_round": getattr(request,
+                                                            "agent_round",
+                                                            None),
+                                    "arrival_step": arr_step,
+                                    "admit_step": self._v3_sched_step,
+                                    "k_queue_actual":
+                                        self._v3_sched_step - arr_step,
+                                    "arrival_ts": arr_ts,
+                                    "wait_wall_s": (
+                                        time.time() - arr_ts
+                                        if arr_ts is not None else None),
+                                    "num_prompt_tokens":
+                                        request.num_prompt_tokens,
+                                    "num_running_at_admit":
+                                        len(self.running),
+                                    "num_waiting_at_admit":
+                                        len(self.waiting),
+                                }
+                                with open(self._v3_kqueue_log_path,
+                                          "a") as _kf:
+                                    _kf.write(json.dumps(rec) + "\n")
+                            except Exception:
+                                pass
                 elif request.status == RequestStatus.PREEMPTED:
                     self.continuum_recorder.request_evicted_to_running(
                         request,
@@ -1188,8 +1988,182 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
-        
+
+        # Step-time ground truth: log per-step compute load so the
+        # offline step_time/ training pipeline has the actual
+        # num_scheduled_tokens (= chunked-prefill + decode tokens THIS
+        # step) — not the iteration_stats.num_prompt_tokens which counts
+        # finished-prefill prompt lengths (≠ per-step compute).
+        try:
+            new_admit_tokens = sum(
+                num_scheduled_tokens.get(r.request_id, 0)
+                for r in scheduled_new_reqs)
+            monitoring_recorder.record_step_compute(
+                step_id=self._v3_sched_step,
+                num_scheduled_tokens=int(
+                    sum(num_scheduled_tokens.values())
+                    if num_scheduled_tokens else 0),
+                num_running=len(self.running),
+                num_waiting=len(self.waiting),
+                num_new_admits=len(scheduled_new_reqs),
+                num_new_admit_tokens=int(new_admit_tokens),
+            )
+        except Exception as e:
+            logger.debug("record_step_compute failed: %s", e)
+
+        # LICHTV3 StepEvent publish: send authoritative snapshot of
+        # waiting + running so decode-side ShadowScheduler can mirror
+        # state in real time.  Best-effort; failure never blocks
+        # the scheduler.
+        if self._v3_step_event_pub is not None:
+            try:
+                num_tokens_total = (
+                    sum(num_scheduled_tokens.values())
+                    if num_scheduled_tokens else 0)
+                self._v3_publish_step_event(
+                    scheduled_new_reqs,
+                    list(self.finished_req_ids),
+                    num_scheduled_tokens_this_step=num_tokens_total)
+            except Exception as e:
+                logger.debug("LICHTV3 StepEvent publish failed: %s", e)
+
         return scheduler_output
+
+    # ----------------------------------------------------------------------
+    # LICHTV3 StepEvent helpers
+    # ----------------------------------------------------------------------
+
+    def _v3_publish_step_event(self,
+                                scheduled_new_reqs: list,
+                                finished_now: list,
+                                num_scheduled_tokens_this_step: int = 0
+                                ) -> None:
+        """Build + publish a StepEvent for this scheduler step."""
+        from vllm.v1.core.sched.licht_v3.step_event import (
+            ReqSnapshot, StepEvent, encode_step_event)
+        now = time.time()
+        # Rolling sec/step (window of 32 step ends).
+        self._v3_step_wall_history.append(now)
+        if len(self._v3_step_wall_history) > 32:
+            self._v3_step_wall_history.pop(0)
+        if len(self._v3_step_wall_history) >= 2:
+            span = (self._v3_step_wall_history[-1]
+                    - self._v3_step_wall_history[0])
+            n = len(self._v3_step_wall_history) - 1
+            sec_per_step = span / n if n > 0 else 0.05
+        else:
+            sec_per_step = 0.05
+
+        def _snap(req, *, admit_step=None, arrival_step=None,
+                  r_remaining=None) -> "ReqSnapshot":
+            return ReqSnapshot(
+                request_id=req.request_id,
+                traj_id=getattr(req, "job_id", None),
+                agent_round=getattr(req, "agent_round", None),
+                num_prompt_tokens=int(
+                    getattr(req, "num_prompt_tokens", 0) or 0),
+                hit_length=int(
+                    getattr(req, "num_computed_tokens", 0) or 0),
+                admit_step=admit_step,
+                arrival_step=arrival_step,
+                r_remaining=r_remaining,
+                evictable_prefix=0,
+            )
+
+        # Compute true r_remaining (chunked-prefill chunks left).  Only
+        # meaningful when LICHTV2 is enabled (chunk_size constant comes
+        # from scheduler_config.long_prefill_token_threshold).  For
+        # decode-phase requests _licht_v2_R_at returns 0; decode side
+        # then treats them as "static (no chunks, never auto-release)".
+        def _r_remaining_for(req) -> Optional[int]:
+            if not self.licht_v2_enabled:
+                return None
+            try:
+                return int(self._licht_v2_R_at(
+                    req, req.num_computed_tokens))
+            except Exception:
+                return None
+
+        admitted = [
+            _snap(r,
+                  admit_step=self._v3_sched_step,
+                  arrival_step=self._v3_arrival_step.get(r.request_id),
+                  r_remaining=_r_remaining_for(r))
+            for r in scheduled_new_reqs
+        ]
+        # waiting snapshot — only requests still in queue post-schedule.
+        try:
+            waiting_iter = list(self.waiting)
+        except Exception:
+            waiting_iter = []
+        waiting_now = []
+        for w in waiting_iter:
+            arr = self._v3_arrival_step.get(w.request_id, self._v3_sched_step)
+            snap = _snap(w, arrival_step=arr)
+            # P5b: a WAITING request's request.num_computed_tokens is 0
+            # pre-admit, so _snap's hit_length is 0.  Override with the
+            # real prefix hit captured by this step's can_admit probe.
+            he = self._v3_waiting_hit.get(w.request_id)
+            if he is not None:
+                snap.hit_length = int(he[0])
+                snap.evictable_prefix = int(he[1])
+            waiting_now.append(snap)
+        # running snapshot.  r_remaining is computed exactly so decode
+        # side can model release timing correctly.
+        running_now = []
+        for r in self.running:
+            running_now.append(
+                _snap(r, r_remaining=_r_remaining_for(r)))
+        evt = StepEvent(
+            step_id=int(self._v3_sched_step),
+            step_wall_ts=float(now),
+            sec_per_step_recent=float(sec_per_step),
+            admitted=admitted,
+            finished=[str(x) for x in finished_now],
+            preempted=[],
+            waiting_now=waiting_now,
+            running_now=running_now,
+            max_num_seqs=int(self.max_num_running_reqs),
+            max_num_batched_tokens=int(self.max_num_scheduled_tokens),
+            block_size=int(self.block_size),
+            total_kv_blocks=int(self.kv_cache_config.num_blocks
+                                if hasattr(self.kv_cache_config,
+                                           "num_blocks") else 0),
+            num_scheduled_tokens_this_step=int(
+                num_scheduled_tokens_this_step),
+            # LICHTV2 timeline + constants — the simulator on decode
+            # side mirrors prefill's admit decisions using these.
+            future_free=(list(self._licht_v2_future_free)
+                         if self.licht_v2_enabled else []),
+            future_alloc=(list(self._licht_v2_future_alloc)
+                          if self.licht_v2_enabled else []),
+            lichtv2_horizon_n=int(getattr(self, "LICHTV2_N", 0)),
+            chunk_size_tokens=int(
+                self._licht_v2_chunk_size()
+                if self.licht_v2_enabled else 0),
+            max_alloc_per_step_blocks=int(
+                self.max_num_scheduled_tokens // max(self.block_size, 1)),
+            long_tail_headroom_blocks=int(
+                0.025 * (self.kv_cache_config.num_blocks
+                         if hasattr(self.kv_cache_config,
+                                    "num_blocks") else 0)),
+            long_running_count=int(
+                self._licht_v2_count_long_running()
+                if self.licht_v2_enabled else 0),
+            max_long_bridge=int(
+                getattr(self, "LICHTV2_MAX_LONG_BRIDGE", 2)),
+            score_a=float(getattr(self, "LICHT_PREFILL_SCORE_A", 3.0)),
+            score_b=float(getattr(self, "LICHT_PREFILL_SCORE_B", 1.0)),
+            score_tmax_s=float(
+                getattr(self, "LICHT_PREFILL_SCORE_TMAX_S", 120.0)),
+            round_decay_alpha=float(
+                getattr(self, "LICHT_PREFILL_ROUND_DECAY_ALPHA", 0.5)),
+        )
+        try:
+            self._v3_step_event_pub.send(encode_step_event(evt),
+                                          flags=0x1)  # NOBLOCK
+        except Exception as e:
+            logger.debug("StepEvent send failed: %s", e)
 
     def _update_after_schedule(
         self,
@@ -1701,6 +2675,12 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        # LICHTV3 K_queue ground truth: stamp arrival step + wall ts so
+        # the diff at admit time gives the true number of scheduler steps
+        # the request waited in `self.waiting`.
+        if self._v3_kqueue_log_enabled:
+            self._v3_arrival_step[request.request_id] = self._v3_sched_step
+            self._v3_arrival_ts[request.request_id] = time.time()
 
     def finish_requests(
         self,
@@ -1748,10 +2728,29 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
+        # LICHTV3: on decode, every finished request is a "round end".
+        # Notify the v3 coordinator BEFORE we free state so its predictor
+        # sees consistent num_tokens / agent_round on the request.  This
+        # call never raises (manager wraps the pipeline in try/except).
+        if self.licht_v3_decode_manager is not None:
+            self.licht_v3_decode_manager.on_round_finished(
+                request, decode_finish_ts=time.time())
+        # LICHTV3 GPU-tier retention: if the v3 decision wanted to keep
+        # KV in decode GPU until the prewarm push fires, stash the
+        # request here and SKIP the normal free path.  The decode
+        # manager calls back into _v3_release_retained() after the push
+        # completes (success or failure) to perform the deferred free.
+        if (self.licht_v3_decode_manager is not None
+                and self.licht_v3_decode_manager.should_retain_gpu_blocks(
+                    request.request_id)):
+            self._v3_retained_requests[request.request_id] = request
+            return None
         self.tool_call_estimator.request_finished(request)
         self.continuum_recorder.request_finished(request)
         self._drop_licht_waiting_state(request.request_id)
         self.licht_running_admit_ts.pop(request.request_id, None)
+        self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
+        self.licht_v2_evictable_prefix_at_admit.pop(request.request_id, None)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
@@ -1777,6 +2776,36 @@ class Scheduler(SchedulerInterface):
                 getattr(request, "job_id", None))
 
         return kv_xfer_params
+
+    def _v3_release_retained(self, request_id: str) -> None:
+        """Free the KV blocks of a request that was previously retained
+        by LICHTV3 GPU tier.  Called from the decode manager's prewarm
+        thread after the v3 push completes.  No-op if the request is
+        not in the retained map (e.g., scheduler restarted between
+        retain and release)."""
+        request = self._v3_retained_requests.pop(request_id, None)
+        if request is None:
+            return
+        try:
+            # Mirror the tail of _free_request that we skipped earlier.
+            self.tool_call_estimator.request_finished(request)
+            self.continuum_recorder.request_finished(request)
+            self._drop_licht_waiting_state(request.request_id)
+            self.licht_running_admit_ts.pop(request.request_id, None)
+            self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
+            self.licht_v2_evictable_prefix_at_admit.pop(
+                request.request_id, None)
+            delay_free_blocks, _ = self._connector_finished(request)
+            self.encoder_cache_manager.free(request)
+            self.finished_req_ids.add(request_id)
+            if self.finished_req_ids_dict is not None:
+                self.finished_req_ids_dict[request.client_index].add(
+                    request_id)
+            if not delay_free_blocks:
+                self._free_blocks(request)
+        except Exception as e:
+            logger.warning("LICHTV3 release_retained free failed req=%s: %s",
+                           request_id, e)
 
     def _dec_delay_free_counter(self, request: Request) -> None:
         """Decrement delay-free block counter before freeing blocks.

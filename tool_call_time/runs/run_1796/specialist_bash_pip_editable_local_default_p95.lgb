@@ -1,0 +1,164 @@
+tree
+version=v4
+num_class=1
+num_tree_per_iteration=1
+label_index=0
+max_feature_idx=67
+objective=quantile
+feature_names=bucket tool_name cmd_len_chars cmd_len_tokens cmd_has_amp cmd_has_pipe cmd_has_bg cmd_has_redirect cmd_amp_chain_len cmd_n_pipes cmd_has_timeout_prefix cmd_timeout_n cmd_has_sleep cmd_sleep_n cmd_hang_hint cmd_pipe_count e1_same_bucket_count e1_same_bucket_log_mean e1_same_bucket_log_std e1_same_bucket_last e2_traj_log_speed_factor e2_n_heavy_observed e3_all_log_mean e3_n_all_observed e4_round_k e4_cum_bash_time e4_seen_timeout e5_last_obs_traceback e5_cum_obs_traceback e5_last_obs_server_running e5_cum_obs_server_running e5_last_obs_building e5_cum_obs_building editor_cmd editor_has_range editor_filetext_len c_script_resolved c_script_loc c_script_n_imports c_script_flask_run c_script_serve_forever c_script_n_hang_signals c_script_strong_hang c_script_has_network c_script_has_subprocess c_script_has_threading editor_old_len editor_new_len pytest_has_k pytest_has_x pytest_collect_only pytest_has_tb pytest_scope c_pytest_n_test_files c_pytest_total_files pip_is_editable pip_has_extras pip_no_build_iso pip_no_deps pip_has_venv_chain pip_has_uninstall pip_n_pkgs pip_has_compile_heavy c_pip_setup_resolved c_pip_setup_loc c_pip_n_deps c_pip_has_cython c_pip_has_c_ext
+feature_infos=-1:76 -1:0 [23:124] [4:16] [0:1] none none none [0:3] none [0:1] [0:60] none none [0:1] [0:0] [0:15] [1.8570397464465525:5.186411443035297] [0:0.483794838759803] [1.8174998254262729:5.186411443035297] [-0.78909614252948412:4.8530443315877481] [0:18] [0:2.8535551323744377] [2:63] [2:63] [0:822.38850899999977] [0:1] [0:1] [0:16] none [0:1] [0:1] [0:15] -1:0 [0:0] [0:0] [0:1] [3:42] [1:3] [0:0] [0:0] [0:0] [0:0] [0:1] [0:0] [0:0] [0:0] [0:0] [0:0] [0:0] [0:0] [0:0] [1:1] [0:0] [0:0] [1:1] none none none none [0:1] [0:3] [0:1] [1:1] [10:285] [0:4] [0:0] [0:0]
+tree_sizes=1286
+
+Tree=0
+num_leaves=13
+num_cat=0
+split_feature=25 20 22 20 22 20 23 22 22 21 22 25
+split_gain=1.67972 1.2 0.390925 1.5 0.3 0.157746 0.262579 0.8448 0.964286 0.25 0.107962 0.789474
+threshold=0.28857650000000007 -0.42474754204822357 1.003285669812269 0.63397058377955517 0.068817871537099742 -0.15911642273629287 10.500000000000002 0.19816561177312766 0.28126620070407349 2.5000000000000004 0.099935913002356172 0.7064775000000002
+decision_type=2 10 2 8 2 8 2 2 2 2 2 2
+left_child=1 -1 5 -4 -3 6 7 10 9 -9 11 -2
+right_child=2 4 3 -5 -6 -7 -8 8 -10 -11 -12 -13
+leaf_value=4.9533023842964399 5.0618596696194631 5.0679012870683833 5.0680091595413304 5.0606651721629063 5.075143064059664 5.0580797707183747 5.0585227321827944 5.0677080988225018 5.0613519644412488 5.0610263920208913 5.0589647981907344 5.0665183149404793
+leaf_weight=3.0000000000000009 15.000000000000002 2.9999999999999991 1.9999999999999989 6.0000000000000009 1.9999999999999998 114 43 1.9999999999999989 3 1.9999999999999998 20 3.9999999999999991
+leaf_count=3 15 3 2 6 2 114 43 2 3 2 20 4
+internal_value=5.06217 5.08465 5.06131 5.07215 5.09965 5.06089 5.06246 5.06509 5.08108 5.09715 5.06222 5.06492
+internal_weight=219 8 211 8 5 203 89 46 7 4 39 19
+internal_count=219 8 211 8 5 203 89 46 7 4 39 19
+is_linear=0
+shrinkage=1
+
+
+end of trees
+
+feature_importances:
+e3_all_log_mean=5
+e2_traj_log_speed_factor=3
+e4_cum_bash_time=2
+e2_n_heavy_observed=1
+e3_n_all_observed=1
+
+parameters:
+[boosting: gbdt]
+[objective: quantile]
+[metric: quantile]
+[tree_learner: serial]
+[device_type: cpu]
+[data_sample_strategy: bagging]
+[data: ]
+[valid: ]
+[num_iterations: 200]
+[learning_rate: 0.05]
+[num_leaves: 31]
+[num_threads: 1]
+[seed: 0]
+[deterministic: 0]
+[force_col_wise: 0]
+[force_row_wise: 0]
+[histogram_pool_size: -1]
+[max_depth: -1]
+[min_data_in_leaf: 2]
+[min_sum_hessian_in_leaf: 0.001]
+[bagging_fraction: 1]
+[pos_bagging_fraction: 1]
+[neg_bagging_fraction: 1]
+[bagging_freq: 0]
+[bagging_seed: 3]
+[bagging_by_query: 0]
+[feature_fraction: 1]
+[feature_fraction_bynode: 1]
+[feature_fraction_seed: 2]
+[extra_trees: 0]
+[extra_seed: 6]
+[early_stopping_round: 0]
+[early_stopping_min_delta: 0]
+[first_metric_only: 0]
+[max_delta_step: 0]
+[lambda_l1: 0]
+[lambda_l2: 0]
+[linear_lambda: 0]
+[min_gain_to_split: 0]
+[drop_rate: 0.1]
+[max_drop: 50]
+[skip_drop: 0.5]
+[xgboost_dart_mode: 0]
+[uniform_drop: 0]
+[drop_seed: 4]
+[top_rate: 0.2]
+[other_rate: 0.1]
+[min_data_per_group: 100]
+[max_cat_threshold: 32]
+[cat_l2: 10]
+[cat_smooth: 10]
+[max_cat_to_onehot: 4]
+[top_k: 20]
+[monotone_constraints: ]
+[monotone_constraints_method: basic]
+[monotone_penalty: 0]
+[feature_contri: ]
+[forcedsplits_filename: ]
+[refit_decay_rate: 0.9]
+[cegb_tradeoff: 1]
+[cegb_penalty_split: 0]
+[cegb_penalty_feature_lazy: ]
+[cegb_penalty_feature_coupled: ]
+[path_smooth: 0]
+[interaction_constraints: ]
+[verbosity: -1]
+[saved_feature_importance_type: 0]
+[use_quantized_grad: 0]
+[num_grad_quant_bins: 4]
+[quant_train_renew_leaf: 0]
+[stochastic_rounding: 1]
+[linear_tree: 0]
+[max_bin: 255]
+[max_bin_by_feature: ]
+[min_data_in_bin: 3]
+[bin_construct_sample_cnt: 200000]
+[data_random_seed: 1]
+[is_enable_sparse: 1]
+[enable_bundle: 1]
+[use_missing: 1]
+[zero_as_missing: 0]
+[feature_pre_filter: 0]
+[pre_partition: 0]
+[two_round: 0]
+[header: 0]
+[label_column: ]
+[weight_column: ]
+[group_column: ]
+[ignore_column: ]
+[categorical_feature: 0,1,33]
+[forcedbins_filename: ]
+[precise_float_parser: 0]
+[parser_config_file: ]
+[objective_seed: 5]
+[num_class: 1]
+[is_unbalance: 0]
+[scale_pos_weight: 1]
+[sigmoid: 1]
+[boost_from_average: 1]
+[reg_sqrt: 0]
+[alpha: 0.95]
+[fair_c: 1]
+[poisson_max_delta_step: 0.7]
+[tweedie_variance_power: 1.5]
+[lambdarank_truncation_level: 30]
+[lambdarank_norm: 1]
+[label_gain: ]
+[lambdarank_position_bias_regularization: 0]
+[eval_at: ]
+[multi_error_top_k: 1]
+[auc_mu_weights: ]
+[num_machines: 1]
+[local_listen_port: 12400]
+[time_out: 120]
+[machine_list_filename: ]
+[machines: ]
+[gpu_platform_id: -1]
+[gpu_device_id: -1]
+[gpu_use_dp: 0]
+[num_gpu: 1]
+
+end of parameters
+
+pandas_categorical:null

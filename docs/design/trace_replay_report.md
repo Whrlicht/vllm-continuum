@@ -20,7 +20,7 @@
 
 1. vllm/trace_replay/store.py
 - 从占位实现改为可加载 trace 文件。
-- 支持读取环境变量 VLLM_TRACE_REPLAY_PATH，默认回退 trace_data/swe_bench_sample_100_with_timings.json。
+- 支持读取环境变量 VLLM_TRACE_REPLAY_PATH，默认回退 trace_data/swe_bench_sample_300_tool_clean_with_timings.json。
 - 支持按 traj_id/instance_id 建索引。
 - 支持从常见字段抽取 token ids（trace_token_ids / forced_token_ids / output_token_ids / token_ids / tokens）。
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -293,15 +294,77 @@ class OpenAIServingChat(OpenAIServing):
                             role = str(msg.get("role", "user"))
                             norm: dict[str, object] = {"role": role}
                             content = msg.get("content")
-                            if isinstance(content, (str, list)):
-                                norm["content"] = content
+                            if isinstance(content, str):
+                                content_str = content
+                            elif isinstance(content, list):
+                                # Flatten content list to a text blob
+                                # (multimodal-style is not used here).
+                                pieces: list[str] = []
+                                for it in content:
+                                    if isinstance(it, dict):
+                                        t = it.get("text")
+                                        if isinstance(t, str):
+                                            pieces.append(t)
+                                    elif isinstance(it, str):
+                                        pieces.append(it)
+                                content_str = "\n".join(pieces)
                             elif content is None:
-                                norm["content"] = ""
+                                content_str = ""
                             else:
-                                norm["content"] = str(content)
-
-                            # Keep schema-minimal to avoid parser-specific
-                            # validation failures while computing token spans.
+                                content_str = str(content)
+                            # Append tool_call JSON inline INTO content.
+                            # Rationale: Llama 3.1's chat template, given a
+                            # message with BOTH content and tool_calls,
+                            # renders ONLY the tool_calls (silently dropping
+                            # content).  That breaks ReAct semantics — we
+                            # want the model output to include both the
+                            # thought/content text AND the tool_call.
+                            # Solution: keep tool_calls OUT of the message
+                            # dict (so the template won't trigger its
+                            # tool_calls branch) but stitch the JSON
+                            # rendering into `content` directly.  Downstream
+                            # consumers (LICHTV3 regex extractor + agent
+                            # parsers) can still locate the tool_call by
+                            # scanning the rendered text.
+                            tool_calls = msg.get("tool_calls")
+                            if isinstance(tool_calls, list) and tool_calls:
+                                tc_lines: list[str] = []
+                                for tc in tool_calls:
+                                    fn = (tc.get("function") or {}) \
+                                        if isinstance(tc, dict) else {}
+                                    name = fn.get("name")
+                                    args_raw = fn.get("arguments")
+                                    args = args_raw
+                                    if isinstance(args_raw, str):
+                                        try:
+                                            args = json.loads(args_raw)
+                                        except (json.JSONDecodeError,
+                                                TypeError):
+                                            args = args_raw
+                                    if name is None:
+                                        continue
+                                    tc_lines.append(json.dumps({
+                                        "name": name,
+                                        "parameters": args,
+                                    }, ensure_ascii=False))
+                                if tc_lines:
+                                    if content_str:
+                                        content_str = (
+                                            content_str + "\n"
+                                            + "\n".join(tc_lines))
+                                    else:
+                                        content_str = "\n".join(tc_lines)
+                            norm["content"] = content_str
+                            # tool_call_id stays for role=tool messages —
+                            # the template uses it to wire responses to
+                            # call IDs (chat_utils does NOT in-place mutate
+                            # this field, so it's safe).
+                            tool_call_id = msg.get("tool_call_id")
+                            if tool_call_id is not None:
+                                norm["tool_call_id"] = tool_call_id
+                            name = msg.get("name")
+                            if name is not None:
+                                norm["name"] = name
                             return norm
 
                         trace_messages = [
@@ -315,10 +378,19 @@ class OpenAIServingChat(OpenAIServing):
                             # Build trace token ids with the same chat template
                             # pipeline as the incoming request to keep token
                             # positions consistent.
+                            # IMPORTANT: deepcopy because `_preprocess_chat`
+                            # MUTATES tool_calls in place (chat_utils
+                            # json.loads-and-replaces `arguments` strings →
+                            # dicts).  Reusing the same trace_messages later
+                            # for prefix/upto re-rendering would re-enter
+                            # that path and json.loads a dict → 500.  The
+                            # trace_store also shares these objects across
+                            # requests, so mutating them would corrupt
+                            # subsequent calls.
                             _, _, trace_engine_prompts = await self._preprocess_chat(
                                 request,
                                 tokenizer,
-                                trace_messages,
+                                copy.deepcopy(trace_messages),
                                 chat_template=request.chat_template
                                 or self.chat_template,
                                 chat_template_content_format=self.
@@ -382,7 +454,7 @@ class OpenAIServingChat(OpenAIServing):
                                     _, _, prefix_prompts = await self._preprocess_chat(
                                         request,
                                         tokenizer,
-                                        trace_prefix_messages,
+                                        copy.deepcopy(trace_prefix_messages),
                                         chat_template=request.chat_template
                                         or self.chat_template,
                                         chat_template_content_format=self.
@@ -402,7 +474,7 @@ class OpenAIServingChat(OpenAIServing):
                                     _, _, upto_prompts = await self._preprocess_chat(
                                         request,
                                         tokenizer,
-                                        trace_upto_messages,
+                                        copy.deepcopy(trace_upto_messages),
                                         chat_template=request.chat_template
                                         or self.chat_template,
                                         chat_template_content_format=self.

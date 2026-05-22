@@ -305,6 +305,34 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+        # LICHTV3: when this is a prefill instance with v3 enabled, dump
+        # a read-only snapshot for the decode-side queue-time predictor.
+        # The writer rate-limits internally; we just always call it.
+        try:
+            if getattr(self.scheduler, "licht_v3_enabled", False) and \
+                    getattr(self.scheduler, "instance_role", None) != "decode":
+                from vllm.v1.core.sched.licht_v3.snapshot_io import (
+                    write_snapshot)
+                snap = self.scheduler.snapshot_for_v3_simulator()
+                write_snapshot(snap)
+        except Exception:  # pragma: no cover - never wedge the engine
+            pass
+
+        # LICHTV3: drain V3 install center EVERY iteration, even when
+        # the scheduler is idle and `schedule()` was not called this
+        # step.  Otherwise: prefill goes idle → schedule() stops →
+        # drain() stops → decode-side V3 RPCs block the prefill
+        # listener thread for the full 5s timeout each → BRIDGE_POP
+        # RPCs from the existing P/D KV pull also starve → new
+        # decode requests can't pull KV → entire pipeline stalls.
+        try:
+            install_center = getattr(self.scheduler,
+                                      "_v3_install_center", None)
+            if install_center is not None:
+                install_center.drain()
+        except Exception:  # pragma: no cover
+            pass
+
     def step_with_batch_queue(
             self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool]:
         """Schedule and execute batches with the batch queue.
