@@ -68,6 +68,12 @@ class LoggingStatLogger(StatLoggerBase):
         # Tracked stats over current local logging interval.
         self.num_prompt_tokens: int = 0
         self.num_generation_tokens: int = 0
+        # PEAK (max over the interval) instead of an instantaneous snapshot:
+        # PD-disaggregated prefill is bursty (process -> migrate -> free), so a
+        # snapshot at log time almost always lands in an idle gap and reads 0.
+        # The interval peak is what's actually meaningful.
+        self.peak_running_reqs: int = 0
+        self.peak_kv_cache_usage: float = 0.0
 
     def _track_iteration_stats(self, iteration_stats: IterationStats):
         # Save tracked stats for token counters.
@@ -99,12 +105,23 @@ class LoggingStatLogger(StatLoggerBase):
                     scheduler_stats.spec_decoding_stats)
 
             self.last_scheduler_stats = scheduler_stats
+            # Accumulate interval peaks (see _reset note).  Use the per-step
+            # scheduled count + that step's block footprint (prefill leaves
+            # `running` within the step, so num_running_reqs/kv_cache_usage
+            # sampled here read ~0 even when work happened).
+            self.peak_running_reqs = max(self.peak_running_reqs,
+                                         scheduler_stats.step_sched_reqs)
+            self.peak_kv_cache_usage = max(self.peak_kv_cache_usage,
+                                           scheduler_stats.step_block_usage)
 
     def log(self):
         now = time.monotonic()
         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
         generation_throughput = self._get_throughput(
             self.num_generation_tokens, now)
+        # Capture interval peaks before _reset clears them.
+        peak_running_reqs = self.peak_running_reqs
+        peak_kv_cache_usage = self.peak_kv_cache_usage
 
         self._reset(now)
 
@@ -124,15 +141,15 @@ class LoggingStatLogger(StatLoggerBase):
             "Engine %03d: "
             "Avg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, "
-            "Running: %d reqs, Waiting: %d reqs, "
-            "GPU KV cache usage: %.1f%%, "
+            "Running/step(peak): %d reqs, Waiting: %d reqs, "
+            "GPU KV cache usage(peak): %.1f%%, "
             "Prefix cache hit rate: %.1f%%",
             self.engine_index,
             prompt_throughput,
             generation_throughput,
-            scheduler_stats.num_running_reqs,
+            peak_running_reqs,
             scheduler_stats.num_waiting_reqs,
-            scheduler_stats.kv_cache_usage * 100,
+            peak_kv_cache_usage * 100,
             self.prefix_caching_metrics.hit_rate * 100,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)

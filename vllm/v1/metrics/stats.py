@@ -32,6 +32,12 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    # LICHT: requests actually scheduled THIS step (prefill leaves `running`
+    # within the step, so num_running_reqs reads ~0 at log time) + the block
+    # footprint of those requests (full prefix incl. round-kv load + this
+    # step's new prompt) as a fraction of total GPU blocks.
+    step_sched_reqs: int = 0
+    step_block_usage: float = 0.0
     num_waiting_for_remote_kvs: int = 0
     num_preempted: int = 0
 

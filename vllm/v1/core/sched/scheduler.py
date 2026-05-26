@@ -28,10 +28,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
-from vllm.v1.core.sched.licht_v3_snapshot import (LichtV3Constants,
-                                                  LichtV3PrefillSnapshot,
-                                                  LichtV3RunningView,
-                                                  LichtV3WaitingView)
 from vllm.v1.core.sched.licht_v3.decode_manager import LichtV3DecodeManager
 from vllm.utils import get_hash_fn_by_name
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
@@ -1097,109 +1093,6 @@ class Scheduler(SchedulerInterface):
                     request, num_computed_at_admit) + evictable_prefix)
             self._licht_v2_future_free[t] += cum_delta
 
-    # ------------------------------------------------------------------
-    # LICHTV3 read-only snapshot API
-    # ------------------------------------------------------------------
-    # Below this line: strictly read-only helpers used by the LICHTV3
-    # decode-side queue-time predictor.  Nothing here mutates scheduler
-    # state, and no licht-v2 code path calls into it.
-
-    def _v3_get_admit_ts(self, request: Request) -> float:
-        """Wall-clock admit timestamp for a running prefill request.
-        Falls back to arrival_time if the request was admitted before
-        the admit-ts bookkeeping was active."""
-        return self.licht_running_admit_ts.get(
-            request.request_id, request.arrival_time)
-
-    def snapshot_for_v3_simulator(
-        self,
-        now: Optional[float] = None,
-    ) -> LichtV3PrefillSnapshot:
-        """Build a read-only snapshot for the LICHTV3 queue-time predictor.
-
-        Safe to call from any thread that has a consistent view of
-        `self.running` / `self.waiting` (i.e. between scheduler steps).
-        Caller is expected to memoise the result for ~100ms to keep
-        snapshot rate low.
-        """
-        if now is None:
-            now = time.time()
-
-        constants = LichtV3Constants(
-            score_a=self.LICHT_PREFILL_SCORE_A,
-            score_b=self.LICHT_PREFILL_SCORE_B,
-            score_tmax_s=self.LICHT_PREFILL_SCORE_TMAX_S,
-            round_decay_alpha=self.LICHT_PREFILL_ROUND_DECAY_ALPHA,
-            lichtv2_horizon_n=self.LICHTV2_N,
-            chunk_size_tokens=self._licht_v2_chunk_size(),
-        )
-
-        running_views: list[LichtV3RunningView] = []
-        for r in self.running:
-            r_remaining = self._licht_v2_R_at(r, r.num_computed_tokens)
-            running_views.append(LichtV3RunningView(
-                request_id=r.request_id,
-                arrival_ts=r.arrival_time,
-                admit_ts=self._v3_get_admit_ts(r),
-                num_prompt_tokens=r.num_prompt_tokens,
-                num_computed_tokens=r.num_computed_tokens,
-                r_remaining_chunks=r_remaining,
-                agent_round=max(r.agent_round, 0),
-            ))
-
-        waiting_views: list[LichtV3WaitingView] = []
-        for r in self.waiting:
-            r_full = self._licht_v2_R_at(r, 0)
-            waiting_views.append(LichtV3WaitingView(
-                request_id=r.request_id,
-                arrival_ts=r.arrival_time,
-                num_prompt_tokens=r.num_prompt_tokens,
-                r_full_chunks=r_full,
-                agent_round=max(r.agent_round, 0),
-            ))
-
-        future_free: Optional[tuple[int, ...]] = None
-        future_alloc: Optional[tuple[int, ...]] = None
-        if (self.licht_v2_prefill_sched_enabled
-                and hasattr(self, "_licht_v2_future_free")
-                and hasattr(self, "_licht_v2_future_alloc")):
-            future_free = tuple(self._licht_v2_future_free)
-            future_alloc = tuple(self._licht_v2_future_alloc)
-
-        # Compute the prefill worker's ZMQ address the same way the
-        # P2pNcclConnector does: `kv_ip` from config (typically
-        # 127.0.0.1) + kv_port.  Decode-side ConnectorBridge reads
-        # this from the snapshot so the LICHTV3 RPC target matches
-        # the engine's ROUTER bind exactly.
-        prefill_kv_zmq_address: Optional[str] = None
-        try:
-            kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
-            if (kv_cfg is not None
-                    and self.instance_role != "decode"
-                    and getattr(kv_cfg, "kv_port", None)):
-                from vllm.utils import get_ip
-                host = getattr(kv_cfg, "kv_ip", None) or get_ip()
-                prefill_kv_zmq_address = (
-                    f"{host}:{int(kv_cfg.kv_port)}")
-        except Exception:  # pragma: no cover
-            prefill_kv_zmq_address = None
-
-        return LichtV3PrefillSnapshot(
-            timestamp=now,
-            instance_role=self.instance_role,
-            block_size=self.block_size,
-            free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
-            total_kv_blocks=self._total_kv_blocks,
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            constants=constants,
-            running=tuple(running_views),
-            waiting=tuple(waiting_views),
-            licht_v2_future_free=future_free,
-            licht_v2_future_alloc=future_alloc,
-            prefill_kv_zmq_address=prefill_kv_zmq_address,
-        )
-
     def schedule(self) -> SchedulerOutput:
         # P9/兜底: hold _schedule_lock across the whole method so the
         # install-center bg drain (separate thread) can drain reserves
@@ -1573,6 +1466,17 @@ class Scheduler(SchedulerInterface):
                             self._pop_waiting_request(request)
                             skipped_waiting_requests.prepend_request(request)
                             continue
+                        # LICHT round-kv: count external (cross-round) KV hits
+                        # in the prefix-cache hit rate, so the metric reflects
+                        # reuse from the external store too, not only the local
+                        # cache.  external is disjoint from local (the connector
+                        # returns matched - local), so there is no double count.
+                        elif (num_external_computed_tokens
+                              and self.kv_cache_manager.log_stats
+                              and self.kv_cache_manager.prefix_cache_stats
+                              is not None):
+                            self.kv_cache_manager.prefix_cache_stats.hits += (
+                                num_external_computed_tokens)
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
@@ -1668,10 +1572,22 @@ class Scheduler(SchedulerInterface):
                     evictable_prefix_lv2 = (
                         self._licht_v2_count_evictable_prefix(
                             new_computed_blocks))
+                    # LICHT round-kv reuse: the externally-loaded prior-round
+                    # prefix occupies FRESH blocks (not free-queue prefix
+                    # cache), so _count_evictable_prefix does not see them.
+                    # Charge them like an evictable prefix: consumed at admit
+                    # (t=0), held through this request's short prefill, and
+                    # released together at t=R (BLOCK_MIGRATE).  anchor_lv2
+                    # already includes these tokens (num_computed_tokens =
+                    # local + external), so R/B cover only the new tokens;
+                    # this term is the only missing block accounting.
+                    if num_external_computed_tokens > 0:
+                        evictable_prefix_lv2 += (
+                            num_external_computed_tokens // self.block_size)
                     # 回传 REMOVED: P11d full-prefix anchor override is gone.
                     # anchor = actual num_computed (plain LICHT-V2): the
-                    # timeline accounts only what's really cached, since no
-                    # 回传 will bring the rest.
+                    # timeline accounts only what's really cached (plus any
+                    # round-kv reuse charged above).
                     # Snapshot the free-pool BEFORE can_admit so the
                     # offline simulator gets the same `current_free`
                     # the scheduler saw at THIS probe (success or fail).
@@ -1959,7 +1875,27 @@ class Scheduler(SchedulerInterface):
             grammar_bitmask=grammar_bitmask,
         )
         #print(f"scheduler_output: {scheduler_output}")
-        
+
+        # LICHT: per-step occupancy for the metrics log.  In PD-disagg the
+        # prefill request leaves `running` and frees its blocks WITHIN the
+        # step, so num_running_reqs / kv usage sampled at log time read ~0.
+        # Capture here, BEFORE _update_after_schedule, what was actually
+        # scheduled this step + the block footprint of those requests (full
+        # prefix incl. round-kv loaded blocks + this step's new prompt).
+        try:
+            # True allocated-block usage RIGHT NOW (after this step's
+            # allocations, before the prefill migrates + frees).  Use
+            # block_pool.get_usage() which dedups shared prefix-cache blocks
+            # via refcount -> bounded to ~100%.  A per-request sum would
+            # double-count shared prefixes and exceed 100% (the earlier bug).
+            # Captured here (not at make_stats time) because prefill frees its
+            # blocks within the step, so usage sampled later reads ~0.
+            self._step_sched_reqs = len(num_scheduled_tokens)
+            self._step_block_usage = (
+                self.kv_cache_manager.block_pool.get_usage())
+        except Exception:
+            self._step_sched_reqs = 0
+            self._step_block_usage = 0.0
 
         # NOTE (Hanchen) this will handle the KVConnector
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2874,6 +2810,8 @@ class Scheduler(SchedulerInterface):
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            step_sched_reqs=getattr(self, "_step_sched_reqs", 0),
+            step_block_usage=getattr(self, "_step_block_usage", 0.0),
             num_waiting_for_remote_kvs=num_waiting_for_remote_kvs,
             num_preempted=num_preempted,
             kv_cache_usage=self.kv_cache_manager.usage,

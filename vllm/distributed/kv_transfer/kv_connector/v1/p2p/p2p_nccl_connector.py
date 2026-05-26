@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -56,12 +57,35 @@ class ReqMeta:
 
 
 @dataclass
+class RoundReqMeta:
+    """LICHT cross-round KV reuse entry passed scheduler→worker.
+
+    `block_ids` are GPU blocks: on prefill `round_load` the freshly
+    allocated prefix blocks to fill from the store; on decode
+    `round_store` the finished request's blocks to persist.  `token_ids`
+    is the full sequence (store only; empty for load)."""
+    request_id: str
+    job_id: str
+    block_ids: list[int]
+    token_ids: list[int]
+    num_blocks: int = 0
+    # round_load only: index of the first SAVED block to read.  Skips the
+    # leading prefix blocks already present in GPU via the local prefix
+    # cache, so block_ids (the destination) and the saved source stay
+    # aligned even when a local hit and a round-kv hit coexist.
+    src_block_offset: int = 0
+
+
+@dataclass
 class P2pNcclConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta]
     # 回传 REMOVED (2026-05-21): no v3 push-back/offload metadata fields.
 
     def __init__(self):
         self.requests = []
+        # LICHT round-kv cross-round reuse (empty unless enabled).
+        self.round_load: list[RoundReqMeta] = []
+        self.round_store: list[RoundReqMeta] = []
 
     def add_request(
         self,
@@ -99,11 +123,56 @@ class P2pNcclConnector(KVConnectorBase_V1):
         }
         self.chunked_prefill: dict[str, Any] = {}
         self._pending_bridge_reqs: list[tuple[str, list[int]]] = []
+        # Per prefill-step phase timing (producer): confirms whether the
+        # SYNCHRONOUS round-kv load blocks the engine.  idle=gap since prev
+        # step, load=time stuck in start_load_kv (round-kv read+scatter),
+        # fwd=forward, bridge=stage_bridge_request.
+        self._step_t_load_start = None
+        self._step_t_load_end = None
+        self._step_prev_save_end = None
         self._pending_failed_block_migrations: dict[
             str, tuple[list[int], list[int], str]
         ] = {}
         # 回传 REMOVED (2026-05-21): no v3 push-back/offload queues, bg
         # thread, tier handles, or push bridge.
+
+        # LICHT cross-round KV reuse store (CPU/SSD).  Enabled when
+        # extra_config["round_kv_reuse_path"] is set (e.g. /dev/shm/...).
+        # prefill (producer) LOADs a returning request's prior-round KV
+        # before forward; decode (consumer) STOREs a finished request's
+        # full-sequence KV via the delay-free + get_finished protocol.
+        self._round_kv_path = str(
+            self.config.get_from_extra_config("round_kv_reuse_path", "")
+            or "")
+        self._round_kv_enabled = bool(self._round_kv_path)
+        # ASYNC load (default OFF): async parks requests in
+        # WAITING_FOR_REMOTE_KVS for a variable (load-dependent) time, which
+        # breaks the LICHT-V3 admit predictor (it assumes the deterministic
+        # sync pattern: admit -> load this step -> run this step).  So default
+        # to SYNCHRONOUS (admit a batch -> load all their KV -> run together).
+        # LICHT_ROUND_KV_ASYNC=1 re-enables async (engine non-blocking) for
+        # experiments where the predictor isn't in play.
+        import os as _os
+        self._round_async = (
+            _os.environ.get("LICHT_ROUND_KV_ASYNC", "0") == "1")
+        self._round_store_obj = None  # RoundKVStore (lazy)
+        if self._round_kv_enabled:
+            try:
+                from vllm.v1.core.sched.licht_v3.round_kv_store import (
+                    RoundKVStore)
+                self._round_store_obj = RoundKVStore(
+                    self._round_kv_path, self._block_size)
+                logger.info(
+                    "LICHT round-kv reuse enabled (role=%s, is_producer=%s, "
+                    "path=%s)", role, self.is_producer, self._round_kv_path)
+            except Exception as e:
+                logger.warning("LICHT round-kv init failed: %s; disabling.", e)
+                self._round_kv_enabled = False
+        # Scheduler-side bookkeeping: producer prefix-load / decode store.
+        self._round_load_reqs: dict[str, tuple] = {}
+        self._pending_round_store: dict[str, tuple] = {}
+        # Worker-side store-completion is tracked inside RoundKVStore
+        # (drain_done) now that the write is async; get_finished reads it.
 
         self._rank = get_world_group().rank \
             if role == KVConnectorRole.WORKER else 0
@@ -131,6 +200,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if self.p2p_nccl_engine is not None:
             self.p2p_nccl_engine.register_kv_caches(kv_caches)
+        if self._round_store_obj is not None:
+            self._round_store_obj.bind_kv_caches(
+                kv_caches, is_producer=self.is_producer)
 
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
@@ -155,12 +227,54 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         if self.direct_block_mode:
             if self.is_producer:
+                self._step_t_load_start = time.time()
+                # LICHT round-kv: load the reused prior-round prefix into
+                # the GPU paged buffer BEFORE the forward, so attention
+                # sees it.  Delete-on-load (consume-once).
+                if self._round_kv_enabled:
+                    # NO delete-on-load (incremental keeps history; later
+                    # rounds append only the delta).
+                    if self._round_async:
+                        # ASYNC: enqueue to a bg thread and RETURN immediately
+                        # — the engine never blocks.  These requests are parked
+                        # in WAITING_FOR_REMOTE_KVS; get_finished reports them
+                        # done (recving) once the bg load fills their blocks.
+                        if metadata.round_load:
+                            self._round_store_obj.enqueue_load([
+                                (rl.request_id, rl.job_id, rl.block_ids,
+                                 rl.src_block_offset)
+                                for rl in metadata.round_load])
+                    elif self._round_store_obj.pipeline_enabled:
+                        # (sync) Layer-wise pipelined load.
+                        _items = [
+                            (rl.job_id, rl.block_ids, rl.src_block_offset)
+                            for rl in metadata.round_load]
+                        self._round_store_obj.start_load_pipelined(_items)
+                    elif metadata.round_load:
+                        # (sync) Batched load: BLOCKS the engine until done.
+                        _items = [
+                            (rl.job_id, rl.block_ids, rl.src_block_offset)
+                            for rl in metadata.round_load]
+                        self._round_store_obj.load_batch(_items)
+                self._step_t_load_end = time.time()
                 # Bridge publication must happen after prefill forward.
                 self._pending_bridge_reqs.extend((
                     req.request_id,
                     [int(x) for x in req.block_ids.tolist()],
                 ) for req in metadata.requests)
                 return
+
+            # LICHT round-kv: decode STOREs finished requests' full-seq KV
+            # from their delay-free-retained blocks.  Completions are
+            # reported via get_finished so the scheduler frees them.
+            if self._round_kv_enabled and metadata.round_store:
+                for rs in metadata.round_store:
+                    # Engine ONLY enqueues (no GPU op, no wait).  The
+                    # background pool does the incremental gather (own CUDA
+                    # stream) + write, and marks the request done once its
+                    # gather completes, releasing the delay-free blocks.
+                    self._round_store_obj.enqueue_store(
+                        rs.job_id, rs.block_ids, rs.token_ids, rs.request_id)
 
             for req_meta in metadata.requests:
                 remote_address = req_meta.remote_prefill_address
@@ -316,11 +430,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
-        This interface will be useful for layer-by-layer pipelining.
+        Used for LICHT round-kv layer-wise pipelining: on the prefill
+        (producer) side, this waits until the background driver has loaded
+        this layer's reused prefix, so attention reads valid KV while later
+        layers keep loading.  Cheap no-op when round-kv pipelining is off or
+        this forward has nothing to load.
 
         Args:
             layer_name: the name of that layer
         """
+        if (self._round_kv_enabled and self.is_producer
+                and self._round_store_obj is not None):
+            self._round_store_obj.wait_layer(layer_name)
         return
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
@@ -398,10 +519,29 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # Pure decode-pull mode: only stage bridge metadata
                 # locally.  Decode will fetch via BRIDGE_POP RPC in its
                 # own forward step.
+                _nreq = len(self._pending_bridge_reqs)
+                t_save_start = time.time()
                 for request_id, context_block_ids in self._pending_bridge_reqs:
                     self.p2p_nccl_engine.stage_bridge_request(
                         request_id, context_block_ids)
                 self._pending_bridge_reqs.clear()
+                # Per-step phase breakdown (producer): idle | load | fwd |
+                # bridge.  load = time the engine was STUCK in start_load_kv
+                # (round-kv synchronous load).  Confirms the stall source.
+                t_save_end = time.time()
+                ls, le = self._step_t_load_start, self._step_t_load_end
+                # Only log steps that actually forwarded requests — skip the
+                # frequent idle steps (reqs=0) that spam the log.
+                if ls is not None and le is not None and _nreq > 0:
+                    idle = ((ls - self._step_prev_save_end) * 1000.0
+                            if self._step_prev_save_end is not None else 0.0)
+                    logger.info(
+                        "round-kv STEP: reqs=%d idle_ms=%.0f load_ms=%.0f "
+                        "fwd_ms=%.0f bridge_ms=%.0f",
+                        _nreq, idle, (le - ls) * 1000.0,
+                        (t_save_start - le) * 1000.0,
+                        (t_save_end - t_save_start) * 1000.0)
+                self._step_prev_save_end = t_save_end
                 return
             self.p2p_nccl_engine.wait_for_sent()
 
@@ -423,8 +563,21 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         no_compile_layers = (
             self._vllm_config.compilation_config.static_forward_context)
-        return self.p2p_nccl_engine.get_finished(finished_req_ids,
-                                                 no_compile_layers)
+        sending, recving = self.p2p_nccl_engine.get_finished(
+            finished_req_ids, no_compile_layers)
+        # LICHT round-kv: report decode-store completions as finished
+        # sends so the scheduler frees the delay-free retained blocks.
+        if self._round_kv_enabled and self._round_store_obj is not None:
+            done = self._round_store_obj.drain_done()
+            if done:
+                sending = (sending or set()) | done
+            # ASYNC load completions -> recving, so the scheduler moves the
+            # request from WAITING_FOR_REMOTE_KVS to running (KV now filled).
+            if self._round_async:
+                loaded = self._round_store_obj.drain_loaded()
+                if loaded:
+                    recving = (recving or set()) | loaded
+        return sending, recving
 
     def pop_delay_free_timestamps(
             self, req_ids: set[str]) -> dict[str, dict[str, float]]:
@@ -476,6 +629,21 @@ class P2pNcclConnector(KVConnectorBase_V1):
             external KV cache beyond what is already computed.
         """
         if self.is_producer:
+            # LICHT round-kv: a returning request can reuse its prior-round
+            # KV from the CPU/SSD store.  Synchronous load (load_async=
+            # False) → blocks allocated + filled this step before forward.
+            if self._round_kv_enabled:
+                job_id = getattr(request, "job_id", None)
+                if job_id:
+                    res = self._round_store_obj.lookup(
+                        str(job_id), request.prompt_token_ids)
+                    if res is not None:
+                        matched_tokens, _ = res
+                        ext = matched_tokens - num_computed_tokens
+                        if ext > 0:
+                            # async (True): park in WAITING_FOR_REMOTE_KVS,
+                            # bg load, engine free.  sync (False): old path.
+                            return ext, self._round_async
             return 0, False
 
         num_external_tokens = (len(request.prompt_token_ids) - 1 -
@@ -498,6 +666,32 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if not self.is_producer and num_external_tokens > 0:
             self._requests_need_load[request.request_id] = (
                 request, blocks.get_block_ids()[0])
+            return
+        # LICHT round-kv: producer/prefill reuse — record the EXACT prefix
+        # blocks to fill before the forward.  The block list is
+        # [local-cache-hit blocks ... | external (gap) blocks | new-token
+        # blocks].  We must target only the gap blocks, at the right
+        # offset, AND read the saved source from the same offset — else we
+        # overwrite shared cached blocks and leave the prefix tail garbage.
+        if (self.is_producer and self._round_kv_enabled
+                and num_external_tokens > 0):
+            job_id = getattr(request, "job_id", None)
+            if job_id and self._round_store_obj is not None:
+                res = self._round_store_obj.lookup(
+                    str(job_id), request.prompt_token_ids)
+                if res is not None:
+                    _matched_tokens, matched_blocks = res
+                    num_blocks = num_external_tokens // self._block_size
+                    # local cache hit (in blocks) sits before the gap.
+                    local_hit_blocks = matched_blocks - num_blocks
+                    block_ids0 = blocks.get_block_ids()[0]
+                    if (num_blocks > 0 and local_hit_blocks >= 0
+                            and len(block_ids0)
+                            >= local_hit_blocks + num_blocks):
+                        dst = list(block_ids0)[
+                            local_hit_blocks:local_hit_blocks + num_blocks]
+                        self._round_load_reqs[request.request_id] = (
+                            str(job_id), dst, local_hit_blocks)
 
     # 回传 REMOVED (2026-05-21): enqueue_v3_pushback / enqueue_v3_offload /
     # enqueue_v3_offload_release deleted.
@@ -517,6 +711,27 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         meta = P2pNcclConnectorMetadata()
         # 回传 REMOVED: no v3 push-back/offload drain.
+
+        # LICHT round-kv: drain scheduler-side reuse bookkeeping into the
+        # metadata so the worker connector can load (prefill) / store
+        # (decode) during the forward.  Done before the role-specific
+        # early returns below so both paths carry it.
+        if self._round_kv_enabled:
+            for req_id, (job_id, dst_block_ids, src_offset) in \
+                    self._round_load_reqs.items():
+                meta.round_load.append(RoundReqMeta(
+                    request_id=req_id, job_id=job_id,
+                    block_ids=list(dst_block_ids), token_ids=[],
+                    num_blocks=len(dst_block_ids),
+                    src_block_offset=src_offset))
+            self._round_load_reqs.clear()
+            for req_id, (job_id, block_ids0, token_ids) in \
+                    self._pending_round_store.items():
+                meta.round_store.append(RoundReqMeta(
+                    request_id=req_id, job_id=job_id,
+                    block_ids=list(block_ids0), token_ids=list(token_ids),
+                    num_blocks=0))
+            self._pending_round_store.clear()
 
         if not self.is_producer and self.direct_block_mode:
             for req_id, (request, local_block_ids) in \
@@ -704,6 +919,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     "staged; freeing blocks immediately",
                     request.request_id)
             return (bridge_staged and len(block_ids) > 0), None
+
+        # LICHT round-kv: decode persists a finished round's full-sequence
+        # KV.  Stash (job_id, block_ids, token_ids) and return delay-free
+        # so the scheduler holds the blocks; the worker saves them next
+        # forward and reports completion via get_finished → then freed.
+        if (not self.is_producer and self._round_kv_enabled):
+            job_id = getattr(request, "job_id", None)
+            all_ids = list(getattr(request, "all_token_ids", []) or [])
+            if job_id and len(block_ids) > 0 and all_ids:
+                self._pending_round_store[request.request_id] = (
+                    str(job_id), list(block_ids), all_ids)
+                return True, None
 
         send_type = str(
             self.config.get_from_extra_config("send_type",

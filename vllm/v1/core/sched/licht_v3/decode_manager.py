@@ -34,8 +34,6 @@ from vllm.logger import init_logger
 
 from .predictors import ToolTimePredictorWrapper
 from .shadow_scheduler import ShadowScheduler
-from .snapshot_io import (get_instance_tag, read_snapshot,
-                          select_snapshot_path)
 # 回传 REMOVED (2026-05-21): connector_bridge / prewarm / tier_planner /
 # tier_storage / warm_pool deleted.  The dead orchestration methods that
 # referenced them remain only as never-called shells (safe under
@@ -136,15 +134,9 @@ class LichtV3DecodeManager:
         # REAL execution times in its E1-E5 history features, matching
         # how the predictor was trained.
         self._job_last_round: dict[str, tuple[dict, float]] = {}
-        # Snapshot read cache (poll-rate limited).
-        self._last_snap_ts = 0.0
-        self._last_snap: Optional[dict] = None
-        self._snap_min_interval_s = float(os.environ.get(
-            "LICHT_V3_SNAPSHOT_POLL_MIN_S", "0.1"))
         # Counters (for log only; promote to metrics later).
         self.counters: dict[str, int] = {
             "rounds_seen": 0,
-            "no_snapshot": 0,
             "tier_gpu": 0, "tier_cpu": 0, "tier_ssd": 0, "tier_drop": 0,
         }
         # LICHTV3 ShadowScheduler — event-driven mirror of prefill
@@ -186,25 +178,6 @@ class LichtV3DecodeManager:
             "LICHTV3 decode manager initialised (predictors only, 回传 "
             "removed) (max_slots=%d, block_size=%d)",
             max_slots, block_size)
-
-    # ------------------------------------------------------------------
-    # Snapshot pull (with poll-rate caching)
-    # ------------------------------------------------------------------
-
-    def _get_snapshot(self) -> Optional[dict]:
-        now = time.monotonic()
-        if (self._last_snap is not None
-                and now - self._last_snap_ts < self._snap_min_interval_s):
-            return self._last_snap
-        path = select_snapshot_path(exclude_tag=get_instance_tag())
-        if path is None:
-            return None
-        snap = read_snapshot(path)
-        if snap is None:
-            return None
-        self._last_snap = snap
-        self._last_snap_ts = now
-        return snap
 
     # ------------------------------------------------------------------
     # Per-round prediction log writer (for offline merge w/ client JSON)

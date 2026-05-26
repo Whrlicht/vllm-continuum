@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="4"
-DECODE_GPUS="5"
+PREFILL_GPUS="6"
+DECODE_GPUS="7"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -32,6 +32,59 @@ DECODE_GPU_MEMORY_UTILIZATION=0.95
 # DistServe-style direct block migration mode.
 # Decode actively pops bridge metadata and migrates blocks from prefill.
 KV_SEND_TYPE="BLOCK_MIGRATE"
+# LICHT cross-round KV reuse: when set to a host-shared dir (e.g.
+# /dev/shm/licht_round_kv for a RAM/"CPU" tier, or an SSD mount), decode
+# persists each finished round's full-sequence KV there and the next
+# round's prefill loads that prefix straight into GPU (skipping recompute).
+# Empty here = use the default below.  Under --licht-v3 it auto-enables
+# at /dev/shm/licht_round_kv unless --no-round-kv is given.  Override with
+# --round-kv-reuse-path PATH (also works without --licht-v3).
+ROUND_KV_REUSE_PATH=""
+ROUND_KV_DEFAULT_PATH="/dev/shm/licht_round_kv"
+NO_ROUND_KV=false
+# Layer-wise pipelined round-kv load: prefill loads layer i+1's reused
+# prefix while computing layer i (vs the default: read+scatter all layers
+# before the forward, blocking).  Off by default; enable with
+# --round-kv-pipeline (or env LICHT_ROUND_KV_PIPELINE=1).
+ROUND_KV_PIPELINE=false
+# Diagnostic profiling of the round-kv load (contention probe + per-segment
+# pin_copy/h2d/index timing).  Adds cuda syncs => slower; use only to find
+# the bottleneck, then turn off.  Enable with --round-kv-profile.
+ROUND_KV_PROFILE=false
+# Background HBM headroom dual-probe (pure-H2D vs H2D+scatter, every ~30ms),
+# to see how much DMA/SM bandwidth is available DURING the real forward.
+# Diagnostic; adds a small constant load — turn off after.  Enable --hbm-probe.
+HBM_PROBE=false
+# Round-kv ASYNC load (default OFF): async parks requests for a variable
+# load-dependent time, which breaks the LICHT-V3 admit predictor.  Default is
+# SYNCHRONOUS (admit a batch -> load all their KV -> run together).  Pass
+# --round-kv-async to experiment with the non-blocking async load.
+ROUND_KV_ASYNC=false
+# Round-kv RAW storage (default ON): store KV as contiguous .bin chunks and
+# load via mmap + bulk H2D + GPU scatter (no safetensors, no strided read).
+# Kills the read bottleneck.  --no-round-kv-raw -> old safetensors path (A/B).
+ROUND_KV_RAW=true
+# Round-kv ARENA (default ON): resident shared PINNED arena (LMCache-style).
+# decode memcpys KV into a /dev/shm region that prefill cudaHostRegisters once,
+# so a load is a DIRECT H2D (~24GB/s) — no per-load file read / mmap->pinned
+# copy / page faults.  Supersedes RAW.  --no-round-kv-arena -> RAW .bin path.
+# --round-kv-arena-gb N sizes the arena (default 24; ring-evicts oldest when
+# full; prefill pays a one-time ~N/2 s cudaHostRegister at startup).
+ROUND_KV_ARENA=true
+ROUND_KV_ARENA_GB="256"
+# DIAGNOSTIC: drain the GPU before each round-kv load + time it, to tell
+# contention-with-prior-forward apart from op-inefficiency.  --round-kv-sync-first.
+ROUND_KV_SYNC_FIRST=false
+# Fused multi-layer scatter CUDA kernel: replace per-chunk nL index_puts with
+# ONE kernel launch (cuts CPU dispatch that starves the GPU in serving).
+# --round-kv-fused to enable (opt-in until serving-validated).
+ROUND_KV_FUSED=false
+# Bind each worker to its GPU's local NUMA node (numactl) so pinned buffers
+# and H2D transfers are node-local (~2x H2D on multi-socket boxes).  Defaults
+# ON under --licht-v3; disable with --no-numa-bind, or force on standalone
+# with --numa-bind.
+NUMA_BIND=false
+NO_NUMA_BIND=false
 REQUEST_COMPLETION_TIMEOUT_S=600
 GET_RETRY_TIMEOUT_S=60
 GET_RETRY_INTERVAL_S=0.005
@@ -80,6 +133,28 @@ Options:
   --proxy-api-port PORT        Proxy HTTP bind port (default: ${PROXY_API_PORT})
   --proxy-ip-for-workers IP    Worker-visible proxy IP (default: ${PROXY_IP_FOR_WORKERS})
   --kv-send-type MODE          KV transfer mode, GET enables pull (default: ${KV_SEND_TYPE})
+  --round-kv-reuse-path PATH   Host-shared dir for cross-round KV reuse
+                               (e.g. /dev/shm/licht_round_kv).  Under
+                               --licht-v3 this defaults to
+                               ${ROUND_KV_DEFAULT_PATH}
+  --no-round-kv                Disable cross-round KV reuse even under
+                               --licht-v3 (for A/B comparison)
+  --round-kv-pipeline          Layer-wise pipelined load: load layer i+1's
+                               reused prefix while computing layer i (instead
+                               of loading all layers before the forward).
+                               Off by default; env LICHT_ROUND_KV_PIPELINE=1.
+  --round-kv-profile           Diagnostic: log a contention probe + per-segment
+                               (pin_copy/h2d/index) timing for each round-kv
+                               load.  Adds cuda syncs (slower) — diagnostic
+                               only.  Look for 'round-kv PROFILE:' in the log.
+  --hbm-probe                  Diagnostic: background dual-probe measuring
+                               pure-H2D (DMA) vs H2D+scatter (SM) bandwidth
+                               available during the real forward.  Look for
+                               'round-kv HBM-PROBE:' in the log.  Turn off after.
+  --numa-bind                  Bind each worker to its GPU's local NUMA node
+                               (numactl) for faster pinned H2D.  Defaults ON
+                               under --licht-v3.
+  --no-numa-bind               Disable NUMA binding even under --licht-v3
   --request-completion-timeout SECONDS
                                Timeout before forcing request KV cleanup
                                (default: ${REQUEST_COMPLETION_TIMEOUT_S})
@@ -154,6 +229,59 @@ while [[ $# -gt 0 ]]; do
     --kv-send-type)
       KV_SEND_TYPE="$2"
       shift 2
+      ;;
+    --round-kv-reuse-path)
+      ROUND_KV_REUSE_PATH="$2"
+      shift 2
+      ;;
+    --no-round-kv)
+      NO_ROUND_KV=true
+      shift
+      ;;
+    --round-kv-pipeline)
+      ROUND_KV_PIPELINE=true
+      shift
+      ;;
+    --round-kv-profile)
+      ROUND_KV_PROFILE=true
+      shift
+      ;;
+    --hbm-probe)
+      HBM_PROBE=true
+      shift
+      ;;
+    --round-kv-async)
+      ROUND_KV_ASYNC=true
+      shift
+      ;;
+    --no-round-kv-raw)
+      ROUND_KV_RAW=false
+      shift
+      ;;
+    --no-round-kv-arena)
+      ROUND_KV_ARENA=false
+      shift
+      ;;
+    --round-kv-arena-gb)
+      ROUND_KV_ARENA_GB="$2"
+      shift 2
+      ;;
+    --round-kv-sync-first)
+      ROUND_KV_SYNC_FIRST=true
+      shift
+      ;;
+    --round-kv-fused)
+      ROUND_KV_FUSED=true
+      shift
+      ;;
+    --numa-bind)
+      NUMA_BIND=true
+      shift
+      ;;
+    --no-numa-bind)
+      NO_NUMA_BIND=true
+      NUMA_BIND=false
+      shift
       ;;
     --request-completion-timeout)
       REQUEST_COMPLETION_TIMEOUT_S="$2"
@@ -248,6 +376,48 @@ if [[ "${LICHT_V3}" == "true" ]]; then
     echo "      → tool-time prediction will use the constant fallback."
     echo "      Set a valid dir with --tool-predictor-dir, e.g. tool_call_time/runs/run_2902_v2"
   fi
+  # Cross-round KV reuse defaults ON under LICHT-V3 (decode persists each
+  # finished round's KV; next-round prefill loads the prefix instead of
+  # recomputing).  Disable with --no-round-kv; override dir with
+  # --round-kv-reuse-path.
+  if [[ "${NO_ROUND_KV}" != "true" && -z "${ROUND_KV_REUSE_PATH}" ]]; then
+    ROUND_KV_REUSE_PATH="${ROUND_KV_DEFAULT_PATH}"
+  fi
+  # NUMA binding also defaults ON under LICHT-V3 (faster pinned H2D for the
+  # round-kv load).  Disable with --no-numa-bind.
+  if [[ "${NO_NUMA_BIND}" != "true" ]]; then
+    NUMA_BIND=true
+  fi
+fi
+
+# Layer-wise pipelined round-kv load (opt-in; works with/without --licht-v3).
+# Exported into the workers' env; the store reads LICHT_ROUND_KV_PIPELINE.
+if [[ "${ROUND_KV_PIPELINE}" == "true" ]]; then
+  export LICHT_ROUND_KV_PIPELINE=1
+fi
+if [[ "${ROUND_KV_PROFILE}" == "true" ]]; then
+  export LICHT_ROUND_KV_PROFILE=1
+fi
+if [[ "${HBM_PROBE}" == "true" ]]; then
+  export LICHT_HBM_PROBE=1
+fi
+if [[ "${ROUND_KV_ASYNC}" == "true" ]]; then
+  export LICHT_ROUND_KV_ASYNC=1
+fi
+if [[ "${ROUND_KV_RAW}" != "true" ]]; then
+  export LICHT_ROUND_KV_RAW=0
+fi
+if [[ "${ROUND_KV_ARENA}" != "true" ]]; then
+  export LICHT_ROUND_KV_ARENA=0
+fi
+if [[ -n "${ROUND_KV_ARENA_GB}" ]]; then
+  export LICHT_ROUND_KV_ARENA_GB="${ROUND_KV_ARENA_GB}"
+fi
+if [[ "${ROUND_KV_SYNC_FIRST}" == "true" ]]; then
+  export LICHT_ROUND_KV_SYNC_FIRST=1
+fi
+if [[ "${ROUND_KV_FUSED}" == "true" ]]; then
+  export LICHT_ROUND_KV_FUSED=1
 fi
 
 if [[ ! -f "${PROXY_SCRIPT}" ]]; then
@@ -449,6 +619,24 @@ cleanup() {
   wait 2>/dev/null || true
 }
 
+# Echo a `numactl --cpunodebind=N --membind=N` prefix that binds a worker to
+# the NUMA node local to GPU $1 (derived from sysfs), or nothing if disabled /
+# unavailable / node unknown.  numactl needs no privileges.
+numa_wrap_for_gpu() {
+  local gpu="$1" busid node
+  [[ "${NUMA_BIND}" == "true" ]] || { echo ""; return; }
+  command -v numactl >/dev/null 2>&1 || { echo ""; return; }
+  busid="$(nvidia-smi -i "${gpu}" --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
+            | tr '[:upper:]' '[:lower:]' | sed 's/^0000//')"
+  [[ -n "${busid}" ]] || { echo ""; return; }
+  node="$(cat "/sys/bus/pci/devices/${busid}/numa_node" 2>/dev/null)"
+  if [[ "${node}" =~ ^[0-9]+$ ]] && (( node >= 0 )); then
+    echo "numactl --cpunodebind=${node} --membind=${node}"
+  else
+    echo ""
+  fi
+}
+
 wait_for_http_ready() {
   local port="$1"
   local timeout="$2"
@@ -487,6 +675,12 @@ echo "  MODEL_PATH=${MODEL_PATH}"
 echo "  PREFILL_GPUS=${PREFILL_GPUS}"
 echo "  DECODE_GPUS=${DECODE_GPUS}"
 echo "  KV_SEND_TYPE=${KV_SEND_TYPE}"
+echo "  ROUND_KV_REUSE_PATH=${ROUND_KV_REUSE_PATH:-(disabled)}"
+echo "  ROUND_KV_PIPELINE=${ROUND_KV_PIPELINE} (layer-wise load overlap)"
+echo "  ROUND_KV_PROFILE=${ROUND_KV_PROFILE} (diagnostic load timing)"
+echo "  HBM_PROBE=${HBM_PROBE} (diagnostic HBM headroom probe)"
+echo "  ROUND_KV_ASYNC=${ROUND_KV_ASYNC} (async load, engine non-blocking)"
+echo "  ROUND_KV_RAW=${ROUND_KV_RAW} (contiguous .bin, no strided read)"
 echo "  REQUEST_COMPLETION_TIMEOUT_S=${REQUEST_COMPLETION_TIMEOUT_S}"
 echo "  GET_RETRY_TIMEOUT_S=${GET_RETRY_TIMEOUT_S}"
 echo "  GET_RETRY_INTERVAL_S=${GET_RETRY_INTERVAL_S}"
@@ -511,6 +705,13 @@ trap cleanup INT TERM EXIT
 cd "${SCRIPT_DIR}"
 
 rm -rf "${SCRIPT_DIR}/continuum_exp"/prefill_* "${SCRIPT_DIR}/continuum_exp"/decode_* 2>/dev/null || true
+
+# Start each run with a clean cross-round KV store (avoid stale files from
+# a prior run lingering / filling the medium).
+if [[ -n "${ROUND_KV_REUSE_PATH}" ]]; then
+  rm -rf "${ROUND_KV_REUSE_PATH}" 2>/dev/null || true
+  mkdir -p "${ROUND_KV_REUSE_PATH}" 2>/dev/null || true
+fi
 
 mkdir -p "${SCRIPT_DIR}/continuum_exp"
 EXPECTED_TIMESTAMP_FILES=()
@@ -565,7 +766,9 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     "${prefill_output_dir}/monitoring_timestamps"
   )
 
-  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid vllm serve "${MODEL_PATH}" \
+  NUMA_WRAP="$(numa_wrap_for_gpu "${gpu_id}")"
+  [[ -n "${NUMA_WRAP}" ]] && echo "  prefill[$i]: numa-bind gpu ${gpu_id} via '${NUMA_WRAP}'"
+  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
     --host 0.0.0.0 \
     --port "${http_port}" \
@@ -577,7 +780,7 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     --gpu-memory-utilization "${PREFILL_GPU_MEMORY_UTILIZATION}" \
     "${PREFILL_EXTRA_ARGS[@]}" \
     --kv-transfer-config \
-    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\"}}" \
+    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
     > "prefill_prod_$((i + 1)).log" 2>&1 &
   PIDS+=("$!")
 done
@@ -623,7 +826,9 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
     "${decode_output_dir}/monitoring_timestamps"
   )
 
-  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid vllm serve "${MODEL_PATH}" \
+  NUMA_WRAP="$(numa_wrap_for_gpu "${gpu_id}")"
+  [[ -n "${NUMA_WRAP}" ]] && echo "  decode[$i]: numa-bind gpu ${gpu_id} via '${NUMA_WRAP}'"
+  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
     --host 0.0.0.0 \
     --port "${http_port}" \
@@ -636,7 +841,7 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
     "${DECODE_EXTRA_ARGS[@]}" \
     --enable-chunked-prefill \
     --kv-transfer-config \
-    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\"}}" \
+    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
     > "decode_prod_$((i + 1)).log" 2>&1 &
   PIDS+=("$!")
 done
