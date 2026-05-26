@@ -140,7 +140,7 @@ def parse_args() -> ClientConfig:
                         help="Task dispatch strategy")
     parser.add_argument("--concurrency",
                         type=int,
-                        default=32,
+                        default=64,
                         help="Used in fixed mode")
     parser.add_argument("--jps",
                         type=float,
@@ -772,6 +772,7 @@ async def chat_once(
     traj_id: str,
     instance_id: str,
     assistant_round_index: int,
+    is_last_step: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": cfg.model_name,
@@ -789,6 +790,12 @@ async def chat_once(
         payload["vllm_xargs"] = {
             "trace_replay_assistant_round": int(assistant_round_index),
             "job_id": job_id,
+            # Phase A: tell the server when this is the last round of a
+            # trajectory so the scheduler can evict the job's arena
+            # entry on finish.  Equivalent to "no role=tool follows this
+            # assistant" in the trace (rounds is exactly the list of
+            # role=assistant turns extracted from messages).
+            "is_last_step": bool(is_last_step),
         }
 
     url = f"{cfg.base_url}/chat/completions"
@@ -873,6 +880,7 @@ async def run_single_trajectory(
                     sample.traj_id,
                     sample.instance_id,
                     round_spec.assistant_round_index,
+                    is_last_step=(i == len(rounds) - 1),
                 )
                 output_text = extract_output_text(raw_response)
                 route_meta = raw_response.get("_disagg_route")

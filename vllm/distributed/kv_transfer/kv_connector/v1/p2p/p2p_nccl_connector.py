@@ -86,6 +86,24 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         # LICHT round-kv cross-round reuse (empty unless enabled).
         self.round_load: list[RoundReqMeta] = []
         self.round_store: list[RoundReqMeta] = []
+        # Phase 1 (save-on-preempt): per-step preempt-victim saves the
+        # worker must execute synchronously in start_load_kv (the gather
+        # must complete before forward overwrites the victim's slots).
+        # Empty unless LICHT_PHASE1_SAVE_ON_PREEMPT=1.
+        self.preempt_store: list[RoundReqMeta] = []
+        # Phase 2 (PD path selector): per-step arena-sink requests the
+        # decode worker fires as ARENA_SINK RPCs to prefill.  Each
+        # entry = (request_id, job_id, prompt_token_ids,
+        # remote_prefill_address).  Prefill side D2H's the KV and
+        # releases its GPU blocks; decode side admits via arena-load
+        # next pass.  Empty unless LICHT_PHASE2_ADMISSION_GATE=1.
+        self.arena_sink: list[tuple] = []
+        # Phase A: job_ids whose trace has finished (is_last_step on a
+        # request just completed).  Worker iterates and calls
+        # _round_store_obj.mark_finished so its in-memory eviction
+        # bookkeeping updates.  Schedule-only drain — broadcast every
+        # step; usually empty.
+        self.finished_jobs: list[str] = []
 
     def add_request(
         self,
@@ -164,13 +182,80 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     self._round_kv_path, self._block_size)
                 logger.info(
                     "LICHT round-kv reuse enabled (role=%s, is_producer=%s, "
-                    "path=%s)", role, self.is_producer, self._round_kv_path)
+                    "path=%s) | Phase1_save_on_preempt=%s | "
+                    "Phase2_admission_gate=%s threshold=%.2f",
+                    role, self.is_producer, self._round_kv_path,
+                    _os.environ.get(
+                        "LICHT_PHASE1_SAVE_ON_PREEMPT", "0") == "1",
+                    _os.environ.get(
+                        "LICHT_PHASE2_ADMISSION_GATE", "0") == "1",
+                    float(_os.environ.get(
+                        "LICHT_PHASE2_GATE_THRESHOLD", "0.80")))
             except Exception as e:
                 logger.warning("LICHT round-kv init failed: %s; disabling.", e)
                 self._round_kv_enabled = False
         # Scheduler-side bookkeeping: producer prefix-load / decode store.
         self._round_load_reqs: dict[str, tuple] = {}
         self._pending_round_store: dict[str, tuple] = {}
+        # ---- Phase 1: save-on-preempt (decode side) ----
+        # When scheduler preempts a running decode request, instead of
+        # discarding its KV (recompute path), we synchronously D2H-save
+        # the increment to arena.  On re-admit, the consumer's
+        # get_num_new_matched_tokens looks the request up in arena and
+        # loads from there (skipping the catastrophic re-prefill of the
+        # entire accumulated context).  request_id -> job_id of saved.
+        self._phase1_save_on_preempt = (
+            _os.environ.get("LICHT_PHASE1_SAVE_ON_PREEMPT", "0") == "1")
+        # Scheduler-side: req_id -> job_id of requests whose KV was
+        # handed off to the connector for save-on-preempt.  Consumes by
+        # the consumer recovery path (get_num_new_matched_tokens /
+        # update_state_after_alloc) to route to arena instead of NCCL.
+        self._preempt_saved: dict[str, str] = {}
+        # Scheduler-side: drained by build_connector_meta into
+        # meta.preempt_store so the worker can do the actual save.
+        # req_id -> (job_id, block_ids, all_token_ids).
+        self._pending_preempt_store: dict[str, tuple] = {}
+
+        # ---- Phase A: trace-finished job IDs to evict on the worker
+        # ---- (mark_finished_job is called by the scheduler from
+        # ---- _free_request when request.is_last_step is True).
+        # Drained by build_connector_meta into meta.finished_jobs.  The
+        # worker iterates this list at the top of start_load_kv and
+        # calls _round_store_obj.mark_finished so its in-memory
+        # _finished_jobs + reverse index update (the scheduler-side
+        # instance only handles manifest deletion).
+        self._pending_finish_jobs: set[str] = set()
+
+        # ---- Phase 2: PD admission path selector (80% by default) ----
+        # When the projected decode KV occupancy after admitting this
+        # request (FCFS view: current occupancy already reflects the
+        # admit decisions earlier in this same scheduler pass) would
+        # cross the threshold, route the PD handoff through the CPU
+        # arena instead of NCCL GPU-GPU.  Prefill side D2H'es to arena
+        # and releases its GPU blocks; decode side loads from arena
+        # when it eventually gets admitted.  Both paths self-release
+        # symmetrically (NCCL: RELEASE RPC; arena: D2H done -> mark).
+        self._phase2_admission_gate = (
+            _os.environ.get("LICHT_PHASE2_ADMISSION_GATE", "0") == "1")
+        try:
+            self._phase2_gate_threshold = float(
+                _os.environ.get("LICHT_PHASE2_GATE_THRESHOLD", "0.80"))
+        except ValueError:
+            self._phase2_gate_threshold = 0.80
+        self._admission_kv_usage: float = 0.0
+        self._admission_kv_total_blocks: int = 0
+        # Scheduler-side: req_ids the connector has decided to route
+        # through arena this pass — drained by build_connector_meta
+        # into meta.arena_sink so the worker can fire the ARENA_SINK
+        # RPC to prefill.  Tuple = (job_id, prompt_token_ids,
+        # remote_prefill_address).
+        self._pending_arena_sink: dict[str, tuple] = {}
+        # Scheduler-side: req_ids already routed to arena (RPC sent
+        # this step OR earlier).  Cleared when the request is
+        # admitted from arena (in update_state_after_alloc).  Until
+        # then, every get_num_new_matched_tokens attempt for this
+        # req checks arena instead of falling into NCCL.
+        self._arena_sinked: set[str] = set()
         # Worker-side store-completion is tracked inside RoundKVStore
         # (drain_done) now that the write is async; get_finished reads it.
 
@@ -192,6 +277,31 @@ class P2pNcclConnector(KVConnectorBase_V1):
             hostname=_bind_host,
             port_offset=self._rank,
         ) if role == KVConnectorRole.WORKER else None
+
+        # Phase 2: producer-side worker wires ARENA_SINK plumbing so
+        # the engine's router thread can call back into the connector
+        # to do D2H and the round-kv-store can call back when D2H is
+        # done.  Consumer worker / scheduler don't need these hooks
+        # (they only SEND ARENA_SINK; receiving + handling is producer).
+        # Worker-side _arena_sink_pending tracks req_ids waiting for
+        # D2H completion so we know which _done events to forward
+        # onto the producer's fast-release queue.
+        self._arena_sink_pending: set[str] = set()
+        self._arena_sink_decode_addr: dict[str, str] = {}
+        if (role == KVConnectorRole.WORKER
+                and self.p2p_nccl_engine is not None
+                and self.is_producer):
+            try:
+                self.p2p_nccl_engine.set_arena_sink_handler(
+                    self._handle_arena_sink_rpc)
+            except AttributeError:
+                pass
+            if self._round_store_obj is not None:
+                try:
+                    self._round_store_obj.set_done_hook(
+                        self._on_round_store_done)
+                except AttributeError:
+                    pass
 
     # ==============================
     # Worker-side methods
@@ -224,6 +334,20 @@ class P2pNcclConnector(KVConnectorBase_V1):
         assert isinstance(metadata, P2pNcclConnectorMetadata)
 
         # 回传 REMOVED (2026-05-21): no v3 offload/pushback bg work here.
+
+        # Phase A: process finished-job notifications from scheduler.
+        # Both producer and consumer workers do this so each side's
+        # _round_store_obj updates its in-memory _finished_jobs (the
+        # scheduler-side handles manifest deletion).  Idempotent +
+        # cheap (set membership + bg-thread delete).
+        if (self._round_kv_enabled and self._round_store_obj is not None
+                and metadata.finished_jobs):
+            for _jid in metadata.finished_jobs:
+                try:
+                    self._round_store_obj.mark_finished(_jid)
+                except Exception as e:  # pragma: no cover
+                    logger.debug(
+                        "worker mark_finished failed job=%s: %s", _jid, e)
 
         if self.direct_block_mode:
             if self.is_producer:
@@ -263,6 +387,81 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     [int(x) for x in req.block_ids.tolist()],
                 ) for req in metadata.requests)
                 return
+
+            # Phase 1 (save-on-preempt) SAVE side: scheduler preempted
+            # one or more victims this step and asked us to persist their
+            # KV to arena.  Run synchronously here so the gather reads
+            # the slots BEFORE the new tenant's forward (this same step)
+            # overwrites them.  Per-victim wait is bounded by
+            # save_preempted_sync's timeout.
+            if (self._phase1_save_on_preempt
+                    and self._round_kv_enabled and metadata.preempt_store
+                    and self._round_store_obj is not None):
+                for ps in metadata.preempt_store:
+                    try:
+                        ok = self._round_store_obj.save_preempted_sync(
+                            ps.job_id, list(ps.block_ids),
+                            list(ps.token_ids), ps.request_id)
+                        if not ok:
+                            logger.warning(
+                                "Phase1 preempt-save timed out req=%s "
+                                "job=%s nblk=%d (recompute fallback)",
+                                ps.request_id, ps.job_id, len(ps.block_ids))
+                    except Exception as e:  # pragma: no cover
+                        logger.warning(
+                            "Phase1 preempt-save failed req=%s: %s",
+                            ps.request_id, e)
+
+            # Phase 2 (PD path selector) ARENA_SINK fires: tell each
+            # prefill side to D2H its KV for this request and release
+            # its prefill GPU blocks.  Fire-and-(near-)forget — the
+            # RPC just enqueues the D2H on the prefill side.  Decode
+            # admits this request from arena in a later pass via
+            # get_num_new_matched_tokens (which waits for arena
+            # lookup to succeed).
+            if (self._phase2_admission_gate and metadata.arena_sink
+                    and self.p2p_nccl_engine is not None):
+                for (req_id, job_id, prompt_tids, remote_addr) in \
+                        metadata.arena_sink:
+                    if not remote_addr:
+                        logger.warning(
+                            "ARENA_SINK skip req=%s: no remote addr",
+                            req_id)
+                        continue
+                    try:
+                        ok = self.p2p_nccl_engine.send_arena_sink_request(
+                            req_id, job_id, prompt_tids, remote_addr)
+                        if ok:
+                            logger.info(
+                                "ARENA_SINK sent req=%s job=%s "
+                                "remote=%s ntoks=%d",
+                                req_id, job_id, remote_addr,
+                                len(prompt_tids))
+                        else:
+                            logger.warning(
+                                "ARENA_SINK declined req=%s remote=%s "
+                                "(prefill miss / no handler)",
+                                req_id, remote_addr)
+                    except Exception as e:  # pragma: no cover
+                        logger.warning(
+                            "ARENA_SINK send failed req=%s remote=%s: %s",
+                            req_id, remote_addr, e)
+
+            # Phase 1 (save-on-preempt) consumer recovery: arena → GPU
+            # paged buffer for re-admitted preempt-saved requests.  Done
+            # BEFORE the NCCL pull loop so attention sees the prefix on
+            # this step.  Sync load (small per-request increment).
+            if (self._phase1_save_on_preempt
+                    and self._round_kv_enabled and metadata.round_load
+                    and self._round_store_obj is not None):
+                _items = [(rl.job_id, rl.block_ids, rl.src_block_offset)
+                          for rl in metadata.round_load]
+                try:
+                    self._round_store_obj.load_batch(_items)
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "Phase1 arena consumer load_batch failed: %s "
+                        "(falling through to recompute path)", e)
 
             # LICHT round-kv: decode STOREs finished requests' full-seq KV
             # from their delay-free-retained blocks.  Completions are
@@ -545,6 +744,100 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 return
             self.p2p_nccl_engine.wait_for_sent()
 
+    def _handle_arena_sink_rpc(self, request_id: str, job_id: str,
+                               prompt_token_ids: list,
+                               decode_zmq_address: str) -> bool:
+        """Phase 2: producer-side router-thread callback for the
+        ARENA_SINK RPC.  Pulls the request's block_ids out of
+        bridge_queue (set by stage_bridge_request earlier), kicks off
+        the async D2H to the round-kv arena, and remembers the
+        request so the _round_store_obj done-hook can fast-release it
+        once D2H finishes.  Runs in the engine's router thread —
+        must not block."""
+        if not self.is_producer:
+            return False
+        if not (self._round_kv_enabled
+                and self._round_store_obj is not None):
+            return False
+        engine = self.p2p_nccl_engine
+        if engine is None:
+            return False
+        with engine.state_lock:
+            block_ids = engine.bridge_queue.pop(request_id, None)
+        if not block_ids:
+            # Bridge metadata wasn't staged for this req on us — race
+            # (RELEASE already happened) or wrong target.  Tell the
+            # decode side to fall back.
+            logger.warning(
+                "ARENA_SINK miss in bridge_queue req=%s (already "
+                "released or wrong target)", request_id)
+            return False
+        try:
+            self._arena_sink_pending.add(request_id)
+            self._arena_sink_decode_addr[request_id] = decode_zmq_address
+            self._round_store_obj.enqueue_store(
+                str(job_id), list(block_ids),
+                list(prompt_token_ids), request_id)
+            logger.info(
+                "ARENA_SINK enqueued req=%s job=%s nblk=%d decode=%s",
+                request_id, job_id, len(block_ids), decode_zmq_address)
+            return True
+        except Exception as e:  # pragma: no cover
+            logger.warning(
+                "ARENA_SINK enqueue_store failed req=%s: %s",
+                request_id, e)
+            self._arena_sink_pending.discard(request_id)
+            self._arena_sink_decode_addr.pop(request_id, None)
+            return False
+
+    def _on_round_store_done(self, request_id: str) -> None:
+        """Phase 2: round-kv-store done-hook.  When an ARENA_SINK
+        request's D2H finishes, mark its prefill GPU blocks for
+        release via the producer fast-release queue (mirrors the
+        RELEASE-RPC path at p2p_nccl_engine.py:984-1000).  Runs in
+        the store-pool thread — must be cheap and exception-safe.
+
+        Must also set `release_received_ts` on the engine's
+        `_delay_free_ts[req_id]` ledger: the engine's RELEASE-timeout
+        detector (engine.py:1248-1280) reads that field to decide
+        whether to clear `pending_release_deadlines`.  Without it
+        every ARENA_SINK req trips the 600s timeout warning + an
+        unnecessary force-free (functionally a no-op since the
+        blocks are already released via fast-release-queue drain,
+        but ledger goes inconsistent and the WARNING is alarming)."""
+        if request_id not in self._arena_sink_pending:
+            return
+        self._arena_sink_pending.discard(request_id)
+        decode_addr = self._arena_sink_decode_addr.pop(request_id, "")
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.p2p.\
+p2p_nccl_engine import get_fast_release_queue
+            q = get_fast_release_queue()
+            if q is None:
+                return
+            now = time.time()
+            engine = self.p2p_nccl_engine
+            if engine is not None:
+                # Mirror RELEASE-RPC handler: set release_received_ts
+                # so pending_release_deadlines clears + push the
+                # ts_entry (NOT a fresh dict) onto the queue so the
+                # scheduler's drain sees the consistent record.
+                ts_entry = engine._delay_free_ts.setdefault(
+                    request_id, {})
+                ts_entry["release_received_ts"] = now
+                ts_entry["arena_sink_done_ts"] = now
+                q.put_nowait((request_id, ts_entry.copy()))
+            else:
+                q.put_nowait(
+                    (request_id, {"arena_sink_done_ts": now}))
+            logger.info(
+                "ARENA_SINK D2H done req=%s decode=%s -> "
+                "fast-release", request_id, decode_addr)
+        except Exception as e:  # pragma: no cover
+            logger.warning(
+                "ARENA_SINK done-hook fast-release failed req=%s: %s",
+                request_id, e)
+
     def get_finished(
             self, finished_req_ids: set[str],
             **kwargs) -> tuple[Optional[set[str]], Optional[set[str]]]:
@@ -610,6 +903,87 @@ class P2pNcclConnector(KVConnectorBase_V1):
     # Scheduler-side methods
     # ==============================
 
+    def mark_finished_job(self, job_id: str) -> None:
+        """Phase A: scheduler tells us a trajectory's last step has
+        finished — the job's KV history is no longer needed.  We:
+        (1) call our scheduler-side _round_store_obj.mark_finished
+            (deletes manifest on shared FS — also stops lookup() from
+            returning hits across all processes), and
+        (2) record the job_id so build_connector_meta can broadcast it
+            via meta.finished_jobs.  Each worker then updates its own
+            in-memory _finished_jobs + reverse index so _arena_alloc
+            no longer protects this job's head increment."""
+        if not job_id:
+            return
+        jid = str(job_id)
+        if self._round_store_obj is not None:
+            try:
+                self._round_store_obj.mark_finished(jid)
+            except Exception as e:  # pragma: no cover
+                logger.debug("mark_finished sched-side failed job=%s: %s",
+                             jid, e)
+        self._pending_finish_jobs.add(jid)
+        logger.info("PhaseA mark_finished_job job=%s (manifest deleted, "
+                    "broadcast to worker via meta.finished_jobs)", jid)
+
+    def set_admission_kv_usage(self, usage: float,
+                               num_total_blocks: int = 0) -> None:
+        """Phase 2: scheduler publishes (occupancy, total GPU blocks)
+        once per admission pass.  The path-selector in
+        get_num_new_matched_tokens uses them to project post-admit
+        occupancy (FCFS: each admit in this pass already shows up in
+        `usage` next time around).  No-op when the gate env is off.
+        Cheap: two assignments; safe to call every step.
+        """
+        try:
+            self._admission_kv_usage = float(usage)
+        except (TypeError, ValueError):
+            pass
+        try:
+            self._admission_kv_total_blocks = int(num_total_blocks)
+        except (TypeError, ValueError):
+            pass
+
+    def save_preempt(self, request: "Request", block_ids: list,
+                     all_token_ids: list) -> bool:
+        """Phase 1: register a preempted decode request's KV for an
+        arena save.  Called by the scheduler from the preempt path
+        BEFORE kv_cache_manager.free().  The actual gather + D2H runs
+        on the worker in start_load_kv THIS SAME STEP (synchronously,
+        so the gather finishes before forward writes the slots).
+
+        Returns True iff the save was scheduled (caller should remember
+        the request as "kv lives in arena").  False -> caller proceeds
+        with normal recompute path (no functional change vs current
+        behaviour, just no save attempted).
+
+        Process-boundary note: the connector's `_round_store_obj` is
+        only `bind_kv_caches`-ed on the worker process — the gather
+        cannot run here on the scheduler.  We only record state; the
+        worker drains `meta.preempt_store` in start_load_kv.
+        """
+        if not self._phase1_save_on_preempt:
+            return False
+        # Only decode side preempts (producer prefill doesn't run decode).
+        if self.is_producer:
+            return False
+        if not self._round_kv_enabled:
+            return False
+        job_id = getattr(request, "job_id", None)
+        if not job_id:
+            return False
+        try:
+            self._pending_preempt_store[request.request_id] = (
+                str(job_id), list(block_ids), list(all_token_ids))
+            self._preempt_saved[request.request_id] = str(job_id)
+        except Exception as e:  # pragma: no cover
+            logger.warning("Phase1 save_preempt record failed req=%s: %s",
+                           request.request_id, e)
+            return False
+        logger.info("Phase1 save_preempt enqueued req=%s job=%s nblk=%d",
+                    request.request_id, job_id, len(block_ids))
+        return True
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -646,6 +1020,104 @@ class P2pNcclConnector(KVConnectorBase_V1):
                             return ext, self._round_async
             return 0, False
 
+        # Phase 2 (PD path selector): if this request was previously
+        # routed through the arena (RPC fired in an earlier pass), the
+        # connector waits here for the prefill side to finish D2H
+        # writing.  Once arena has the data, lookup succeeds and the
+        # admit proceeds via the arena-load path (matches Phase 1
+        # preempt-recovery: scheduler → update_state_after_alloc →
+        # round_load → worker load_batch).  Miss = still defer.
+        if (self._phase2_admission_gate
+                and request.request_id in self._arena_sinked
+                and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            job_id = getattr(request, "job_id", None)
+            if job_id:
+                res = self._round_store_obj.lookup(
+                    str(job_id), request.prompt_token_ids)
+                if res is not None:
+                    matched_tokens, _ = res
+                    ext = matched_tokens - num_computed_tokens
+                    if ext > 0:
+                        return ext, False
+            # Arena not ready yet (D2H still in flight) -> defer.
+            return None, False
+
+        # Phase 2 (PD path selector): first time we see this request
+        # in admission.  Project post-admit occupancy.  > threshold
+        # -> route through arena (mark, fire RPC via meta, defer);
+        # ≤ threshold -> NCCL direct (current behaviour).
+        if (self._phase2_admission_gate
+                and request.request_id not in self._preempt_saved
+                and self._admission_kv_total_blocks > 0):
+            try:
+                _need_tokens = max(
+                    0, len(request.prompt_token_ids) - num_computed_tokens)
+                _need_blocks = (_need_tokens + self._block_size - 1) \
+                    // self._block_size
+                _predicted = (self._admission_kv_usage
+                              + _need_blocks
+                              / float(self._admission_kv_total_blocks))
+            except Exception:
+                _predicted = self._admission_kv_usage
+            if _predicted > self._phase2_gate_threshold:
+                # Route to arena.  Need a remote_prefill_address for
+                # the RPC; fall back to parse_request_id (the existing
+                # convention).
+                _remote = None
+                _kvp = getattr(request, "kv_transfer_params", None)
+                if isinstance(_kvp, dict):
+                    _remote = _kvp.get("prefill_zmq_address")
+                if _remote is None:
+                    try:
+                        _ip, _port = self.parse_request_id(
+                            request.request_id, is_prefill=False)
+                        _remote = f"{_ip}:{_port}"
+                    except Exception:
+                        _remote = None
+                _job = getattr(request, "job_id", None) or ""
+                self._pending_arena_sink[request.request_id] = (
+                    str(_job), list(request.prompt_token_ids),
+                    _remote or "")
+                self._arena_sinked.add(request.request_id)
+                logger.info(
+                    "Phase2 sink->arena req=%s usage=%.3f pred=%.3f "
+                    "thr=%.2f need_blk=%d remote=%s",
+                    request.request_id, self._admission_kv_usage,
+                    _predicted, self._phase2_gate_threshold,
+                    _need_blocks, _remote or "<none>")
+                return None, False
+            # else: fall through to current NCCL path below
+
+        # Phase 1 (save-on-preempt): if this request was preempt-saved on
+        # this decode instance, its KV lives in the arena — recover from
+        # arena instead of trying to NCCL-pull from producer (which has
+        # long since freed its KV).  Lookup uses prompt + already-
+        # generated outputs since save_preempt persisted that full prefix.
+        if (self._phase1_save_on_preempt
+                and request.request_id in self._preempt_saved
+                and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            job_id = self._preempt_saved.get(request.request_id)
+            try:
+                all_tids = list(request.prompt_token_ids) + list(
+                    request.output_token_ids)
+            except AttributeError:
+                all_tids = list(request.prompt_token_ids)
+            if job_id:
+                res = self._round_store_obj.lookup(str(job_id), all_tids)
+                if res is not None:
+                    matched_tokens, _ = res
+                    ext = matched_tokens - num_computed_tokens
+                    if ext > 0:
+                        # Sync arena load on resume (small increment;
+                        # avoids parking in WAITING_FOR_REMOTE_KVS).
+                        return ext, False
+            # Arena lookup failed → fall through to the normal NCCL path
+            # (which will return 0 since producer no longer has the KV,
+            # leading to recompute — same as today's behaviour).
+            self._preempt_saved.pop(request.request_id, None)
+
         num_external_tokens = (len(request.prompt_token_ids) - 1 -
                                num_computed_tokens)
 
@@ -664,6 +1136,79 @@ class P2pNcclConnector(KVConnectorBase_V1):
         Update KVConnector state after block allocation.
         """
         if not self.is_producer and num_external_tokens > 0:
+            # Phase 2 (PD path selector) consumer recovery: this request
+            # was previously routed through arena (RPC fired earlier).
+            # get_num_new_matched_tokens just confirmed arena has data
+            # (otherwise it would have returned None to defer).  Route
+            # to round-load like the prefix-reuse / preempt-recovery
+            # paths instead of NCCL pull.
+            if (self._phase2_admission_gate
+                    and request.request_id in self._arena_sinked
+                    and self._round_kv_enabled
+                    and self._round_store_obj is not None):
+                job_id = getattr(request, "job_id", None)
+                all_tids = list(request.prompt_token_ids)
+                if job_id:
+                    res = self._round_store_obj.lookup(
+                        str(job_id), all_tids)
+                    if res is not None:
+                        _matched, matched_blocks = res
+                        num_blocks = num_external_tokens // self._block_size
+                        local_hit_blocks = matched_blocks - num_blocks
+                        block_ids0 = blocks.get_block_ids()[0]
+                        if (num_blocks > 0 and local_hit_blocks >= 0
+                                and len(block_ids0)
+                                >= local_hit_blocks + num_blocks):
+                            dst = list(block_ids0)[
+                                local_hit_blocks:
+                                local_hit_blocks + num_blocks]
+                            self._round_load_reqs[
+                                request.request_id] = (
+                                    str(job_id), dst, local_hit_blocks)
+                            self._arena_sinked.discard(
+                                request.request_id)
+                            return
+                # Lookup raced / failed -> fall through; drop the
+                # marker so a retry doesn't get stuck in the arena
+                # branch forever.
+                self._arena_sinked.discard(request.request_id)
+            # Phase 1 (save-on-preempt) consumer recovery: if this request
+            # was preempt-saved, route to the arena-load path (matches the
+            # producer's prefix-reuse flow) instead of the NCCL pull queue.
+            if (self._phase1_save_on_preempt
+                    and request.request_id in self._preempt_saved
+                    and self._round_kv_enabled
+                    and self._round_store_obj is not None):
+                job_id = self._preempt_saved.get(request.request_id)
+                try:
+                    all_tids = list(request.prompt_token_ids) + list(
+                        request.output_token_ids)
+                except AttributeError:
+                    all_tids = list(request.prompt_token_ids)
+                if job_id:
+                    res = self._round_store_obj.lookup(
+                        str(job_id), all_tids)
+                    if res is not None:
+                        _matched, matched_blocks = res
+                        num_blocks = num_external_tokens // self._block_size
+                        local_hit_blocks = matched_blocks - num_blocks
+                        block_ids0 = blocks.get_block_ids()[0]
+                        if (num_blocks > 0 and local_hit_blocks >= 0
+                                and len(block_ids0)
+                                >= local_hit_blocks + num_blocks):
+                            dst = list(block_ids0)[
+                                local_hit_blocks:
+                                local_hit_blocks + num_blocks]
+                            self._round_load_reqs[
+                                request.request_id] = (
+                                    str(job_id), dst, local_hit_blocks)
+                            # One-shot: arena → GPU, drop the marker.
+                            self._preempt_saved.pop(
+                                request.request_id, None)
+                            return
+                # Arena recovery failed → fall through to NCCL path
+                # (which will see 0 tokens on producer = recompute).
+                self._preempt_saved.pop(request.request_id, None)
             self._requests_need_load[request.request_id] = (
                 request, blocks.get_block_ids()[0])
             return
@@ -732,6 +1277,37 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     block_ids=list(block_ids0), token_ids=list(token_ids),
                     num_blocks=0))
             self._pending_round_store.clear()
+            # Phase 1 (save-on-preempt): drain pending preempt-victim
+            # saves so the worker can run them in start_load_kv this
+            # same step (before the new tenant overwrites the slots).
+            if self._phase1_save_on_preempt and self._pending_preempt_store:
+                for req_id, (job_id, block_ids0, token_ids) in \
+                        self._pending_preempt_store.items():
+                    meta.preempt_store.append(RoundReqMeta(
+                        request_id=req_id, job_id=job_id,
+                        block_ids=list(block_ids0),
+                        token_ids=list(token_ids),
+                        num_blocks=0))
+                self._pending_preempt_store.clear()
+
+        # Phase 2 (PD path selector): drain arena-sink RPCs so the
+        # decode worker fires them in start_load_kv to the producer
+        # (prefill) side via ZMQ.  Drained role-independent so both
+        # sides see consistent meta (only consumer worker actually
+        # acts).
+        if self._phase2_admission_gate and self._pending_arena_sink:
+            for req_id, (job_id, prompt_tids, remote_addr) in \
+                    self._pending_arena_sink.items():
+                meta.arena_sink.append(
+                    (req_id, job_id, list(prompt_tids), remote_addr))
+            self._pending_arena_sink.clear()
+
+        # Phase A: drain trace-finished job IDs.  Both producer and
+        # consumer worker process these (each updates its own
+        # _round_store_obj instance); drain is role-independent.
+        if self._pending_finish_jobs:
+            meta.finished_jobs.extend(self._pending_finish_jobs)
+            self._pending_finish_jobs.clear()
 
         if not self.is_producer and self.direct_block_mode:
             for req_id, (request, local_block_ids) in \

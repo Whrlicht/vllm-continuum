@@ -1301,6 +1301,34 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
 
+                    # Phase 1 (save-on-preempt): hand the victim's KV to
+                    # the connector for synchronous D2H into the round-kv
+                    # arena BEFORE we free its blocks.  The connector's
+                    # consumer recovery path will read from arena on the
+                    # next admission, avoiding the recompute-thrash that
+                    # crashes long-decode requests.  Gated behind the
+                    # LICHT_PHASE1_SAVE_ON_PREEMPT env (no-op if off).
+                    # Skipped for is_unpin (request stays running) and
+                    # for self-preempt with nothing computed.
+                    if (not is_unpin
+                            and self.connector is not None
+                            and getattr(self.connector,
+                                        "_phase1_save_on_preempt", False)
+                            and preempted_req.num_computed_tokens > 0):
+                        try:
+                            (_pbids, ) = self.kv_cache_manager.get_block_ids(
+                                preempted_req.request_id)
+                            _ptoks = (
+                                list(preempted_req.prompt_token_ids)
+                                + list(getattr(preempted_req,
+                                               "output_token_ids", []) or []))
+                            self.connector.save_preempt(
+                                preempted_req, _pbids, _ptoks)
+                        except Exception as _e:
+                            logger.warning(
+                                "Phase1 save_preempt hook failed req=%s: %s",
+                                preempted_req.request_id, _e)
+
                     with self._kv_free_lock:
                         self.kv_cache_manager.free(preempted_req)
                     self.encoder_cache_manager.free(preempted_req)
@@ -1395,6 +1423,21 @@ class Scheduler(SchedulerInterface):
         # TODO (Hanchen) need to add scheduling logic for returns from functions. It should not be FCFS
         if not preempted_reqs:
             self._ensure_licht_waiting_start_timestamps()
+            # Phase 2: publish (usage, total_blocks) so the connector's
+            # path-selector can project post-admit occupancy without an
+            # extra cross-module dep.  Sampled once per pass — the
+            # projection in get_num_new_matched_tokens does per-req
+            # incremental math on top.  No-op if the connector or the
+            # gate env is off.
+            if self.connector is not None:
+                try:
+                    self.connector.set_admission_kv_usage(
+                        self.kv_cache_manager.usage,
+                        self.kv_cache_manager.block_pool.num_gpu_blocks)
+                except AttributeError:
+                    # Older connector implementations lack the method;
+                    # silently skip (gate stays at 0.0 = disabled).
+                    pass
             # LICHTV2: timeline was already built before the running
             # loop.  Each successful admit below applies its events to
             # the same timeline so subsequent candidates see the impact
@@ -1481,6 +1524,21 @@ class Scheduler(SchedulerInterface):
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
                                            num_external_computed_tokens)
+                    # vLLM v1 corner case: GPU prefix cache + external
+                    # connector together claim the ENTIRE prompt is
+                    # already computed (num_computed_tokens ==
+                    # num_tokens).  Leaves 0 tokens to forward and
+                    # trips `assert num_new_tokens > 0` below, killing
+                    # EngineCore.  Mirror the protection at
+                    # _update_waiting_for_remote_kv L2955-2956: reserve
+                    # at least 1 token for the forward.  Only applies
+                    # to the sync path; load_kv_async sets num_new=0
+                    # below regardless and the async path's
+                    # _update_waiting_for_remote_kv has its own guard.
+                    if (not load_kv_async
+                            and num_computed_tokens >= request.num_tokens
+                            and request.num_tokens > 0):
+                        num_computed_tokens = request.num_tokens - 1
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
                 else:
@@ -2691,6 +2749,21 @@ class Scheduler(SchedulerInterface):
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        # Phase A: if this is the trajectory's last step (client set
+        # is_last_step=True in vllm_xargs), tell the connector to
+        # evict the job's arena entries — manifest deletion runs
+        # immediately; worker-side in-memory bookkeeping updates next
+        # step via meta.finished_jobs.
+        if (getattr(request, "is_last_step", None) is True
+                and self.connector is not None
+                and getattr(request, "job_id", None)):
+            try:
+                self.connector.mark_finished_job(str(request.job_id))
+            except AttributeError:
+                pass  # older connectors don't have it
+            except Exception as e:  # pragma: no cover
+                logger.debug("mark_finished_job hook failed req=%s: %s",
+                             request.request_id, e)
         # NOTE (Hanchen) we do not care about encoder here, ignore
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

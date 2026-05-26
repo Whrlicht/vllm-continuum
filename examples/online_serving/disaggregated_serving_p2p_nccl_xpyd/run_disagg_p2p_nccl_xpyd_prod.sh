@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="6"
-DECODE_GPUS="7"
+PREFILL_GPUS="4"
+DECODE_GPUS="5"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -404,6 +404,19 @@ fi
 if [[ "${ROUND_KV_ASYNC}" == "true" ]]; then
   export LICHT_ROUND_KV_ASYNC=1
 fi
+# Phase 1 (save-on-preempt): when scheduler preempts a running decode
+# req, save its KV increment to arena before freeing; on re-admit it
+# reloads from arena instead of doing a full recompute of prompt+outputs.
+export LICHT_PHASE1_SAVE_ON_PREEMPT=1
+# Phase 2 (PD path selector): at PD-handoff admission, if projected
+# decode KV occupancy after admitting this req would exceed the
+# threshold, route the handoff via CPU arena (ARENA_SINK RPC) instead
+# of NCCL GPU->GPU.  Prefill D2H's the KV and releases its GPU blocks
+# immediately; decode loads from arena once it has space.  Solves the
+# RELEASE-timeout/force-free pathology (prefill GPU blocked when decode
+# is full).  Default threshold 0.80.
+export LICHT_PHASE2_ADMISSION_GATE=1
+# export LICHT_PHASE2_GATE_THRESHOLD=0.80
 if [[ "${ROUND_KV_RAW}" != "true" ]]; then
   export LICHT_ROUND_KV_RAW=0
 fi

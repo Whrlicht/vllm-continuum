@@ -371,6 +371,36 @@ class P2pNcclEngine:
                 return None
             time.sleep(self.get_retry_interval_s)
 
+    def set_arena_sink_handler(self, handler) -> None:
+        """Phase 2: producer-side hook for ARENA_SINK RPCs.  The
+        connector registers a handler that knows about
+        _round_store_obj, bridge_queue and fast-release queue.
+        Handler signature:
+            handler(req_id: str, job_id: str, prompt_token_ids: list[int],
+                    decode_zmq_address: str) -> bool
+        Returns True iff the sink was scheduled (D2H enqueued).
+        Runs in the router thread; must not block."""
+        self._arena_sink_handler = handler
+
+    def send_arena_sink_request(self, request_id: str, job_id: str,
+                                prompt_token_ids: list,
+                                remote_address: str) -> bool:
+        """Phase 2: decode side fires this to ask the prefill side to
+        D2H this request's KV into arena (and release its prefill GPU
+        blocks).  The decode side does NOT need a sync ack: the prefill
+        D2H is async and decode will admit from arena once arena lookup
+        succeeds.  Non-blocking from decode's perspective."""
+        if not self.direct_block_mode:
+            return False
+        payload = self._rpc(remote_address, {
+            "cmd": "ARENA_SINK",
+            "request_id": request_id,
+            "job_id": str(job_id),
+            "token_ids": list(prompt_token_ids),
+            "decode_zmq_address": self.zmq_address,
+        })
+        return payload.get("ret") == 0
+
     def launch_block_migration(self, request_id: str,
                                context_block_ids: list[int],
                                decoding_block_ids: list[int],
@@ -921,6 +951,34 @@ class P2pNcclEngine:
                     }
                 self.router_socket.send_multipart(
                     [remote_address, msgpack.dumps(payload)])
+            elif data["cmd"] == "ARENA_SINK":
+                # Phase 2: decode side asks us to D2H this request's KV
+                # to the round-kv arena and release our prefill GPU
+                # blocks (instead of waiting for an NCCL pull that
+                # won't fit on a near-full decode GPU).
+                request_id = data["request_id"]
+                job_id = data.get("job_id", "")
+                token_ids = data.get("token_ids", [])
+                decode_zmq = data.get("decode_zmq_address", "")
+                handler = getattr(self, "_arena_sink_handler", None)
+                ok = False
+                if handler is not None:
+                    try:
+                        ok = bool(handler(
+                            request_id, str(job_id),
+                            list(token_ids), decode_zmq))
+                    except Exception as e:  # pragma: no cover
+                        logger.warning(
+                            "ARENA_SINK handler failed req=%s: %s",
+                            request_id, e)
+                        ok = False
+                # Always ack so decode doesn't hang on _rpc.  ret=0
+                # means D2H was scheduled; ret=1 means we couldn't
+                # (handler missing / lookup miss in bridge_queue) —
+                # decode side falls back to NCCL path next attempt.
+                self.router_socket.send_multipart([
+                    remote_address,
+                    msgpack.dumps({"ret": 0 if ok else 1})])
             elif data["cmd"] == "RELEASE":
                 request_id = data["request_id"]
                 release_received_ts = time.time()

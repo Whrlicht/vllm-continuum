@@ -208,6 +208,21 @@ class RoundKVStore:
         self._load_done_lock = threading.Lock()
         self._async_load_started = False
 
+        # ---- Phase 1: save-on-preempt sync infrastructure ----
+        # When a decode request is preempted, the scheduler asks us to save
+        # its KV increment to arena and waits for completion (so blocks are
+        # safe to free).  We reuse the existing async store pool (enqueue
+        # + bg gather + write_inc) but expose a sync wait API via a per-
+        # request threading.Event signalled in _mark_done.
+        self._preempt_lock = threading.Lock()
+        self._preempt_events: dict = {}    # request_id -> threading.Event
+        # ---- Phase 2: post-store completion hook ----
+        # Installed via set_done_hook by p2p_nccl_connector on the
+        # producer side so it can route ARENA_SINK completions onto
+        # the fast-release queue.  None = no-op.  Fires from the
+        # store-pool thread inside _mark_done.
+        self._done_hook = None
+
         # ---- RESIDENT SHARED PINNED ARENA (LICHT_ROUND_KV_ARENA=1, default) --
         # The mainstream (LMCache/Mooncake) design: KV lives in a fixed,
         # pre-registered pinned region; a load is a DIRECT H2D from it — NO
@@ -262,6 +277,21 @@ class RoundKVStore:
         self._arena_mapped = False     # mmap + slot layout derived
         self._arena_registered = False  # cudaHostRegister done (prefill)
         self._arena_lock = threading.Lock()   # guards the bump counter
+        # ---- Phase A: arena eviction policy (job-aware + prefix-protect)
+        # _slot_to_inc: physical slot_id (in [0, num_slots)) -> (job_id,
+        #   inc_start_block, inc_end_block).  Updated on every successful
+        #   _write_inc_arena; older mappings are overwritten when bump
+        #   wraps and reuses the slot.
+        # _job_to_slots: job_id -> set of slot_ids it currently occupies.
+        #   Inverse of _slot_to_inc; lets delete(job_id) run in O(blocks)
+        #   instead of O(num_slots).
+        # _finished_jobs: job_ids the scheduler told us are done.  These
+        #   jobs' slots are NOT protected (free to overwrite) and their
+        #   manifests are deleted by mark_finished.
+        # All three are guarded by _arena_lock.
+        self._slot_to_inc: dict = {}
+        self._job_to_slots: dict = {}
+        self._finished_jobs: set = set()
         self._hdr_mm = None            # shm header: [0]=next_slot (int64 bump)
         self._hdr = None               # numpy int64 view over the header
         self._cudart = None            # cached ctypes libcudart
@@ -450,14 +480,54 @@ class RoundKVStore:
         """Allocate n CONTIGUOUS slots from the ring; return the absolute
         bump_base, or None if n > num_slots.  If the run would wrap the ring
         end, skip the tail so every increment stays contiguous (load = one
-        bulk H2D)."""
+        bulk H2D).
+
+        Phase A: bump skips over PROTECTED slots (active job's head
+        increment).  Worst-case the whole ring is protected -> we fall
+        back to forcing an overwrite (warning) so the engine never
+        deadlocks on a full arena."""
         if n <= 0 or n > self._num_slots:
             return None
         with self._arena_lock:
             base = int(self._hdr[0])
+            # Safety budget: at most 2 ring traversals.  Bumping +1 per
+            # protected slot in pathological cases would still terminate,
+            # but we cap it to make the loop's worst-case bounded and
+            # easy to reason about.
+            budget = 2 * self._num_slots
+            while budget > 0:
+                off = base % self._num_slots
+                # Stay contiguous: never cross the ring boundary.
+                if off + n > self._num_slots:
+                    skip = self._num_slots - off
+                    base += skip
+                    budget -= skip
+                    continue
+                # Scan [off, off+n) for the first protected slot.
+                bad = -1
+                for k in range(n):
+                    if self._is_protected(off + k):
+                        bad = k
+                        break
+                if bad < 0:
+                    # Whole run is overwritable.
+                    self._hdr[0] = base + n
+                    return base
+                # Skip past the protected slot and retry.
+                base += bad + 1
+                budget -= bad + 1
+            # Pathological case: arena is fully covered by protected
+            # head-increments.  Force an overwrite at the original
+            # bump position and log a warning so the operator sees it.
+            logger.warning(
+                "round-kv ARENA fully protected (num_slots=%d, "
+                "active_head_inc=%d) — forcing overwrite of HEAD "
+                "increment.  Increase ROUND_KV_ARENA_GB.",
+                self._num_slots, len(self._slot_to_inc))
+            base = int(self._hdr[0])
             off = base % self._num_slots
             if off + n > self._num_slots:
-                base += (self._num_slots - off)      # skip to ring boundary
+                base += (self._num_slots - off)
             self._hdr[0] = base + n
             return base
 
@@ -876,6 +946,27 @@ class RoundKVStore:
         # memcpy CPU(gathered) -> shared pinned pages (one contiguous run).
         self._arena_view[off:off + nbc].copy_(bm)
         self._write_slot_index(job_id, start, end, base)
+        # Phase A: register this run in the reverse index so future
+        # _arena_alloc's see "slots [off, off+nbc) belong to (job_id,
+        # start, end)" and decide whether to protect them.  Sweep out
+        # the previous owners (if any) of the same physical slots so
+        # _job_to_slots stays consistent.
+        jid = str(job_id)
+        with self._arena_lock:
+            slots_set = self._job_to_slots.setdefault(jid, set())
+            for k in range(nbc):
+                sid = off + k
+                prev = self._slot_to_inc.get(sid)
+                if prev is not None:
+                    prev_jid = prev[0]
+                    if prev_jid != jid:
+                        prev_slots = self._job_to_slots.get(prev_jid)
+                        if prev_slots is not None:
+                            prev_slots.discard(sid)
+                            if not prev_slots:
+                                self._job_to_slots.pop(prev_jid, None)
+                self._slot_to_inc[sid] = (jid, int(start), int(end))
+                slots_set.add(sid)
 
     def _write_inc_raw(self, job_id, start, end, tensors) -> None:
         """Write the increment as ONE raw contiguous .bin, BLOCK-MAJOR
@@ -951,11 +1042,70 @@ class RoundKVStore:
     # Completion bookkeeping (drain_done -> free GPU blocks)
     # ------------------------------------------------------------------
 
+    def set_done_hook(self, hook) -> None:
+        """Phase 2: install a callback invoked at the END of _mark_done
+        for any normal-store completion (not preempt-sync, which short-
+        circuits earlier).  Used by p2p_nccl_connector to learn when an
+        ARENA_SINK D2H has finished so it can push the req_id onto the
+        producer-side fast-release queue.  Callback signature:
+            hook(request_id: str) -> None
+        Errors in the hook are swallowed (logged) so a buggy callback
+        can't break the store pool."""
+        self._done_hook = hook
+
     def _mark_done(self, request_id: Optional[str]) -> None:
         if request_id is None:
             return
+        # Phase 1: if this is a preempt-save (sync caller is waiting), signal
+        # the event but DO NOT route through _done -- the scheduler owns the
+        # free in the preempt path, so adding to _done would cause delay-free
+        # release to also fire.  Only normal-store completions feed _done.
+        with self._preempt_lock:
+            ev = self._preempt_events.get(request_id)
+        if ev is not None:
+            ev.set()
+            return
         with self._done_lock:
             self._done.add(request_id)
+        # Phase 2: notify the done-hook (if installed).  Runs in the
+        # store-pool thread; keep handler cheap.
+        hook = getattr(self, "_done_hook", None)
+        if hook is not None:
+            try:
+                hook(request_id)
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    "RoundKVStore done-hook raised for req=%s: %s",
+                    request_id, e)
+
+    def save_preempted_sync(self, job_id: str, block_ids: list,
+                            token_ids: list, request_id: str,
+                            timeout_s: float = 30.0) -> bool:
+        """Phase 1: synchronously save a preempted decode request's KV
+        increment to arena.  Reuses the background store pool (gather +
+        write_inc_arena + advance _last_stored) and waits for completion
+        via a per-request Event signalled in _mark_done.
+
+        Returns True iff the increment was successfully persisted; False
+        means the caller should fall back to the normal recompute path
+        (KV not in arena -> integrity preserved)."""
+        if not self.ready or not self._is_cuda:
+            return False
+        ev = threading.Event()
+        with self._preempt_lock:
+            self._preempt_events[request_id] = ev
+        try:
+            # enqueue_store will be picked up by _store_loop, which does the
+            # D2H gather (own CUDA stream) + write_inc_arena and finally
+            # calls _mark_done(request_id) -> ev.set().
+            self.enqueue_store(job_id, block_ids, token_ids, request_id)
+            ok = ev.wait(timeout=timeout_s)
+            return ok
+        except Exception:  # pragma: no cover
+            return False
+        finally:
+            with self._preempt_lock:
+                self._preempt_events.pop(request_id, None)
 
     def drain_done(self) -> set:
         with self._done_lock:
@@ -2389,6 +2539,7 @@ class RoundKVStore:
         eviction).  Best-effort."""
         with self._job_lock(job_id):
             self._last_stored.pop(job_id, None)
+            self._inc_cache.pop(job_id, None)
             try:
                 shutil.rmtree(self._job_dir(job_id))
             except FileNotFoundError:
@@ -2396,6 +2547,59 @@ class RoundKVStore:
             except OSError as e:  # pragma: no cover
                 logger.debug("RoundKVStore.delete failed job=%s: %s",
                              job_id, e)
+        # Phase A: clear reverse-index so this job's old slot mappings
+        # no longer protect them in _arena_alloc.  Physical slots are
+        # still occupied with this job's bytes (until bump overwrites),
+        # but lookup() will miss (manifest gone) so they're effectively
+        # free.
+        with self._arena_lock:
+            slots = self._job_to_slots.pop(str(job_id), None)
+            if slots:
+                for sid in slots:
+                    cur = self._slot_to_inc.get(sid)
+                    if cur is not None and cur[0] == str(job_id):
+                        del self._slot_to_inc[sid]
+            self._finished_jobs.discard(str(job_id))
+
+    def mark_finished(self, job_id: str) -> None:
+        """Phase A: scheduler signals the trajectory's last step has
+        finished — the job's KV history is no longer needed.  We:
+        (1) mark the job as finished so its slots are immediately
+            considered overwritable in _arena_alloc (no longer
+            protected even if inc_start==0),
+        (2) asynchronously delete the manifest + reverse-index so
+            lookup() stops returning hits.
+        Best-effort: any errors are logged and swallowed so a buggy
+        scheduler call can't kill the store."""
+        if not job_id:
+            return
+        jid = str(job_id)
+        with self._arena_lock:
+            self._finished_jobs.add(jid)
+        # Run the actual delete on a daemon thread so we don't block
+        # the scheduler.  delete() takes per-job lock + rmtree -> ms
+        # range, not worth blocking on.
+        try:
+            t = threading.Thread(target=self.delete, args=(jid,),
+                                 daemon=True, name=f"RKVDel-{jid[:16]}")
+            t.start()
+        except Exception as e:  # pragma: no cover
+            logger.debug("mark_finished thread launch failed job=%s: %s",
+                         jid, e)
+
+    def _is_protected(self, slot_id: int) -> bool:
+        """Phase A: slot is protected iff it currently belongs to an
+        ACTIVE (non-finished) job's HEAD increment (inc_start == 0).
+        Head increment is the prompt prefix -> shared across rounds of
+        the same job -> don't let bump overwrite it while the job is
+        still running.  Caller must hold _arena_lock."""
+        e = self._slot_to_inc.get(slot_id)
+        if e is None:
+            return False
+        job_id, inc_start, _ = e
+        if job_id in self._finished_jobs:
+            return False
+        return inc_start == 0
 
     def shutdown(self) -> None:
         self._stop.set()
