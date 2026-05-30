@@ -226,22 +226,24 @@ class ArenaHdr:
     def bitmap_word_addr(self, word_idx: int) -> int:
         return self._layout.bitmap_word_addr(self._base_addr, word_idx)
 
-    # ---- bitmap 操作 (注意: 必须在 alloc_mutex 内调用, 不需要原子) ----
+    # ---- bitmap 操作 ----
+    # 设计约束:
+    #   - 协议层面: alloc/evict 应在 alloc_mutex 内调用 bitmap 操作
+    #   - 实现层面: 使用 atomic fetch_or/fetch_and 作为 defense in depth,
+    #     即使意外在 mutex 外调用也不会丢更新
     def bitmap_set_free(self, slot_id: int) -> None:
         assert 0 <= slot_id < self._layout.num_slots
         word_idx = slot_id // 64
         bit_idx = slot_id % 64
         addr = self.bitmap_word_addr(word_idx)
-        cur = _atomic.atomic_load_u64(addr)
-        _atomic.atomic_store_u64(addr, cur | (1 << bit_idx))
+        _atomic.atomic_fetch_or_u64(addr, 1 << bit_idx)
 
     def bitmap_set_used(self, slot_id: int) -> None:
         assert 0 <= slot_id < self._layout.num_slots
         word_idx = slot_id // 64
         bit_idx = slot_id % 64
         addr = self.bitmap_word_addr(word_idx)
-        cur = _atomic.atomic_load_u64(addr)
-        _atomic.atomic_store_u64(addr, cur & ~(1 << bit_idx))
+        _atomic.atomic_fetch_and_u64(addr, ~(1 << bit_idx) & 0xFFFFFFFFFFFFFFFF)
 
     def bitmap_is_free(self, slot_id: int) -> bool:
         assert 0 <= slot_id < self._layout.num_slots

@@ -108,8 +108,10 @@ void arena_evict_slot(uint64_t* slot_state, uint64_t* new_gen_out) {
     // 仅在 alloc_mutex 内 + pin == 0 时调用
     // 因此读 old 可用 RELAXED (没有并发改写)
     uint64_t old = __atomic_load_n(slot_state, __ATOMIC_RELAXED);
-    uint64_t new_gen = (old & ARENA_GEN_MASK) + 1;
-    // gen += 1, pin 保持 0
+    // mask 防御 gen 溢出 (理论 2^48 evict 才会发生, 实际几千年不到):
+    // 不 mask -> 写入 bit 48 会把 pin 位污染
+    uint64_t new_gen = ((old & ARENA_GEN_MASK) + 1) & ARENA_GEN_MASK;
+    // gen 更新, pin 保持 0
     __atomic_store_n(slot_state, new_gen, __ATOMIC_RELEASE);
     if (new_gen_out) *new_gen_out = new_gen;
 }
@@ -118,7 +120,8 @@ void arena_publish_slot(uint64_t* slot_state, uint64_t new_gen) {
     // 仅在 alloc_mutex 内、memcpy 完成后调用
     // pin 必须为 0 (alloc 完后 reader 还看不到)
     // RELEASE 保证 memcpy 的所有 store 在 publish 之前对 reader 可见
-    __atomic_store_n(slot_state, new_gen, __ATOMIC_RELEASE);
+    // mask 防御调用方传入的 new_gen 超过 48 位
+    __atomic_store_n(slot_state, new_gen & ARENA_GEN_MASK, __ATOMIC_RELEASE);
 }
 
 // ============================================================
@@ -134,6 +137,14 @@ void arena_atomic_store_u64(uint64_t* addr, uint64_t val) {
 
 uint64_t arena_atomic_fetch_add_u64(uint64_t* addr, uint64_t delta) {
     return __atomic_fetch_add(addr, delta, __ATOMIC_ACQ_REL);
+}
+
+uint64_t arena_atomic_fetch_or_u64(uint64_t* addr, uint64_t mask) {
+    return __atomic_fetch_or(addr, mask, __ATOMIC_ACQ_REL);
+}
+
+uint64_t arena_atomic_fetch_and_u64(uint64_t* addr, uint64_t mask) {
+    return __atomic_fetch_and(addr, mask, __ATOMIC_ACQ_REL);
 }
 
 // ============================================================
@@ -205,6 +216,12 @@ static void py_atomic_store_u64(uint64_t addr, uint64_t val) {
 static uint64_t py_atomic_fetch_add_u64(uint64_t addr, uint64_t delta) {
     return arena_atomic_fetch_add_u64(reinterpret_cast<uint64_t*>(addr), delta);
 }
+static uint64_t py_atomic_fetch_or_u64(uint64_t addr, uint64_t mask) {
+    return arena_atomic_fetch_or_u64(reinterpret_cast<uint64_t*>(addr), mask);
+}
+static uint64_t py_atomic_fetch_and_u64(uint64_t addr, uint64_t mask) {
+    return arena_atomic_fetch_and_u64(reinterpret_cast<uint64_t*>(addr), mask);
+}
 
 // ---- 常量查询 (Python 端避免 hardcode) ----
 static uint64_t py_pthread_mutex_size() {
@@ -250,6 +267,8 @@ PYBIND11_MODULE(licht_arena_atomic, m) {
     m.def("atomic_load_u64",      &py_atomic_load_u64,      py::arg("addr"));
     m.def("atomic_store_u64",     &py_atomic_store_u64,     py::arg("addr"), py::arg("val"));
     m.def("atomic_fetch_add_u64", &py_atomic_fetch_add_u64, py::arg("addr"), py::arg("delta"));
+    m.def("atomic_fetch_or_u64",  &py_atomic_fetch_or_u64,  py::arg("addr"), py::arg("mask"));
+    m.def("atomic_fetch_and_u64", &py_atomic_fetch_and_u64, py::arg("addr"), py::arg("mask"));
 
     // 常量查询
     m.def("pthread_mutex_size",      &py_pthread_mutex_size);

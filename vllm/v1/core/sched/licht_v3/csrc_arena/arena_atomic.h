@@ -120,6 +120,8 @@ void arena_publish_slot(uint64_t* slot_state, uint64_t new_gen);
 uint64_t arena_atomic_load_u64(uint64_t* addr);
 void     arena_atomic_store_u64(uint64_t* addr, uint64_t val);
 uint64_t arena_atomic_fetch_add_u64(uint64_t* addr, uint64_t delta);
+uint64_t arena_atomic_fetch_or_u64(uint64_t* addr, uint64_t mask);
+uint64_t arena_atomic_fetch_and_u64(uint64_t* addr, uint64_t mask);
 
 #ifdef __cplusplus
 }  // extern "C"
