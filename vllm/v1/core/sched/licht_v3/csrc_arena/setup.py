@@ -5,26 +5,15 @@
 
 Usage:
     cd vllm/v1/core/sched/licht_v3/csrc_arena
-    pip install .
+    pip install --no-build-isolation .
 
 构建说明:
-    - 文件后缀用 .cu 但不含 CUDA kernel, 只是为了统一 torch 扩展构建流程
+    - 本扩展不含 CUDA kernel, 用 CppExtension (纯 host C++)
     - xxhash 用 vendored single-header (third_party/xxhash.h, Stage 6 才用)
-    - 不需要全局 CUDA_HOME, setup.py 内部找
+    - 必须 --no-build-isolation, 因为依赖外部已装的 torch
 """
-import os
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
-# 自动定位 CUDA, 优先用 nvcc 所在路径
-_cuda_home = os.environ.get("CUDA_HOME")
-if not _cuda_home:
-    for candidate in ("/usr/local/cuda-12.2", "/usr/local/cuda"):
-        if os.path.isdir(candidate):
-            _cuda_home = candidate
-            break
-if _cuda_home:
-    os.environ["CUDA_HOME"] = _cuda_home
+from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
 setup(
@@ -35,22 +24,16 @@ setup(
         "(mutex, pin/gen CAS, atomic load/store)"
     ),
     ext_modules=[
-        CUDAExtension(
+        CppExtension(
             name="licht_arena_atomic",
-            sources=["arena_atomic.cu"],
+            sources=["arena_atomic.cpp"],
             include_dirs=["./third_party"],  # 含 xxhash.h
-            extra_compile_args={
-                "cxx": [
-                    "-O3",
-                    "-std=c++17",
-                    "-pthread",
-                    "-Wall",
-                ],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                ],
-            },
+            extra_compile_args=[
+                "-O3",
+                "-std=c++17",
+                "-pthread",
+                "-Wall",
+            ],
             extra_link_args=["-pthread"],
         ),
     ],
