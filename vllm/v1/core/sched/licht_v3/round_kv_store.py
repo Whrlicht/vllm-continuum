@@ -445,23 +445,22 @@ class RoundKVStore:
             try:
                 from vllm.v1.core.sched.licht_v3.arena_lru_store import (
                     LruArenaStore)
-                if register:
-                    self._lru_store = LruArenaStore.create(
-                        self.storage_path,
-                        num_slots=self._num_slots,
-                        block_size=self.block_size)
-                else:
-                    self._lru_store = LruArenaStore.open(
-                        self.storage_path,
-                        num_slots=self._num_slots,
-                        block_size=self.block_size)
+                # 用 open_or_create: 跨进程 fcntl flock 互斥,
+                # 谁先到谁创建+init bitmap, 后到的 mmap+sync.
+                # prefill/decode 启动顺序无关.
+                self._lru_store = LruArenaStore.open_or_create(
+                    self.storage_path,
+                    num_slots=self._num_slots,
+                    block_size=self.block_size,
+                    wait_timeout_s=60.0)
                 self._lru_store.bind_data_writer(self._lru_data_writer)
                 self._arena_mapped = True
                 logger.info(
                     "round-kv LRU arena bound (role=%s, num_slots=%d, "
-                    "slot_bytes=%.2fMB)",
+                    "slot_bytes=%.2fMB, free=%d)",
                     "producer" if register else "consumer",
-                    self._num_slots, self._slot_bytes / 1e6)
+                    self._num_slots, self._slot_bytes / 1e6,
+                    self._lru_store.free_count())
                 return
             except Exception as e:
                 logger.warning(

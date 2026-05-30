@@ -154,6 +154,34 @@ class LruArenaStore:
         store._allocator.sync_from_bitmap()
         return store
 
+    @classmethod
+    def open_or_create(cls, storage_path: str, num_slots: int,
+                       block_size: int,
+                       wait_timeout_s: float = 60.0) -> "LruArenaStore":
+        """跨进程安全的初始化: 谁先到谁创建+init bitmap, 后到的 mmap+sync.
+
+        与 prefill/decode 启动顺序无关. 推荐用这个代替 create()/open() 分别处理.
+        flock 协议保证 creator 在临界区内完成 bitmap init, 不会有半态被后到进程
+        看到.
+        """
+        store = cls(storage_path, num_slots, block_size)
+        hdr_path = os.path.join(storage_path, "_arena.hdr")
+
+        # ArenaHdr.open_or_create 的 on_create 回调里做 allocator.init_all_free,
+        # 这样 bitmap init 也在 flock 临界区内完成
+        def _on_create(hdr):
+            tmp_allocator = ArenaAllocator(hdr)
+            tmp_allocator.init_all_free()
+
+        store._hdr = ArenaHdr.open_or_create(
+            hdr_path, num_slots=num_slots,
+            wait_timeout_s=wait_timeout_s,
+            on_create=_on_create)
+        store._allocator = ArenaAllocator(store._hdr)
+        # bitmap 已被 creator init, sync 当前真实计数
+        store._allocator.sync_from_bitmap()
+        return store
+
     def close(self) -> None:
         if self._hdr is not None:
             self._hdr.close()

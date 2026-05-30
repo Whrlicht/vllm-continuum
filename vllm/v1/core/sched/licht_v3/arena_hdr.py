@@ -26,8 +26,10 @@ Stage 6: 启动时打开 use_content_addressing=True, 复用同一 hdr.
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import mmap
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -207,6 +209,71 @@ class ArenaHdr:
             os.close(fd)
         base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
         return cls(mm, layout, base, path)
+
+    @classmethod
+    def open_or_create(cls, path: str, num_slots: int,
+                       wait_timeout_s: float = 60.0,
+                       on_create=None) -> "ArenaHdr":
+        """跨进程安全的 init/open: 用 fcntl.flock 互斥, 第一个抢到锁的
+        进程负责 ftruncate + init mutex + 调 on_create 回调; 后到的只 mmap.
+
+        与启动顺序无关:
+          - prefill 先到: 创建 + init mutex + on_create; decode 后到 → mmap
+          - decode 先到: 创建 + init mutex + on_create; prefill 后到 → mmap
+
+        on_create(hdr): 创建者在 flock 临界区内调用的回调, 用于额外初始化
+                       (例如 bitmap_init_all_free). 必须在 flock 释放前完成,
+                       否则后到进程可能误判 bitmap 状态.
+
+        wait_timeout_s: 拿不到文件锁时的最大等待秒数 (防止死等)
+        """
+        layout = ArenaHdrLayout.compute(num_slots)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        deadline = time.time() + wait_timeout_s
+
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            # 非阻塞试拿锁; 拿不到就等到 deadline
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        raise TimeoutError(
+                            f"open_or_create: flock timeout on {path}")
+                    time.sleep(0.05)
+
+            try:
+                cur_size = os.fstat(fd).st_size
+                if cur_size < layout.total_size:
+                    # 第一个到的进程: ftruncate + init mutex
+                    os.ftruncate(fd, layout.total_size)
+                    creator = True
+                else:
+                    # 别人已经创建过, 我们只 mmap
+                    creator = False
+                # mmap 必须在 ftruncate 之后做, 否则 mmap 看到的是旧 size
+                mm = mmap.mmap(fd, layout.total_size,
+                               mmap.MAP_SHARED,
+                               mmap.PROT_READ | mmap.PROT_WRITE)
+                base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                hdr = cls(mm, layout, base, path)
+                if creator:
+                    rc = _atomic.mutex_init(layout.mutex_addr(base))
+                    if rc != 0:
+                        mm.close()
+                        raise OSError(rc, f"mutex_init failed rc={rc}")
+                    # 调用上层 init 回调, 仍持 flock, 保证后到进程看到完整状态
+                    if on_create is not None:
+                        on_create(hdr)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            # 关 fd; mmap 仍保持有效
+            os.close(fd)
+
+        return hdr
 
     @property
     def layout(self) -> ArenaHdrLayout:

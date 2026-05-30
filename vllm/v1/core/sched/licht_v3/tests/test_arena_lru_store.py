@@ -411,3 +411,89 @@ class TestGroupFMultiJob:
             assert store.lookup("jobB", tokens) is not None
         finally:
             store.close()
+
+
+# ============================================================
+# Group G - 跨进程 race (open_or_create)
+# ============================================================
+
+class TestGroupGOpenOrCreate:
+    def test_open_or_create_single_process(self, tmp_path):
+        """单进程: open_or_create 应等同于 create."""
+        store = LruArenaStore.open_or_create(
+            str(tmp_path / "arena"),
+            num_slots=100, block_size=16)
+        try:
+            assert store.free_count() == 100  # 全 free
+            assert store.num_slots == 100
+        finally:
+            store.close()
+
+    def test_open_or_create_second_caller_sees_initialized(self, tmp_path):
+        """同一进程内两次 open_or_create: 第二次看到已 init 的 bitmap, 不重置."""
+        arena_dir = str(tmp_path / "arena")
+        store1 = LruArenaStore.open_or_create(
+            arena_dir, num_slots=100, block_size=16)
+        arena1 = _FakeArena()
+        store1.bind_data_writer(arena1.writer)
+        try:
+            tokens = _make_tokens(48)
+            ok = store1.write_inc("jobA", 0, 3, tokens,
+                                  _block_data("jobA", 0, 3))
+            assert ok
+            assert store1.free_count() == 97  # 3 slot 已用
+            # 第二个 store 打开同一 dir, 不应重置 bitmap
+            store2 = LruArenaStore.open_or_create(
+                arena_dir, num_slots=100, block_size=16)
+            try:
+                assert store2.free_count() == 97  # 看到第一个 store 的状态
+                # 第二个 store 也能 lookup
+                result = store2.lookup("jobA", tokens)
+                assert result is not None
+                _, matched = result
+                assert matched == 3
+            finally:
+                store2.close()
+        finally:
+            store1.close()
+
+    def test_open_or_create_cross_process(self, tmp_path):
+        """跨进程并发 open_or_create: 两端都 work, 共享同一 arena."""
+        import ctypes
+        import multiprocessing as mp
+
+        arena_dir = str(tmp_path / "arena")
+        ctx = mp.get_context("fork")
+
+        # 用 Value 在父子间通信子进程看到的 free_count
+        child_fc = ctx.Value(ctypes.c_int, -1)
+
+        def child(arena_dir, child_fc):
+            from vllm.v1.core.sched.licht_v3.arena_lru_store import (
+                LruArenaStore)
+            child_store = LruArenaStore.open_or_create(
+                arena_dir, num_slots=50, block_size=16)
+            child_fc.value = int(child_store.free_count())
+            child_store.close()
+
+        # 父进程先创建
+        parent = LruArenaStore.open_or_create(
+            arena_dir, num_slots=50, block_size=16)
+        try:
+            # 父进程写一段
+            parent.bind_data_writer(_FakeArena().writer)
+            tokens = _make_tokens(48)
+            parent.write_inc("jobA", 0, 3, tokens,
+                              _block_data("jobA", 0, 3))
+            assert parent.free_count() == 47
+
+            # 子进程 open
+            proc = ctx.Process(target=child, args=(arena_dir, child_fc))
+            proc.start()
+            proc.join(timeout=30)
+            assert proc.exitcode == 0, f"child exited with {proc.exitcode}"
+            # 子进程应看到 47 (父写了 3 个)
+            assert child_fc.value == 47, (
+                f"child saw free_count={child_fc.value}, expected 47")
+        finally:
+            parent.close()
