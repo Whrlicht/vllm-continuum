@@ -308,6 +308,23 @@ class RoundKVStore:
         self._inc_cache: dict = {}
         self._inc_ttl = float(os.environ.get("LICHT_ROUND_KV_INC_TTL", "1.0"))
 
+        # ============================================================
+        # Stage 2 LRU arena (env: LICHT_ROUND_KV_LRU=1)
+        # ============================================================
+        # 当开启时, arena 使用全新 slot-paged LRU 实现:
+        #   - hdr 格式: mutex + bitmap + slot_state (~1MB, 含 Stage 6 预留)
+        #   - 分配: bitmap first-fit
+        #   - 淘汰: per-job LRU (manifest mtime) + tail-first
+        #   - .slot 文件格式: per-block (slot_id, gen)
+        #   - 跨进程同步: pthread_mutex_t PROCESS_SHARED + ROBUST
+        #   - reader 保护: per-slot atomic pin
+        #   - self-heal: evict 后 _last_stored 回退
+        #
+        # FIFO 代码路径不变, 不开 env 时默认仍走 FIFO bump 环.
+        self._lru_enabled = (
+            os.environ.get("LICHT_ROUND_KV_LRU", "0") == "1")
+        self._lru_store = None    # LruArenaStore, 由 _arena_init 设置
+
     # ------------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------------
@@ -423,7 +440,35 @@ class RoundKVStore:
         self._arena_rest = rest
         self._arena_dim = dim
         self._arena_nL = nL
-        # ---- shared header (bump counter) ----
+        # ---- Stage 2 LRU arena: 跳过 FIFO bump hdr, 用 LruArenaStore ----
+        if self._lru_enabled:
+            try:
+                from vllm.v1.core.sched.licht_v3.arena_lru_store import (
+                    LruArenaStore)
+                if register:
+                    self._lru_store = LruArenaStore.create(
+                        self.storage_path,
+                        num_slots=self._num_slots,
+                        block_size=self.block_size)
+                else:
+                    self._lru_store = LruArenaStore.open(
+                        self.storage_path,
+                        num_slots=self._num_slots,
+                        block_size=self.block_size)
+                self._lru_store.bind_data_writer(self._lru_data_writer)
+                self._arena_mapped = True
+                logger.info(
+                    "round-kv LRU arena bound (role=%s, num_slots=%d, "
+                    "slot_bytes=%.2fMB)",
+                    "producer" if register else "consumer",
+                    self._num_slots, self._slot_bytes / 1e6)
+                return
+            except Exception as e:
+                logger.warning(
+                    "round-kv LRU bind failed (%s); falling back to FIFO", e)
+                self._lru_store = None
+                # 继续走下面 FIFO 路径
+        # ---- shared header (bump counter, FIFO 路径) ----
         hfd = os.open(self._arena_hdr_path(), os.O_CREAT | os.O_RDWR, 0o600)
         os.ftruncate(hfd, 4096)
         hmm = _mmap.mmap(hfd, 4096, _mmap.MAP_SHARED,
@@ -436,6 +481,124 @@ class RoundKVStore:
                     self._slot_bytes / 1e6, register)
         if self._fused and register:
             self._setup_fused()
+
+    # ==================================================================
+    # Stage 2 LRU arena 路径 (when LICHT_ROUND_KV_LRU=1)
+    # ==================================================================
+    def _lru_data_writer(self, slot_id: int, block_idx: int,
+                         source_obj) -> None:
+        """传给 LruArenaStore.bind_data_writer 的钩子.
+
+        source_obj: block-major torch tensor [n_blocks, nL, 2, *rest] (CPU)
+                    在 _write_inc_arena_lru 里已 permute 好
+        copy source_obj[block_idx] -> self._arena_view[slot_id]
+        """
+        # arena_view 是 CPU shm 张量, source_obj 是 CPU 张量, host->host memcpy
+        self._arena_view[slot_id].copy_(source_obj[block_idx])
+
+    def _write_inc_arena_lru(self, job_id, start, end, tensors) -> None:
+        """LRU 版 write_inc: 把 tensors 字典 permute 成 block-major,
+        交给 LruArenaStore.write_inc 处理 (内部 alloc + evict + memcpy + publish).
+        """
+        import torch
+        layers = []
+        for ln in self._kv_caches:
+            t = tensors.get(ln)
+            if t is None:
+                return                           # incomplete -> skip
+            layers.append(t.contiguous())
+        stk = torch.stack(layers)
+        if stk.shape[1] == 2:                    # FA per-layer [2, nbc, *rest]
+            perm = [2, 0, 1] + list(range(3, stk.dim()))
+        else:                                    # MLA per-layer [nbc, 2, *rest]
+            perm = [1, 0, 2] + list(range(3, stk.dim()))
+        bm = stk.permute(*perm).contiguous()     # [nbc, nL, 2, *rest]
+
+        # 读 token_ids: 由 _do_store 在 write_inc 之后 _write_manifest 时设置;
+        # 这里我们传当前能拿到的近似 (token_ids 在 callsite 还没传进来), 用 [] 占位.
+        # LruArenaStore.write_inc 会 rewrite manifest, 后面 _do_store 的
+        # _write_manifest 调用会再覆写一次 (atomic rename, 同内容, OK).
+        ok = self._lru_store.write_inc(
+            job_id=str(job_id),
+            start_block=int(start),
+            end_block=int(end),
+            token_ids=[],   # caller 之后 _write_manifest 会带正确 token_ids
+            source_obj=bm)
+        if not ok:
+            logger.warning(
+                "round-kv LRU write_inc failed (job=%s start=%d end=%d nbc=%d)",
+                str(job_id)[:32], start, end, bm.shape[0])
+
+    def _lookup_lru(self, job_id: str,
+                    cur_token_ids: list):
+        """LRU 版 lookup: 直接调 LruArenaStore.lookup."""
+        return self._lru_store.lookup(str(job_id), cur_token_ids)
+
+    def _load_request_arena_lru(self, job_id: str,
+                                 dst_block_ids: list,
+                                 src_block_offset: int) -> bool:
+        """LRU 版 load_request: 用 LruArenaStore.load_request 拿 LoadHandle,
+        然后 gather + H2D + per-layer scatter.
+
+        返回: True 成功, False miss/race
+        """
+        import torch
+        handle = self._lru_store.load_request(
+            str(job_id), list(dst_block_ids), int(src_block_offset))
+        if handle is None:
+            return False
+        try:
+            if not handle.slot_ids:
+                return True
+            # Gather: arena_view[slot_ids] -> CPU tensor [n, nL, 2, *rest]
+            slot_ids_t = torch.tensor(handle.slot_ids, dtype=torch.long)
+            src_cpu = self._arena_view[slot_ids_t]  # CPU shm fancy index
+            # H2D
+            src_gpu = src_cpu.to(self._device, non_blocking=True)
+            # 目标 paged 索引
+            dst_t = torch.tensor(handle.dst_block_ids,
+                                  dtype=torch.long, device=self._device)
+            # per-layer scatter
+            layer_names = list(self._kv_caches.keys())
+            for li, ln in enumerate(layer_names):
+                kv = self._kv_caches[ln]
+                layer = kv[0] if isinstance(kv, (list, tuple)) else kv
+                srcl = src_gpu[:, li]            # [n, 2, *rest]
+                if self._arena_dim == 1:         # FA
+                    layer[:, dst_t, ...] = srcl.permute(
+                        1, 0, *range(2, srcl.dim()))
+                else:                            # MLA
+                    layer[dst_t, ...] = srcl
+            # post-load gen 校验
+            if not handle.post_load_validate():
+                logger.warning("round-kv LRU post-load validation FAILED "
+                               "(race detected) job=%s", str(job_id)[:32])
+                return False
+            return True
+        finally:
+            handle.release()
+
+    def _load_batch_arena_lru(self, items: list) -> list:
+        """LRU 版 batch load: 逐请求调 _load_request_arena_lru."""
+        results = []
+        for (job_id, dst_block_ids, src_block_offset) in items:
+            try:
+                ok = self._load_request_arena_lru(
+                    job_id, dst_block_ids, src_block_offset)
+            except Exception as e:  # pragma: no cover
+                logger.warning("round-kv LRU load_request error job=%s: %s",
+                               str(job_id)[:32], e)
+                ok = False
+            results.append(ok)
+        return results
+
+    def _delete_lru(self, job_id: str) -> None:
+        self._lru_store.delete_job(str(job_id))
+
+    def _mark_finished_lru(self, job_id: str) -> None:
+        self._lru_store.mark_finished_job(str(job_id))
+
+    # ==================================================================
 
     def _setup_fused(self) -> None:
         """Compile + wire the fused-scatter kernel (prefill side).  On any
@@ -922,6 +1085,9 @@ class RoundKVStore:
         allocate a contiguous slot run, memcpy into the shared pages, then
         write the tiny inc_*.slot index (bump_base) so prefill can find +
         validate it.  No data file, no per-load read on the prefill side."""
+        # Stage 2 LRU dispatch
+        if self._lru_store is not None:
+            return self._write_inc_arena_lru(job_id, start, end, tensors)
         import torch
         layers = []
         for ln in self._kv_caches:
@@ -1124,6 +1290,9 @@ class RoundKVStore:
         block-aligned prefix of `cur_token_ids` covered by the stored
         increments of `job_id`, else None.  Cheap: reads only the
         manifest JSON, not the KV blobs."""
+        # Stage 2 LRU dispatch
+        if self._lru_store is not None:
+            return self._lookup_lru(job_id, cur_token_ids)
         m = self._read_manifest(job_id)
         if not m:
             return None
@@ -1776,6 +1945,10 @@ class RoundKVStore:
         scatter, exactly like the .bin path.  Runs inside the copy stream.
         `acc` (optional [meta,idx,h2d,scat] float list) accumulates per-phase
         CPU-side time (NO cuda sync added) to pin down per-request overhead."""
+        # Stage 2 LRU dispatch
+        if self._lru_store is not None:
+            return self._load_request_arena_lru(
+                job_id, dst_block_ids, src_block_offset)
         import torch
         n = len(dst_block_ids)
         if n <= 0:
@@ -1902,6 +2075,9 @@ class RoundKVStore:
         into ONE staging buffer [nb, nL, 2, *rest] (chunked by stage cap), and
         (3) do exactly nL `index_put`s per chunk — ONE per layer across ALL
         requests' blocks.  Launches drop from reqs×nL to (chunks×nL)."""
+        # Stage 2 LRU dispatch
+        if self._lru_store is not None:
+            return self._load_batch_arena_lru(items)
         import torch
         results = [False] * len(items)
         if self._pipe_ev is not None:
@@ -2537,6 +2713,15 @@ class RoundKVStore:
     def delete(self, job_id: str) -> None:
         """Remove a job's whole increment history (trajectory end /
         eviction).  Best-effort."""
+        # Stage 2 LRU dispatch
+        if self._lru_store is not None:
+            try:
+                self._delete_lru(job_id)
+            except Exception as e:  # pragma: no cover
+                logger.debug("LRU delete failed job=%s: %s", job_id, e)
+            self._last_stored.pop(job_id, None)
+            self._inc_cache.pop(job_id, None)
+            return
         with self._job_lock(job_id):
             self._last_stored.pop(job_id, None)
             self._inc_cache.pop(job_id, None)
