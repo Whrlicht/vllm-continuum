@@ -2311,7 +2311,18 @@ class RoundKVStore:
             _t0 = time.time()
             _nblk = len(dst)
             try:
-                if self._arena and self._arena_registered and self._is_cuda:
+                # Stage 2 LRU dispatch (在 _arena_registered 检查之前, 否则
+                # consumer 端会 fall through 到 FIFO _read_for_load).
+                if self._lru_store is not None:
+                    import torch
+                    if stream is not None:
+                        with torch.cuda.stream(stream):
+                            self._load_request_arena_lru(job_id, dst, off)
+                        stream.synchronize()
+                    else:
+                        self._load_request_arena_lru(job_id, dst, off)
+                        torch.cuda.current_stream().synchronize()
+                elif self._arena and self._arena_registered and self._is_cuda:
                     # ARENA: direct H2D from the resident pinned region.
                     import torch
                     if stream is not None:
@@ -2361,6 +2372,15 @@ class RoundKVStore:
         production prefill uses load_batch."""
         if not self.ready:
             return False
+        # Stage 2 LRU dispatch (绕过 _arena_registered: consumer 端不 register
+        # 但仍需要走 LRU 路径读 LRU 格式的 .slot 文件)
+        if self._lru_store is not None:
+            ok = self._load_request_arena_lru(
+                job_id, dst_block_ids, src_block_offset)
+            if self._is_cuda:
+                import torch
+                torch.cuda.current_stream().synchronize()
+            return ok
         if self._arena and self._arena_registered and self._is_cuda:
             ok = self._load_request_arena(job_id, dst_block_ids,
                                           src_block_offset)
@@ -2393,6 +2413,11 @@ class RoundKVStore:
         ~max(read_i) + sum(scatter_i).  Returns per-item success bool."""
         if not self.ready or not items:
             return [False] * len(items)
+        # Stage 2 LRU dispatch (在所有 FIFO 路径分支前 — 必须最优先, 否则
+        # consumer 端 _arena_registered=False 会 fall through 到 _load_batch_pipelined
+        # 走 FIFO safetensors 读路径, 但 LRU 写的是新 .slot 格式, 必崩 "header too large").
+        if self._lru_store is not None:
+            return self._load_batch_arena_lru(items)
         if self._profile and self._is_cuda:
             # Clean per-stage diagnostic (read/pin/h2d/scatter isolated).
             return self._profile_load(items)
