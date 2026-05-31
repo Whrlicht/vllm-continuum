@@ -399,16 +399,19 @@ class LruArenaStore:
             for (slot_id, new_gen) in records:
                 _atomic.publish_slot(self._hdr.slot_state_addr(slot_id),
                                      new_gen)
+            # in-memory LRU 状态在临界区内更新 (alloc_mutex 保护): 同进程多
+            # store 线程争同一 mutex, 保证 _last_stored / _job_lru 不竞争.
+            # (evict 的 self-heal 也在 alloc_mutex 内改这俩, 顺序一致.)
+            self._last_stored[job_id] = end_block
+            self._touch_job_lru(job_id)   # 移到 LRU 末尾 (最新)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
 
-        # ---- 锁外: 重写 manifest (mtime 自动更新 → LRU 提权).
+        # ---- 锁外: 重写 manifest (文件 IO, 不进临界区).
         # manifest 必须在 gen 发布之后写: lookup 用 manifest 的 token_ids 算
         # LCP, 然后校验每 inc 的 gen. gen 已发布, 所以 lookup 命中即可用. ----
         self._write_manifest(
             job_id, end_block, token_ids[:end_block * self._block_size])
-        self._last_stored[job_id] = end_block
-        self._touch_job_lru(job_id)   # 移到 LRU 末尾 (最新)
         return True
 
     # ============================================================
@@ -669,9 +672,11 @@ class LruArenaStore:
                     except OSError:
                         pass
         # 如果该 job 已被淘空 (没有 .slot 文件了), 从内存 LRU + 文件系统清理.
-        # 关键: 不清理的话, 空壳 job 留在 _job_lru 最前 (最老), 下次 evict 又
-        # 选到它, _list_incs + _read_manifest 文件 IO 空转 -> O(空壳) 退化.
-        if released > 0 and not self._list_incs(job_id):
+        # 关键: 无条件检查 (即使 released==0). 跨进程场景下对方可能已把这个
+        # job evict 空了, 本进程 _job_lru 仍有它 (空壳). 选到空壳时 released=0,
+        # 但仍必须清理, 否则空壳永远留在 _job_lru 最前 (最老), 每次 evict 又
+        # 选到它 -> _list_incs/_read_manifest 文件 IO 空转 -> O(空壳) 性能退化.
+        if not self._list_incs(job_id):
             self._drop_job_lru(job_id)
             self._last_stored.pop(job_id, None)
             try:
