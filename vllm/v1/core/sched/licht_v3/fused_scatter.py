@@ -60,3 +60,36 @@ def get_scatter():
             "-- falling back to per-layer index_put.", e, _CSRC_DIR)
         _fn = None
     return _fn
+
+
+_fn_arena = None
+_tried_arena = False
+
+
+def get_arena_scatter():
+    """Return the prebuilt `licht_scatter_from_arena` callable, or None if the
+    extension is not installed / too old (caller then falls back to the
+    staging-based or per-layer path).
+
+    This is the DIRECT load path: source is the cudaHostRegister'd shared
+    arena (host pinned), scattered straight into the paged buffer in one
+    launch — NO GPU staging buffer, NO extra HBM round-trip.
+    Signature: fn(arena_host_ptr, src_slots, dst_idx, layer_ptrs,
+                  nb, nL, dim, NBLK, P)
+    """
+    global _fn_arena, _tried_arena
+    if _tried_arena:
+        return _fn_arena
+    _tried_arena = True
+    try:
+        import licht_fused_scatter as _ext
+        _fn_arena = _ext.licht_scatter_from_arena
+        logger.info("round-kv DIRECT arena scatter: using prebuilt "
+                    "licht_fused_scatter.licht_scatter_from_arena")
+    except (ImportError, AttributeError) as e:
+        # AttributeError: old .so without the new symbol -> needs rebuild.
+        logger.warning(
+            "round-kv DIRECT arena scatter unavailable (%s); rebuild csrc/ "
+            "to get licht_scatter_from_arena. Falling back.", e)
+        _fn_arena = None
+    return _fn_arena

@@ -324,6 +324,14 @@ class RoundKVStore:
         self._lru_enabled = (
             os.environ.get("LICHT_ROUND_KV_LRU", "0") == "1")
         self._lru_store = None    # LruArenaStore, 由 _arena_init 设置
+        # 直读 kernel (arena host pinned -> paged, 无 GPU staging). prefill 端
+        # arena cudaHostRegister 后可用; 由 _setup_arena_direct 设置.
+        self._arena_direct_fn = None      # licht_scatter_from_arena callable
+        self._arena_direct_layer_ptrs = None  # int64 GPU [nL] paged data_ptr
+        self._arena_direct_P = 0          # prod(rest)
+        self._arena_direct_NBLK = 0       # blocks per layer
+        # LRU 直读 load 的 pipelined GPU timing (上一波 load 的 event, 下波读)
+        self._lru_pipe_ev = None
 
     # ------------------------------------------------------------------
     # Wiring
@@ -455,12 +463,18 @@ class RoundKVStore:
                     wait_timeout_s=60.0)
                 self._lru_store.bind_data_writer(self._lru_data_writer)
                 self._arena_mapped = True
+                # 直读 kernel: 仅 producer (register=True, arena cudaHostRegister
+                # 过) 能用. consumer 端 arena 没 register, GPU 不能直读 host ptr,
+                # 走 fallback 逐请求路径.
+                if register:
+                    self._setup_arena_direct()
                 logger.info(
                     "round-kv LRU arena bound (role=%s, num_slots=%d, "
-                    "slot_bytes=%.2fMB, free=%d)",
+                    "slot_bytes=%.2fMB, free=%d, direct_kernel=%s)",
                     "producer" if register else "consumer",
                     self._num_slots, self._slot_bytes / 1e6,
-                    self._lru_store.free_count())
+                    self._lru_store.free_count(),
+                    self._arena_direct_fn is not None)
                 return
             except Exception as e:
                 logger.warning(
@@ -577,8 +591,62 @@ class RoundKVStore:
         finally:
             handle.release()
 
+    def _setup_arena_direct(self) -> None:
+        """准备直读 kernel: 拿 licht_scatter_from_arena callable + 预算 layer_ptrs
+        (每层 paged tensor 的 data_ptr) + P/NBLK. 任一前提不满足 (dtype 非 2 字节 /
+        P%8!=0 / kernel 未编译) 则 _arena_direct_fn=None, load 走 fallback."""
+        import torch
+        try:
+            from vllm.v1.core.sched.licht_v3.fused_scatter import (
+                get_arena_scatter)
+            fn = get_arena_scatter()
+            if fn is None:
+                self._arena_direct_fn = None
+                return
+            layer_names = list(self._kv_caches.keys())
+            layers = [(self._kv_caches[ln][0]
+                       if isinstance(self._kv_caches[ln], (list, tuple))
+                       else self._kv_caches[ln]) for ln in layer_names]
+            P = 1
+            for x in self._arena_rest:
+                P *= int(x)
+            if layers[0].element_size() != 2 or P % 8 != 0:
+                logger.warning(
+                    "round-kv DIRECT: unsupported (elem=%dB P=%d); LRU load "
+                    "falls back to per-request path",
+                    layers[0].element_size(), P)
+                self._arena_direct_fn = None
+                return
+            # NBLK = 每层 paged tensor 的 block 维大小
+            self._arena_direct_NBLK = int(
+                layers[0].shape[1 if self._arena_dim == 1 else 0])
+            self._arena_direct_P = int(P)
+            self._arena_direct_layer_ptrs = torch.tensor(
+                [int(l.data_ptr()) for l in layers], dtype=torch.int64,
+                device=self._device)
+            self._arena_direct_layers = layers   # keep refs alive
+            self._arena_direct_fn = fn
+            logger.info(
+                "round-kv DIRECT arena scatter ON: nL=%d P=%d NBLK=%d dim=%d "
+                "arena_host=0x%x",
+                len(layers), self._arena_direct_P, self._arena_direct_NBLK,
+                self._arena_dim, self._arena_addr)
+        except Exception as e:  # pragma: no cover
+            logger.warning("round-kv DIRECT setup failed: %s; per-request "
+                           "fallback", e)
+            self._arena_direct_fn = None
+
     def _load_batch_arena_lru(self, items: list) -> list:
-        """LRU 版 batch load: 逐请求调 _load_request_arena_lru."""
+        """LRU 版 batch load.
+
+        优先走直读 kernel (arena host pinned -> paged, 无 GPU staging, 一次
+        launch). 不可用时 fallback 到逐请求路径.
+        """
+        if not items:
+            return []
+        if self._arena_direct_fn is not None:
+            return self._load_batch_arena_lru_direct(items)
+        # fallback: 逐请求 (consumer 端 / kernel 不可用)
         results = []
         for (job_id, dst_block_ids, src_block_offset) in items:
             try:
@@ -589,6 +657,85 @@ class RoundKVStore:
                                str(job_id)[:32], e)
                 ok = False
             results.append(ok)
+        return results
+
+    def _load_batch_arena_lru_direct(self, items: list) -> list:
+        """直读 kernel 路径: 一波 admit 请求一次性 resolve+pin -> 一次 H2D 索引
+        -> 一次 kernel launch (arena host pinned 直接 PCIe 读 + 散写 paged) ->
+        post-load gen 校验 -> unpin. 无 GPU staging buffer, 无 per-layer 循环."""
+        import torch
+        n_items = len(items)
+        # 上一波的 GPU 计时 (event 此时已完成, 不 sync 不阻塞)
+        if self._lru_pipe_ev is not None:
+            try:
+                _e0, _e1, _gb = self._lru_pipe_ev
+                _gpu = _e0.elapsed_time(_e1)
+                logger.info(
+                    "round-kv LRU DIRECT gpu(prev): %.2fGB scatter_ms=%.1f "
+                    "(%.1f GB/s, async)", _gb, _gpu,
+                    (_gb / (_gpu / 1e3)) if _gpu else 0.0)
+            except Exception:  # pragma: no cover
+                pass
+            self._lru_pipe_ev = None
+
+        _t0 = time.time()
+        # 1) 一次性 resolve + pin 整波
+        bh = self._lru_store.load_batch_pin(items)
+        results = list(bh.per_item_ok)
+        nblk = len(bh.slot_ids)
+        if nblk == 0:
+            return results
+        gb = nblk * self._slot_bytes / 1e9
+        try:
+            # 2) 索引 H2D (一次, 小)
+            src_slots = torch.tensor(bh.slot_ids, dtype=torch.int64,
+                                     device=self._device)
+            dst_idx = torch.tensor(bh.dst_block_ids, dtype=torch.int64,
+                                   device=self._device)
+            # 3) 一次 kernel launch, 在 copy stream 上 (与 forward 尾巴并发)
+            lstream = (self._get_load_stream()
+                       if self._load_stream_scatter else None)
+            sctx = (torch.cuda.stream(lstream) if lstream is not None
+                    else _nullctx())
+            e0 = e1 = None
+            with sctx:
+                if lstream is not None:
+                    e0 = torch.cuda.Event(enable_timing=True)
+                    e0.record(lstream)
+                self._arena_direct_fn(
+                    int(self._arena_addr), src_slots, dst_idx,
+                    self._arena_direct_layer_ptrs,
+                    nblk, self._arena_nL, self._arena_dim,
+                    self._arena_direct_NBLK, self._arena_direct_P)
+                if lstream is not None:
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e1.record(lstream)
+            if lstream is not None:
+                # forward (default stream) 等 copy stream 的 scatter 完成
+                ev = torch.cuda.Event()
+                ev.record(lstream)
+                torch.cuda.current_stream().wait_event(ev)
+                if e0 is not None and e1 is not None:
+                    self._lru_pipe_ev = (e0, e1, gb)
+            else:
+                # 无独立 copy stream: 在当前 stream 上, 需要 sync 保证 KV 就位
+                torch.cuda.current_stream().synchronize()
+
+            # 4) post-load gen 校验 (race 检测). 几乎不触发 (pin 保护).
+            if not bh.post_load_validate():
+                logger.warning("round-kv LRU DIRECT post-load validation "
+                               "FAILED (race); some blocks may be stale")
+        except Exception as e:  # pragma: no cover
+            logger.warning("round-kv LRU DIRECT load failed: %s", e)
+            results = [False] * n_items
+        finally:
+            bh.release()
+
+        logger.info(
+            "round-kv LOAD lru-direct: reqs=%d blocks=%d fail=%d GB=%.2f "
+            "engine_block_ms=%.0f (host-pinned arena -> paged, no staging)",
+            n_items, nblk, sum(1 for r in results if not r), gb,
+            (time.time() - _t0) * 1000.0)
         return results
 
     def _delete_lru(self, job_id: str) -> None:

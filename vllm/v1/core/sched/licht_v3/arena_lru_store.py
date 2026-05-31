@@ -104,6 +104,34 @@ class LoadHandle:
         return True
 
 
+@dataclass
+class BatchLoadHandle:
+    """load_batch_pin 返回. 一整波 admit 请求的展平 slot/dst/gen + pin 地址.
+
+    调用者把 (slot_ids, dst_block_ids) 喂直读 kernel, 完成后必须 release().
+    """
+    per_item_ok: List[bool]        # 每个请求是否成功解析+pin
+    slot_ids: List[int]             # 所有成功请求的 block 的 arena slot (展平)
+    dst_block_ids: List[int]        # 对应目标 paged block 号 (同序)
+    gens: List[int]                 # 对应 gen (post-load 校验)
+    slot_state_addrs: List[int]     # 已 pin 的 slot_state 地址
+    _released: bool = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        for addr in self.slot_state_addrs:
+            _atomic.unpin(addr)
+        self._released = True
+
+    def post_load_validate(self) -> bool:
+        """整波 load 完后再校验所有 pin 的 slot 的 gen (race 检测)."""
+        for addr, expected_gen in zip(self.slot_state_addrs, self.gens):
+            if _atomic.get_gen(addr) != expected_gen:
+                return False
+        return True
+
+
 # ============================================================
 # Main class
 # ============================================================
@@ -535,6 +563,47 @@ class LruArenaStore:
             slot_ids=slot_ids,
             gens=gens,
             dst_block_ids=all_dst,
+        )
+
+    def load_batch_pin(self, items: list) -> "BatchLoadHandle":
+        """Batch 版 load: 解析一整波 admit 请求, 把所有 block 的
+        (slot_id, gen, dst_block) 收集到一起并逐 slot try_pin.
+
+        items: [(job_id, dst_block_ids, src_block_offset), ...]
+
+        返回 BatchLoadHandle, 含:
+          - per_item_ok: [bool] 每个请求是否成功 (miss/race -> False)
+          - slot_ids / dst_block_ids / gens: 所有成功请求的 block 展平 (同序)
+          - state_addrs: 已 pin 的 slot_state 地址 (release 用)
+        调用者用 slot_ids + dst_block_ids 喂直读 kernel, 完成后 release().
+
+        设计: 一次解析整波 -> 一次性把 src_slots/dst 交给 GPU kernel, 避免逐
+        请求的 Python/CUDA 往返. pin 保证 load 期间 evict 不动这些 slot.
+        """
+        n_items = len(items)
+        per_item_ok = [False] * n_items
+        all_slot_ids: List[int] = []
+        all_dst: List[int] = []
+        all_gens: List[int] = []
+        all_addrs: List[int] = []
+        for k, (job_id, dst_block_ids, src_block_offset) in enumerate(items):
+            # 复用单请求 load_request 的解析 + pin (它内部已处理 coverage gap、
+            # gen 校验、try_pin 回滚). 成功则把它的 slot/gen/dst 并入大数组.
+            handle = self.load_request(
+                str(job_id), list(dst_block_ids), int(src_block_offset))
+            if handle is None:
+                continue
+            per_item_ok[k] = True
+            all_slot_ids.extend(handle.slot_ids)
+            all_dst.extend(handle.dst_block_ids)
+            all_gens.extend(handle.gens)
+            all_addrs.extend(handle.slot_state_addrs)
+        return BatchLoadHandle(
+            per_item_ok=per_item_ok,
+            slot_ids=all_slot_ids,
+            dst_block_ids=all_dst,
+            gens=all_gens,
+            slot_state_addrs=all_addrs,
         )
 
     # ============================================================

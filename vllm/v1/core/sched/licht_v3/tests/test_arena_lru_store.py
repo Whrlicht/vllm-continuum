@@ -620,3 +620,89 @@ class TestGroupHConcurrentWrite:
             assert 0 <= fc <= 300, f"free_count corrupted: {fc}"
         finally:
             store.close()
+
+
+# ============================================================
+# Group I - load_batch_pin (直读 kernel 的 CPU 侧: batch resolve+pin)
+# ============================================================
+
+class TestGroupIBatchLoadPin:
+    def test_batch_pin_basic(self, store_and_arena):
+        """多请求 batch resolve+pin: 展平 slot/dst/gen 正确, per_item_ok 正确."""
+        store, arena = store_and_arena
+        # 写 3 个 job, 各 3 block
+        for j in range(3):
+            tokens = _make_tokens(48, seed=j)
+            store.write_inc(f"job{j}", 0, 3, tokens,
+                            _block_data(f"job{j}", 0, 3))
+        # batch load: job0 前 2 block, job1 全 3, job2 前 1
+        items = [
+            ("job0", [100, 101], 0),
+            ("job1", [200, 201, 202], 0),
+            ("job2", [300], 0),
+        ]
+        bh = store.load_batch_pin(items)
+        try:
+            assert bh.per_item_ok == [True, True, True]
+            # 展平: 2 + 3 + 1 = 6 block
+            assert len(bh.slot_ids) == 6
+            assert len(bh.dst_block_ids) == 6
+            assert len(bh.gens) == 6
+            assert len(bh.slot_state_addrs) == 6
+            # dst 顺序 = job0[100,101] + job1[200,201,202] + job2[300]
+            assert bh.dst_block_ids == [100, 101, 200, 201, 202, 300]
+            # 所有 pin 的 slot gen 校验通过
+            assert bh.post_load_validate() is True
+            # arena 数据正确 (slot_ids 对应 block 内容)
+            expected = (_block_data("job0", 0, 3)[:2]
+                        + _block_data("job1", 0, 3)
+                        + _block_data("job2", 0, 3)[:1])
+            actual = [arena.read(sid) for sid in bh.slot_ids]
+            assert actual == expected
+        finally:
+            bh.release()
+
+    def test_batch_pin_partial_miss(self, store_and_arena):
+        """部分请求 miss (job 不存在 / prompt 不匹配): per_item_ok 标 False,
+        成功的仍正确展平."""
+        store, arena = store_and_arena
+        tokens = _make_tokens(48, seed=1)
+        store.write_inc("jobA", 0, 3, tokens, _block_data("jobA", 0, 3))
+        items = [
+            ("jobA", [100, 101, 102], 0),   # hit
+            ("nonexistent", [200], 0),       # miss
+        ]
+        bh = store.load_batch_pin(items)
+        try:
+            assert bh.per_item_ok == [True, False]
+            # 只有 jobA 的 3 block 被 pin
+            assert len(bh.slot_ids) == 3
+            assert bh.dst_block_ids == [100, 101, 102]
+        finally:
+            bh.release()
+
+    def test_batch_pin_release_unpins_all(self, store_and_arena):
+        """release 后所有 slot 的 pin 归零 (可被 evict)."""
+        store, arena = store_and_arena
+        tokens = _make_tokens(48, seed=1)
+        store.write_inc("jobA", 0, 3, tokens, _block_data("jobA", 0, 3))
+        bh = store.load_batch_pin([("jobA", [100, 101, 102], 0)])
+        slot_ids = list(bh.slot_ids)
+        import licht_arena_atomic as A
+        # pin 期间 can_evict 应为 False
+        for sid in slot_ids:
+            assert A.get_pin(store._hdr.slot_state_addr(sid)) == 1
+        bh.release()
+        # release 后 pin 归零
+        for sid in slot_ids:
+            assert A.get_pin(store._hdr.slot_state_addr(sid)) == 0
+
+    def test_batch_pin_empty(self, store_and_arena):
+        """空 items / 全 miss: 不崩, 返回空."""
+        store, _ = store_and_arena
+        bh = store.load_batch_pin([])
+        try:
+            assert bh.per_item_ok == []
+            assert bh.slot_ids == []
+        finally:
+            bh.release()
