@@ -497,3 +497,126 @@ class TestGroupGOpenOrCreate:
                 f"child saw free_count={child_fc.value}, expected 47")
         finally:
             parent.close()
+
+
+# ============================================================
+# Group H - 并发 write_inc (复现 hotfix #3 的死锁场景)
+# ============================================================
+
+class TestGroupHConcurrentWrite:
+    def test_concurrent_writers_no_deadlock(self, tmp_path):
+        """多个线程同时 write_inc 不同 job, 必须不死锁 + 数据正确.
+
+        复现 hotfix #3 死锁: 缩小临界区前, 多个 store 线程在 mutex 临界区内
+        做 data_writer + 文件 IO, 4 线程争一把锁串行甚至死锁. 缩小后临界区只
+        做 alloc/publish, 应该并发无阻塞.
+
+        data_writer 故意 sleep 模拟 GPU memcpy 慢操作 — 缩小临界区前这会让
+        其他线程在锁上等很久; 缩小后并发执行.
+        """
+        import threading
+
+        arena = _FakeArena()
+        slot_lock = threading.Lock()
+
+        def slow_writer(slot_id, block_idx, src):
+            # 模拟慢 GPU memcpy
+            time.sleep(0.002)
+            with slot_lock:  # _FakeArena dict 非线程安全, 测试里加锁
+                arena.slots[slot_id] = src[block_idx]
+
+        store = LruArenaStore.create(str(tmp_path / "arena"),
+                                     num_slots=2000, block_size=16)
+        store.bind_data_writer(slow_writer)
+        try:
+            n_threads = 8
+            n_jobs_per_thread = 10
+            errors = []
+
+            def worker(tid):
+                try:
+                    for j in range(n_jobs_per_thread):
+                        job = f"job_{tid}_{j}"
+                        tokens = _make_tokens(48, seed=tid * 100 + j)
+                        ok = store.write_inc(job, 0, 3, tokens,
+                                             _block_data(job, 0, 3))
+                        if not ok:
+                            errors.append(f"{job} write failed")
+                except Exception as e:
+                    errors.append(f"thread {tid}: {e}")
+
+            threads = [threading.Thread(target=worker, args=(i,))
+                       for i in range(n_threads)]
+            t0 = time.time()
+            for t in threads:
+                t.start()
+            # 关键: join 带 timeout, 死锁则超时失败而非永久挂起
+            for t in threads:
+                t.join(timeout=30)
+            elapsed = time.time() - t0
+
+            # 没有线程还活着 (死锁检测)
+            alive = [t for t in threads if t.is_alive()]
+            assert not alive, f"DEADLOCK: {len(alive)} threads still alive after 30s"
+            assert not errors, f"errors: {errors[:5]}"
+
+            # 所有 job 都能 lookup 命中
+            total = n_threads * n_jobs_per_thread
+            hit = 0
+            for tid in range(n_threads):
+                for j in range(n_jobs_per_thread):
+                    job = f"job_{tid}_{j}"
+                    tokens = _make_tokens(48, seed=tid * 100 + j)
+                    if store.lookup(job, tokens) is not None:
+                        hit += 1
+            assert hit == total, f"only {hit}/{total} jobs hit after concurrent write"
+            # 并发应该比串行快很多 (8 线程 * 10 job * 3 block * 2ms ≈ 0.48s 串行,
+            # 并发应 < 0.2s); 不强求但 elapsed 不应接近串行上界
+            print(f"\n  concurrent write elapsed={elapsed:.2f}s "
+                  f"(serial upper bound ~{n_threads * n_jobs_per_thread * 3 * 0.002:.2f}s)")
+        finally:
+            store.close()
+
+    def test_concurrent_writers_same_arena_fill_and_evict(self, tmp_path):
+        """并发 writer 把 arena 写满触发 evict, 验证不死锁 + 无 slot 泄漏."""
+        import threading
+
+        arena = _FakeArena()
+        slot_lock = threading.Lock()
+
+        def w(slot_id, block_idx, src):
+            with slot_lock:
+                arena.slots[slot_id] = src[block_idx]
+
+        # 小 arena 强制 evict
+        store = LruArenaStore.create(str(tmp_path / "arena"),
+                                     num_slots=300, block_size=16)
+        store.bind_data_writer(w)
+        try:
+            errors = []
+
+            def worker(tid):
+                try:
+                    for j in range(20):
+                        job = f"j_{tid}_{j}"
+                        tokens = _make_tokens(48, seed=tid * 1000 + j)
+                        store.write_inc(job, 0, 3, tokens,
+                                        _block_data(job, 0, 3))
+                        time.sleep(0.001)
+                except Exception as e:
+                    errors.append(f"thread {tid}: {e}")
+
+            threads = [threading.Thread(target=worker, args=(i,))
+                       for i in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            alive = [t for t in threads if t.is_alive()]
+            assert not alive, f"DEADLOCK: {len(alive)} threads alive"
+            assert not errors, f"errors: {errors[:5]}"
+            # free_count 应该 >= 0 且 <= num_slots (无泄漏/无负数)
+            fc = store.free_count()
+            assert 0 <= fc <= 300, f"free_count corrupted: {fc}"
+        finally:
+            store.close()

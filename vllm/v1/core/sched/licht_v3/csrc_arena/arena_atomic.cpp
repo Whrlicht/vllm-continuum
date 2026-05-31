@@ -171,7 +171,16 @@ static int py_mutex_destroy(uint64_t addr) {
     return arena_mutex_destroy(reinterpret_cast<pthread_mutex_t*>(addr));
 }
 static int py_mutex_lock(uint64_t addr) {
-    return arena_mutex_lock(reinterpret_cast<pthread_mutex_t*>(addr));
+    // 必须 release GIL: pthread_mutex_lock 会阻塞 (等其他线程/进程释放锁).
+    // 若持 GIL 阻塞, 持锁线程拿不到 GIL 跑不完临界区, 死锁 (整个解释器冻结).
+    // 这是单进程多 store 线程下的核心正确性要求.
+    pthread_mutex_t* m = reinterpret_cast<pthread_mutex_t*>(addr);
+    int rc;
+    {
+        py::gil_scoped_release release;
+        rc = arena_mutex_lock(m);
+    }
+    return rc;
 }
 static int py_mutex_unlock(uint64_t addr) {
     return arena_mutex_unlock(reinterpret_cast<pthread_mutex_t*>(addr));

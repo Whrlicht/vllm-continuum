@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -119,6 +120,12 @@ class LruArenaStore:
 
         # in-memory caches
         self._last_stored: dict[str, int] = {}
+        # in-memory LRU: job_id -> None, OrderedDict 保序 (最老在前, 最新在后).
+        # evict 选 victim 直接从这里取最老, O(1), 避免在临界区内扫文件系统
+        # (os.listdir + 每 job os.stat manifest mtime, O(jobs), 写满后会塌方).
+        # 本进程 store 过的 job 都在这里; 跨进程对方写的 job 不在 (各 evict 各的,
+        # bitmap 共享所以不会重分配, gen 失效保证 lookup 正确性).
+        self._job_lru: "OrderedDict[str, None]" = OrderedDict()
 
         # 数据搬运钩子 (由调用者注入)
         # data_writer(slot_id, block_idx_in_gathered, gathered): 把 gathered[block_idx]
@@ -307,9 +314,16 @@ class LruArenaStore:
         返回:
             True 成功, False 失败 (空间不够 / writer 未绑定)
 
-        要求:
-            - 调用者已经在外面持锁吗? NO! 本方法内部自己拿 alloc_mutex.
-              (调用方不需要持锁, 也不应该持锁)
+        临界区设计 (修复死锁):
+            mutex 临界区只做 alloc/evict (快, ~10us). 慢操作 (GPU memcpy +
+            .slot/manifest 文件 IO) 全在锁外做. 把 4 个 store 线程 + prefill
+            进程从争一把持锁 ~200ms 的锁, 缩到争 ~10us.
+
+            正确性: alloc 后 slot 被 bitmap 标 used (其他进程 alloc 不会再拿),
+            但 gen 还没 bump -> reader try_pin 会因 gen 不匹配而 miss, 看不到
+            半写状态. 数据写完 + .slot 落盘后, 第二段临界区 bump gen 发布,
+            此刻 reader 才能 pin 成功. manifest 最后写 (它是 lookup 的 LCP 依据,
+            必须在 .slot 之后, 否则 lookup 命中但 .slot 还没落盘).
         """
         if end_block <= start_block:
             return True  # 无 inc 需要写
@@ -318,17 +332,15 @@ class LruArenaStore:
             logger.warning("write_inc: data_writer not bound, skipping")
             return False
 
+        # ---- 临界区 1: alloc (+ evict if needed), 拿到 slot_ids ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
         if rc == _atomic.errno_eownerdead():
-            # 上一持锁进程崩溃, recover 后继续
             _atomic.mutex_recover(self._hdr.mutex_addr)
-            # 重 sync allocator (bitmap 状态可能不一致)
             self._allocator.sync_from_bitmap()
         elif rc != 0:
             logger.warning("write_inc: mutex_lock failed rc=%d", rc)
             return False
         try:
-            # 1. alloc N slots, 不够则 evict
             slot_ids = self._allocator.alloc_n(n_blocks)
             if slot_ids is None:
                 need = n_blocks - self._allocator.free_count
@@ -341,32 +353,63 @@ class LruArenaStore:
                         "write_inc: alloc failed even after evict (job=%s n=%d)",
                         job_id, n_blocks)
                     return False
+        finally:
+            _atomic.mutex_unlock(self._hdr.mutex_addr)
 
-            # 2. 写数据 (调用者注入的钩子)
+        # slot_ids 此刻已被 bitmap 标 used (其他进程不会再 alloc 到), 但 gen
+        # 未 bump (reader 看不到). 下面慢操作全在锁外做.
+        try:
+            # ---- 锁外: 写数据 (GPU memcpy, 慢) ----
             for i, slot_id in enumerate(slot_ids):
                 self._data_writer(slot_id, i, source_obj)
 
-            # 3. 发布 gen + 准备 .slot records
+            # ---- 锁外: 准备 records (gen = 当前 gen + 1, 但还没发布) ----
             records: List[Tuple[int, int]] = []
             for slot_id in slot_ids:
-                state_addr = self._hdr.slot_state_addr(slot_id)
-                cur_gen = _atomic.get_gen(state_addr)
-                new_gen = cur_gen + 1
-                _atomic.publish_slot(state_addr, new_gen)
-                records.append((slot_id, new_gen))
+                cur_gen = _atomic.get_gen(self._hdr.slot_state_addr(slot_id))
+                records.append((slot_id, cur_gen + 1))
 
-            # 4. 写 .slot 文件
+            # ---- 锁外: 写 .slot 文件 (IO) ----
             slot_path = self._slot_path(job_id, start_block, end_block)
             write_slot_file_v1(slot_path, records)
+        except Exception as e:
+            # 写失败: 回滚 — 把 slot 还回 free pool (临界区内), 不发布 gen
+            logger.warning("write_inc: data/slot write failed job=%s: %s",
+                           job_id, e)
+            rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+            if rc in (0, _atomic.errno_eownerdead()):
+                if rc == _atomic.errno_eownerdead():
+                    _atomic.mutex_recover(self._hdr.mutex_addr)
+                    self._allocator.sync_from_bitmap()
+                try:
+                    self._allocator.free_n(slot_ids)
+                finally:
+                    _atomic.mutex_unlock(self._hdr.mutex_addr)
+            return False
 
-            # 5. 重写 manifest (mtime 自动更新 → LRU 自动提权)
-            self._write_manifest(job_id, end_block, token_ids[:end_block * self._block_size])
-
-            # 6. in-memory 状态
-            self._last_stored[job_id] = end_block
-            return True
+        # ---- 临界区 2: 发布 gen (让 reader 可见), 快 ----
+        rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if rc == _atomic.errno_eownerdead():
+            _atomic.mutex_recover(self._hdr.mutex_addr)
+            self._allocator.sync_from_bitmap()
+        elif rc != 0:
+            logger.warning("write_inc: mutex_lock(publish) failed rc=%d", rc)
+            return False
+        try:
+            for (slot_id, new_gen) in records:
+                _atomic.publish_slot(self._hdr.slot_state_addr(slot_id),
+                                     new_gen)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
+
+        # ---- 锁外: 重写 manifest (mtime 自动更新 → LRU 提权).
+        # manifest 必须在 gen 发布之后写: lookup 用 manifest 的 token_ids 算
+        # LCP, 然后校验每 inc 的 gen. gen 已发布, 所以 lookup 命中即可用. ----
+        self._write_manifest(
+            job_id, end_block, token_ids[:end_block * self._block_size])
+        self._last_stored[job_id] = end_block
+        self._touch_job_lru(job_id)   # 移到 LRU 末尾 (最新)
+        return True
 
     # ============================================================
     # LOOKUP (lock-free)
@@ -525,8 +568,21 @@ class LruArenaStore:
 
     def _pick_lru_victim(self,
                         exclude: Iterable[str]) -> Optional[str]:
-        """扫所有 job 的 manifest mtime, 返回最老的 (不在 exclude 内)."""
+        """返回最老的 job (不在 exclude 内).
+
+        优先用内存 LRU (_job_lru, OrderedDict, 最老在前) — O(待排除数), 不碰
+        文件系统. 这是临界区内 evict 的热路径, 必须快 (旧版扫 os.listdir +
+        每 job os.stat manifest mtime, 写满后 O(jobs) 文件 IO 在锁内塌方).
+
+        内存 LRU 选不出时 (本进程没 store 过任何 job, 但 bitmap 满 — 例如
+        全是对方进程写的), 兜底扫一次文件系统 mtime.
+        """
         exclude_set = set(exclude)
+        # 热路径: 内存 LRU, 最老在前
+        for jid in self._job_lru:
+            if jid not in exclude_set:
+                return jid
+        # 兜底: 文件系统扫描 (罕见 — 本进程内存 LRU 为空但仍需 evict)
         candidates: List[Tuple[float, str]] = []
         for job in self._list_jobs():
             if job in exclude_set:
@@ -541,20 +597,40 @@ class LruArenaStore:
         candidates.sort()
         return candidates[0][1]
 
+    def _touch_job_lru(self, job_id: str) -> None:
+        """write_inc 成功后调用: 把 job 移到 LRU 末尾 (最新)."""
+        self._job_lru[job_id] = None
+        self._job_lru.move_to_end(job_id)
+
+    def _drop_job_lru(self, job_id: str) -> None:
+        self._job_lru.pop(job_id, None)
+
     def _evict_job_tail_first(self, job_id: str,
                               max_need: int) -> int:
         """从该 job 尾巴 inc 开始释放 slot, 直到释放够 max_need 或 inc 用完.
 
         返回实际释放数.
+
+        并发安全 (配合缩小后的 write_inc 临界区): write_inc 先写 .slot 文件,
+        最后才写 manifest. 一个 end > manifest.total_blocks 的 inc 说明它正在
+        被某个 writer 写 (还没提交). 我们用 manifest.total_blocks 作为"已提交
+        边界", 只 evict end <= committed 的 inc, 跳过未提交的 inc, 避免淘到正在
+        写的 slot.
         """
         incs = self._list_incs(job_id)
         if not incs:
             return 0
+        # 已提交边界: 没有 manifest 视为 0 (整个 job 都是未提交的, 全跳过)
+        manifest = self._read_manifest(job_id)
+        committed = int(manifest.get("total_blocks", 0)) if manifest else 0
         released = 0
         # 反向遍历 (tail first)
         for (s, e, path) in reversed(incs):
             if released >= max_need:
                 break
+            if e > committed:
+                # 未提交的 inc (正在被 writer 写), 跳过, 不能淘
+                continue
             sf = read_slot_file_v1(path)
             if sf is None:
                 # 损坏的 .slot, 直接删
@@ -566,6 +642,10 @@ class LruArenaStore:
             slots_freed_here: List[int] = []
             slots_left_pinned: List[int] = []
             for (slot_id, _gen) in sf.records:
+                # 已经 free 的 slot 跳过 (防止跨进程/stale LRU 重复 free 把
+                # free_count 加错: 对方进程可能已 evict 过这个 job 的 slot).
+                if self._allocator.is_free(slot_id):
+                    continue
                 addr = self._hdr.slot_state_addr(slot_id)
                 if _atomic.can_evict(addr):
                     _atomic.evict_slot(addr)
@@ -588,6 +668,19 @@ class LruArenaStore:
                         os.unlink(path)
                     except OSError:
                         pass
+        # 如果该 job 已被淘空 (没有 .slot 文件了), 从内存 LRU + 文件系统清理.
+        # 关键: 不清理的话, 空壳 job 留在 _job_lru 最前 (最老), 下次 evict 又
+        # 选到它, _list_incs + _read_manifest 文件 IO 空转 -> O(空壳) 退化.
+        if released > 0 and not self._list_incs(job_id):
+            self._drop_job_lru(job_id)
+            self._last_stored.pop(job_id, None)
+            try:
+                mp = self._manifest_path(job_id)
+                if os.path.exists(mp):
+                    os.unlink(mp)
+                os.rmdir(self._job_dir(job_id))
+            except OSError:
+                pass
         return released
 
     def _rewrite_manifest_for_self_heal(self, job_id: str,
@@ -621,6 +714,9 @@ class LruArenaStore:
                 if sf is not None:
                     slot_ids_freed = []
                     for (slot_id, _) in sf.records:
+                        # 跳过已 free 的 (防重复 free)
+                        if self._allocator.is_free(slot_id):
+                            continue
                         addr = self._hdr.slot_state_addr(slot_id)
                         if _atomic.can_evict(addr):
                             _atomic.evict_slot(addr)
@@ -639,6 +735,7 @@ class LruArenaStore:
             except OSError:
                 pass
             self._last_stored.pop(job_id, None)
+            self._drop_job_lru(job_id)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
 
