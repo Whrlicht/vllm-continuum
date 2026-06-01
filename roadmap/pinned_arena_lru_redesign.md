@@ -1132,3 +1132,48 @@ writer 每次修改 entry 都先 `epoch++` 再改字段再 `epoch++`，使奇数
 
 **文档版本**：v1.0（2026-05-29 初稿）
 **状态**：设计定稿，待动手实施
+
+---
+
+## 待查问题（暂放，arena 改造完成后处理）
+
+### idle_ms 偏高 — 调度/桥接层，非 arena
+- 现象: 请求已 arriving（日志可见），但 Running=0 Waiting=0，引擎空转 ~4.5s 才开始 load
+  - 20:48:47 大批请求 arriving
+  - 20:48:48 Running=0 reqs, Waiting=0 reqs  (到了但没跑没排队)
+  - 20:48:55 STEP idle_ms=4581
+- 判断: 不是"没请求"(请求明明到了), 也不是 arena load 慢 (load_ms=1626 正常, GPU 24.6 GB/s)
+- 怀疑(按可能性):
+  1. BRIDGE/decode 反压: prefill 等 decode 收走上一波 KV (NCCL 桥接阻塞)
+  2. scheduler admit 节流: LICHT timeline gate 挡着, 请求 arriving 后没进 waiting
+  3. proxy -> engine 之间排队
+- 与 arena LRU / load 路径无关, 独立问题
+- 优先级: 低于 Stage 3/4, 等 arena 改造收尾后查
+
+---
+
+## Stage 4 完成记录 (2026-06-01)
+
+### Phase 2 (admission gate) - GPU 端到端验证通过
+两次生产跑 (LICHT_PHASE2_GATE_THRESHOLD=0.30, --round-kv-lru):
+- 写侧 (prefill 当 arena writer, 新场景): 146 sink = 146 enqueued = 143 D2H done,
+  135 次 prefill LRU write_inc. 计数自洽.
+- 读侧 (decode 从 arena 读回): 146 admit-from-arena, 93 consumer load ok=1
+  (差额为正常调度时序).
+- 跨进程双 writer (prefill 135 + decode 多轮): 0 冲突.
+- 0 race, 0 crash, 0 alloc-fail, 0 deadlock.
+
+### 发现并修复的真 bug
+1. alloc_n 跨进程 free_count 缓存失真 (commit 2c850b1): 改为直接扫共享 bitmap.
+2. consumer-load gate bug (commit 95243ce): decode 读回 arena 的 load 之前只在
+   phase1 开关下触发, Phase-2-only 部署会导致 sink 的 KV 永远读不回. 改为
+   (phase1 OR phase2).
+
+### Phase 1 (save-on-preempt) - 代码完成, 未实跑触发 (默认成功)
+- 代码审查: save_preempted_sync 时序在 LRU 下安全 (gather 完才 mark_done).
+- 未触发: 抢占在 Phase 2 准入门槛下本来就少, decode KV 峰值 ~63% 没满到抢占.
+- 用户决定: 先默认成功, 全量跑遇到再验证. 风险低 (路径与 Phase 2 写/读共用).
+
+### stale-pin 清理 - 评估后降级不做
+- 进程崩=重启=清空 arena 无累积; load 异常有 finally release 兜底.
+- 真正泄漏只剩代码 bug 靠测试抓. 优先级低暂不做.
