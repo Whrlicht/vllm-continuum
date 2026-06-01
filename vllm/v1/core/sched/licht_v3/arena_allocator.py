@@ -58,8 +58,18 @@ class ArenaAllocator:
 
     @property
     def free_count(self) -> int:
-        """缓存的空闲 slot 数. 必须在持有 alloc_mutex 时查询保证准确."""
+        """本进程视角的空闲 slot 近似数 (日志/监控用).
+
+        警告: 跨进程双 writer (Phase 2) 下不准 — 只累计本进程的 alloc/free,
+        看不到对方进程的操作. alloc_n 已不依赖它做决策 (直接扫共享 bitmap).
+        需要准确值用 count_free_accurate().
+        """
         return self._free_count
+
+    def count_free_accurate(self) -> int:
+        """实时扫共享 bitmap 得到准确的空闲 slot 数 (跨进程真相).
+        O(num_slots/64) popcount; 需持 alloc_mutex 保证扫描期间 bitmap 不变."""
+        return self._hdr.count_free()
 
     @property
     def num_slots(self) -> int:
@@ -69,21 +79,25 @@ class ArenaAllocator:
     # Alloc / Free (必须持 alloc_mutex)
     # ============================================================
     def alloc_n(self, n: int) -> List[int] | None:
-        """First-fit 扫 bitmap 找 n 个 free slot.
+        """First-fit 扫共享 bitmap 找 n 个 free slot.
 
         成功: 把这些 slot 标 used, 返回 slot_id 列表
-        失败 (free 不够 n): 返回 None, 不做任何修改
+        失败 (扫完 bitmap 不够 n 个 free): 返回 None, 不做任何修改
+
+        正确性 (跨进程双 writer, 如 Phase 2 prefill+decode 同写 arena):
+          唯一真相源是共享 bitmap (受 alloc_mutex 保护). 本方法直接扫 bitmap
+          判断够不够 + 收集 slot_id, 不依赖进程本地的 _free_count 缓存 (该缓存
+          只反映本进程的 alloc/free, 看不到对方进程的操作, 双进程下必然失真).
+          扫描"找 slot 位置"本来就省不掉 (free_count 只知总数不知哪些 free),
+          所以把"够不够"判断合并进这次扫描零额外开销.
 
         注意: 不需要"连续"的 n 个 slot, 任意 n 个 free 都可以.
-              slot-paged 设计下 slot 间独立.
         """
         if n <= 0:
             return []
-        if n > self._free_count:
-            return None
 
         out: List[int] = []
-        # 扫 bitmap, 逐 word 处理
+        # 扫共享 bitmap, 逐 word 处理; 扫够 n 个即停 (不信本地缓存)
         for word_idx in range(self._n_words):
             if len(out) == n:
                 break
@@ -91,9 +105,7 @@ class ArenaAllocator:
             word = _atomic.atomic_load_u64(word_addr)
             if word == 0:
                 continue  # 全 used, 跳过
-            # 该 word 在全 bitmap 中覆盖 slot [word_idx*64, ...)
             base_slot = word_idx * 64
-            # 最后一个 word 可能不满 64
             n_bits = min(64, self._layout.num_slots - base_slot)
             for bit_idx in range(n_bits):
                 if (word >> bit_idx) & 1:
@@ -102,12 +114,14 @@ class ArenaAllocator:
                         break
 
         if len(out) < n:
-            # 这不应该发生 (free_count 说够), 表示状态错乱
+            # bitmap 里 free slot 真的不够 n 个 -> 上层应 evict 后重试.
+            # (此时 out 里的 slot 还没 mark used, 无需回滚.)
             return None
 
-        # 标记为 used
+        # 扫够了, 统一 mark used (失败已在上面 return, 不会半标记)
         for slot_id in out:
             self._hdr.bitmap_set_used(slot_id)
+        # _free_count 降级为本进程视角的近似计数 (日志/监控用, alloc 决策已不依赖它)
         self._free_count -= n
         return out
 

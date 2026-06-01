@@ -371,15 +371,20 @@ class LruArenaStore:
         try:
             slot_ids = self._allocator.alloc_n(n_blocks)
             if slot_ids is None:
-                need = n_blocks - self._allocator.free_count
+                # 不够 n_blocks 个 free slot -> evict. need 用准确的实时 bitmap
+                # 计数 (跨进程双 writer 下本地 free_count 缓存不准, 会把 need
+                # 算错导致 evict 不足).
+                accurate_free = self._allocator.count_free_accurate()
+                need = n_blocks - accurate_free
                 if not self._evict_until_free_locked(need,
                                                     exclude_job_id=job_id):
                     return False
                 slot_ids = self._allocator.alloc_n(n_blocks)
                 if slot_ids is None:
                     logger.warning(
-                        "write_inc: alloc failed even after evict (job=%s n=%d)",
-                        job_id, n_blocks)
+                        "write_inc: alloc failed even after evict (job=%s n=%d "
+                        "accurate_free=%d need=%d)",
+                        job_id, n_blocks, accurate_free, need)
                     return False
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
