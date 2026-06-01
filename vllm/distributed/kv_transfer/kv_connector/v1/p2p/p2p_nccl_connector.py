@@ -447,20 +447,29 @@ class P2pNcclConnector(KVConnectorBase_V1):
                             "ARENA_SINK send failed req=%s remote=%s: %s",
                             req_id, remote_addr, e)
 
-            # Phase 1 (save-on-preempt) consumer recovery: arena → GPU
-            # paged buffer for re-admitted preempt-saved requests.  Done
-            # BEFORE the NCCL pull loop so attention sees the prefix on
-            # this step.  Sync load (small per-request increment).
-            if (self._phase1_save_on_preempt
+            # Consumer recovery (Phase 1 save-on-preempt AND Phase 2
+            # admission-gate): arena → GPU paged buffer for re-admitted
+            # requests whose KV lives in arena.  Both phases register the
+            # request in _round_load_reqs (drained into metadata.round_load),
+            # so this load must fire if EITHER phase is on — not just phase 1.
+            # (Bug fix: previously gated on _phase1_save_on_preempt only, so
+            # Phase-2-only deployments never read the sunk KV back.)
+            # Done BEFORE the NCCL pull loop so attention sees the prefix this
+            # step.  Sync load (small per-request increment).
+            if ((self._phase1_save_on_preempt or self._phase2_admission_gate)
                     and self._round_kv_enabled and metadata.round_load
                     and self._round_store_obj is not None):
                 _items = [(rl.job_id, rl.block_ids, rl.src_block_offset)
                           for rl in metadata.round_load]
                 try:
-                    self._round_store_obj.load_batch(_items)
+                    _res = self._round_store_obj.load_batch(_items)
+                    logger.info(
+                        "consumer arena load_batch: reqs=%d ok=%d "
+                        "(Phase1/2 recovery, decode reads arena)",
+                        len(_items), sum(1 for r in _res if r))
                 except Exception as e:  # pragma: no cover
                     logger.warning(
-                        "Phase1 arena consumer load_batch failed: %s "
+                        "consumer arena load_batch failed: %s "
                         "(falling through to recompute path)", e)
 
             # LICHT round-kv: decode STOREs finished requests' full-seq KV
@@ -1167,6 +1176,12 @@ p2p_nccl_engine import get_fast_release_queue
                                     str(job_id), dst, local_hit_blocks)
                             self._arena_sinked.discard(
                                 request.request_id)
+                            logger.info(
+                                "Phase2 admit-from-arena req=%s job=%s "
+                                "matched_blocks=%d num_blocks=%d "
+                                "local_hit=%d (decode reads arena)",
+                                request.request_id, str(job_id)[:32],
+                                matched_blocks, num_blocks, local_hit_blocks)
                             return
                 # Lookup raced / failed -> fall through; drop the
                 # marker so a retry doesn't get stuck in the arena
