@@ -162,6 +162,10 @@ class LruArenaStore:
         # 我们不直接调 reader, 因为 reader 通常是批量 H2D
         self._data_writer: Optional[Callable[[int, int, object], None]] = None
 
+        # 诊断日志 (LICHT_ARENA_DEBUG=1): 打 write_inc/evict/load 的 slot/gen
+        # 细节, 用于验证 Phase 1/2 等路径下 LRU 真在工作且 slot/gen 对得上.
+        self._debug = os.environ.get("LICHT_ARENA_DEBUG", "0") == "1"
+
     # ============================================================
     # Lifecycle
     # ============================================================
@@ -445,6 +449,13 @@ class LruArenaStore:
         # LCP, 然后校验每 inc 的 gen. gen 已发布, 所以 lookup 命中即可用. ----
         self._write_manifest(
             job_id, end_block, token_ids[:end_block * self._block_size])
+        if self._debug:
+            logger.info(
+                "LRU-DBG write_inc job=%s [%d,%d) nslots=%d slot0=%d gen0=%d "
+                "acc_free=%d",
+                str(job_id)[:32], start_block, end_block, len(slot_ids),
+                slot_ids[0], records[0][1],
+                self._allocator.count_free_accurate())
         return True
 
     # ============================================================
@@ -603,6 +614,11 @@ class LruArenaStore:
             all_dst.extend(handle.dst_block_ids)
             all_gens.extend(handle.gens)
             all_addrs.extend(handle.slot_state_addrs)
+        if self._debug:
+            hit = sum(1 for ok in per_item_ok if ok)
+            logger.info(
+                "LRU-DBG load_batch_pin reqs=%d hit=%d miss=%d pinned_blocks=%d",
+                n_items, hit, n_items - hit, len(all_slot_ids))
         return BatchLoadHandle(
             per_item_ok=per_item_ok,
             slot_ids=all_slot_ids,
@@ -760,6 +776,10 @@ class LruArenaStore:
                 os.rmdir(self._job_dir(job_id))
             except OSError:
                 pass
+        if self._debug and released > 0:
+            logger.info("LRU-DBG evict victim=%s freed=%d acc_free=%d",
+                        str(job_id)[:32], released,
+                        self._allocator.count_free_accurate())
         return released
 
     def _rewrite_manifest_for_self_heal(self, job_id: str,
