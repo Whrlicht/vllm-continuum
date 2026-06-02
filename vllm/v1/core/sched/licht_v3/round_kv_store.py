@@ -332,6 +332,11 @@ class RoundKVStore:
         self._arena_direct_NBLK = 0       # blocks per layer
         # LRU 直读 load 的 pipelined GPU timing (上一波 load 的 event, 下波读)
         self._lru_pipe_ev = None
+        # post-load gen 校验失败计数 (金丝雀). 理论上恒为 0: pin+gen 双原子机制
+        # 保证 (1) pin 前被 evict -> gen 变 -> try_pin 失败 -> miss 重算;
+        # (2) pin 后 -> can_evict 挡住 evict -> gen 不变. 所以 load 完 gen 必与
+        # pin 时一致. 此计数 > 0 == pin/evict 不变量被破坏 (严重 bug), error 报警.
+        self._lru_postload_fail_count = 0
 
     # ------------------------------------------------------------------
     # Wiring
@@ -582,10 +587,16 @@ class RoundKVStore:
                         1, 0, *range(2, srcl.dim()))
                 else:                            # MLA
                     layer[dst_t, ...] = srcl
-            # post-load gen 校验
+            # post-load gen 校验 (金丝雀, 理论恒 True; 见 __init__ 注释).
+            # 这条单请求 fallback 路径已 return False 让请求走 miss/重算 (安全),
+            # 同时 error+计数 报警: 真失败 = pin/evict 不变量被破坏.
             if not handle.post_load_validate():
-                logger.warning("round-kv LRU post-load validation FAILED "
-                               "(race detected) job=%s", str(job_id)[:32])
+                self._lru_postload_fail_count += 1
+                logger.error(
+                    "round-kv LRU post-load gen MISMATCH (canary, total=%d): "
+                    "pin/evict invariant BROKEN job=%s — returning miss "
+                    "(recompute). Investigate evict bypassing can_evict.",
+                    self._lru_postload_fail_count, str(job_id)[:32])
                 return False
             return True
         finally:
@@ -721,10 +732,19 @@ class RoundKVStore:
                 # 无独立 copy stream: 在当前 stream 上, 需要 sync 保证 KV 就位
                 torch.cuda.current_stream().synchronize()
 
-            # 4) post-load gen 校验 (race 检测). 几乎不触发 (pin 保护).
+            # 4) post-load gen 校验 (金丝雀). 理论上恒 True (pin+gen 机制保证,
+            #    见 __init__ 注释). 若失败说明 pin/evict 不变量被破坏 = 严重 bug,
+            #    error 级报警 + 计数, 而非静默. 当前不触发 fallback 重算 (因为
+            #    此分支理论不可达; 真触发了要先查为什么 pin 没挡住 evict).
             if not bh.post_load_validate():
-                logger.warning("round-kv LRU DIRECT post-load validation "
-                               "FAILED (race); some blocks may be stale")
+                self._lru_postload_fail_count += 1
+                logger.error(
+                    "round-kv LRU DIRECT post-load gen MISMATCH "
+                    "(canary, total=%d): pin/evict invariant BROKEN — a "
+                    "pinned slot's gen changed during load. This should be "
+                    "impossible; investigate evict bypassing can_evict. "
+                    "reqs=%d blocks=%d",
+                    self._lru_postload_fail_count, n_items, nblk)
         except Exception as e:  # pragma: no cover
             logger.warning("round-kv LRU DIRECT load failed: %s", e)
             results = [False] * n_items
