@@ -54,6 +54,22 @@ extern "C" {
 #define ARENA_PIN_MAX       ((1ULL << ARENA_PIN_BITS) - 1ULL)
 
 // ============================================================
+// Stage 6: 内容寻址 hash 表 entry 编码常量
+// ============================================================
+// hash_table[i] 占 16 字节:
+//   offset 0  : uint64 hash       (内容指纹, 链式)
+//   offset 8  : int32  slot_id    (EMPTY=-1 / TOMBSTONE=-2 / >=0 物理 slot)
+//   offset 12 : uint32 epoch      (seqlock 序号: 偶=稳定, 奇=写入中)
+// 设计:
+//   - insert/remove 在 alloc_mutex 内 (单写者), 但仍维护 epoch,
+//     供 Stage 6c 跨进程无锁 probe (多读者) 检测撕裂读.
+//   - open-addressing 线性探测; remove 用 tombstone 不回填, 保探测链完整.
+//   - EMPTY != 0 (零页是 slot_id=0 有效 slot), 故 create 时必须 ht_clear.
+#define ARENA_HT_ENTRY_BYTES   16
+#define ARENA_HT_EMPTY         (-1)
+#define ARENA_HT_TOMBSTONE     (-2)
+
+// ============================================================
 // 跨进程 mutex 操作
 // ============================================================
 
@@ -122,6 +138,38 @@ void     arena_atomic_store_u64(uint64_t* addr, uint64_t val);
 uint64_t arena_atomic_fetch_add_u64(uint64_t* addr, uint64_t delta);
 uint64_t arena_atomic_fetch_or_u64(uint64_t* addr, uint64_t mask);
 uint64_t arena_atomic_fetch_and_u64(uint64_t* addr, uint64_t mask);
+
+// ============================================================
+// Stage 6: slot refcnt (atomic uint16)
+// ============================================================
+// 每 slot 一个 uint16, 记"有几个 job manifest 引用这块". store 命中 +1,
+// evict 减 1; 减到 0 才真 evict (bump gen + free + ht_remove).
+// 仅在 alloc_mutex 内调用 (与 alloc/evict 同临界区).
+uint32_t arena_refcnt_inc(uint16_t* p);   // 返回自增后的值
+uint32_t arena_refcnt_dec(uint16_t* p);   // 返回自减后的值
+uint32_t arena_refcnt_get(uint16_t* p);
+void     arena_refcnt_set(uint16_t* p, uint16_t v);
+
+// ============================================================
+// Stage 6: 内容寻址 hash 表 (open-addressing + seqlock)
+// ============================================================
+// table_base: hash_table 区起始地址; cap: HASH_CAP (entry 数).
+//
+// probe: 无锁多读者安全 (seqlock epoch 检测撕裂). 返回 slot_id (>=0) 或 -1 (miss).
+//        遇 EMPTY 即停 (探测链尽头); 遇 TOMBSTONE 继续.
+// insert/remove: 仅在 alloc_mutex 内 (单写者); 仍维护 epoch 供 probe.
+int64_t arena_ht_probe(void* table_base, uint64_t cap, uint64_t hash);
+int     arena_ht_insert(void* table_base, uint64_t cap,
+                        uint64_t hash, int32_t slot_id);  // 1 成功 / 0 表满
+int     arena_ht_remove(void* table_base, uint64_t cap, uint64_t hash);  // 1 删除 / 0 未找到
+void    arena_ht_clear(void* table_base, uint64_t cap);   // 全置 EMPTY (create 时调)
+
+// ============================================================
+// Stage 6: 链式 block hash (xxhash XXH3, seed=prev)
+// ============================================================
+// h[i] = arena_block_hash(h[i-1], token_bytes_i, len). seed 携带前缀,
+// 保证 "block i 命中 <=> 整个 [0,i] 前缀 token 完全相同". 跨进程确定性.
+uint64_t arena_block_hash(uint64_t prev, const void* data, uint64_t len);
 
 #ifdef __cplusplus
 }  // extern "C"

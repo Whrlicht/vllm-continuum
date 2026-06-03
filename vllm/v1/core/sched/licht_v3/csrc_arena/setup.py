@@ -12,8 +12,14 @@ Usage:
     - xxhash 用 vendored single-header (third_party/xxhash.h, Stage 6 才用)
     - 必须 --no-build-isolation, 因为依赖外部已装的 torch
 """
+import os
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
+
+# 绝对路径: ninja 编译时 cwd 在 build 临时目录, 相对 "./third_party" 解析不到
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_THIRD_PARTY = os.path.join(_HERE, "third_party")
 
 
 setup(
@@ -26,8 +32,8 @@ setup(
     ext_modules=[
         CppExtension(
             name="licht_arena_atomic",
-            sources=["arena_atomic.cpp"],
-            include_dirs=["./third_party"],  # 含 xxhash.h
+            sources=[os.path.join(_HERE, "arena_atomic.cpp")],
+            include_dirs=[_THIRD_PARTY],  # 含 xxhash.h (绝对路径)
             extra_compile_args=[
                 "-O3",
                 "-std=c++17",

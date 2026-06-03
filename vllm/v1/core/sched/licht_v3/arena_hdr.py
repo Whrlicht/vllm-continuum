@@ -132,6 +132,15 @@ class ArenaHdrLayout:
         assert 0 <= slot_id < self.num_slots
         return base_addr + self.slot_state_offset + slot_id * 8
 
+    def slot_refcnt_addr(self, base_addr: int, slot_id: int) -> int:
+        """★ Stage 6: slot_refcnt[slot_id] 的字节地址 (atomic uint16)."""
+        assert 0 <= slot_id < self.num_slots
+        return base_addr + self.slot_refcnt_offset + slot_id * 2
+
+    def hash_table_addr(self, base_addr: int) -> int:
+        """★ Stage 6: hash_table 区起始字节地址."""
+        return base_addr + self.hash_table_offset
+
     def bitmap_word_addr(self, base_addr: int, word_idx: int) -> int:
         """bitmap[word_idx] (uint64) 的字节地址."""
         assert 0 <= word_idx * 64 < self.num_slots
@@ -292,6 +301,27 @@ class ArenaHdr:
 
     def bitmap_word_addr(self, word_idx: int) -> int:
         return self._layout.bitmap_word_addr(self._base_addr, word_idx)
+
+    # ---- ★ Stage 6: 内容寻址 (refcnt + hash 表) ----
+    def slot_refcnt_addr(self, slot_id: int) -> int:
+        return self._layout.slot_refcnt_addr(self._base_addr, slot_id)
+
+    @property
+    def hash_table_addr(self) -> int:
+        return self._layout.hash_table_addr(self._base_addr)
+
+    @property
+    def hash_table_capacity(self) -> int:
+        return self._layout.hash_table_capacity
+
+    def content_addr_init(self) -> None:
+        """★ Stage 6: 初始化内容寻址区. 仅创建者在 on_create 内调用.
+
+        - hash_table 必须 ht_clear: 零页 = slot_id 0 (有效 slot), 非 EMPTY(-1),
+          不清会被误判命中. clear 一次性把所有 entry 置 EMPTY.
+        - slot_refcnt 不需 init: ftruncate 已清零, 0 = 无引用, 正确.
+        """
+        _atomic.ht_clear(self.hash_table_addr, self.hash_table_capacity)
 
     # ---- bitmap 操作 ----
     # 设计约束:
