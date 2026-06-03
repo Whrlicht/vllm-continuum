@@ -77,8 +77,8 @@ class TestGroupALayout:
         assert layout.slot_refcnt_bytes == 24000
         # hash_table 容量必须 >= 2 * num_slots 且是质数
         assert layout.hash_table_capacity >= 2 * 12000
-        # hash_table_bytes = cap * 16
-        assert layout.hash_table_bytes == layout.hash_table_capacity * 16
+        # hash_table_bytes = cap * 24 (Stage 6c: entry 带 gen)
+        assert layout.hash_table_bytes == layout.hash_table_capacity * 24
 
     def test_layout_total_size_at_least_1MB(self):
         layout = ArenaHdrLayout.compute(num_slots=12000)

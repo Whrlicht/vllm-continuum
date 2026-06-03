@@ -169,31 +169,28 @@ void arena_refcnt_set(uint16_t* p, uint16_t v) {
 }
 
 // ============================================================
-// Stage 6: 内容寻址 hash 表 (open-addressing + seqlock)
+// Stage 6: 内容寻址 hash 表 (open-addressing, 24B entry, 无 seqlock)
 // ============================================================
-// entry 16 字节: [hash:u64][slot_id:i32][epoch:u32]
+// entry 24 字节: [hash:u64 @0][slot_id:i64 @8][gen:u64 @16]
+// 无 seqlock: 每字段 8B 原子读写 (写 hash 用 RELEASE 作 commit, 读用 ACQUIRE);
+// 撕裂读最坏读到 slot/gen 错配, 下游 try_pin(slot, gen) 必失配 fail-closed.
 static inline uint64_t* ht_hash_ptr(char* base, uint64_t idx) {
     return reinterpret_cast<uint64_t*>(base + idx * ARENA_HT_ENTRY_BYTES + 0);
 }
-static inline int32_t* ht_slot_ptr(char* base, uint64_t idx) {
-    return reinterpret_cast<int32_t*>(base + idx * ARENA_HT_ENTRY_BYTES + 8);
+static inline int64_t* ht_slot_ptr(char* base, uint64_t idx) {
+    return reinterpret_cast<int64_t*>(base + idx * ARENA_HT_ENTRY_BYTES + 8);
 }
-static inline uint32_t* ht_epoch_ptr(char* base, uint64_t idx) {
-    return reinterpret_cast<uint32_t*>(base + idx * ARENA_HT_ENTRY_BYTES + 12);
+static inline uint64_t* ht_gen_ptr(char* base, uint64_t idx) {
+    return reinterpret_cast<uint64_t*>(base + idx * ARENA_HT_ENTRY_BYTES + 16);
 }
 
-// seqlock 写: epoch+1(奇,写入中) -> 写字段 -> epoch+2(偶,完成)
-// 仅在 alloc_mutex 内调用; epoch 供无锁 probe 检测撕裂.
-static inline void ht_write_entry(char* base, uint64_t idx,
-                                  uint64_t hash, int32_t slot_id) {
-    uint32_t* ep = ht_epoch_ptr(base, idx);
-    uint32_t e = __atomic_load_n(ep, __ATOMIC_RELAXED);
-    __atomic_store_n(ep, e + 1, __ATOMIC_RELEASE);          // 奇: 写入中
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(ht_hash_ptr(base, idx), hash, __ATOMIC_RELAXED);
+// 仅在 alloc_mutex 内调用. 写 gen/slot 后, 最后 RELEASE 写 hash 作 commit:
+// reader 读到新 hash (ACQUIRE) 即保证看到已写好的 slot/gen.
+static inline void ht_put(char* base, uint64_t idx,
+                          uint64_t hash, int64_t slot_id, uint64_t gen) {
+    __atomic_store_n(ht_gen_ptr(base, idx), gen, __ATOMIC_RELAXED);
     __atomic_store_n(ht_slot_ptr(base, idx), slot_id, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(ep, e + 2, __ATOMIC_RELEASE);          // 偶: 完成
+    __atomic_store_n(ht_hash_ptr(base, idx), hash, __ATOMIC_RELEASE);
 }
 
 void arena_ht_clear(void* table_base, uint64_t cap) {
@@ -201,48 +198,40 @@ void arena_ht_clear(void* table_base, uint64_t cap) {
     for (uint64_t i = 0; i < cap; i++) {
         __atomic_store_n(ht_hash_ptr(base, i), (uint64_t)0, __ATOMIC_RELAXED);
         __atomic_store_n(ht_slot_ptr(base, i),
-                         (int32_t)ARENA_HT_EMPTY, __ATOMIC_RELAXED);
-        __atomic_store_n(ht_epoch_ptr(base, i), (uint32_t)0, __ATOMIC_RELAXED);
+                         (int64_t)ARENA_HT_EMPTY, __ATOMIC_RELAXED);
+        __atomic_store_n(ht_gen_ptr(base, i),
+                         (uint64_t)ARENA_HT_GEN_UNPUB, __ATOMIC_RELAXED);
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
-int64_t arena_ht_probe(void* table_base, uint64_t cap, uint64_t hash) {
-    if (cap == 0) return -1;
+int arena_ht_probe(void* table_base, uint64_t cap, uint64_t hash,
+                   int64_t* out_slot, uint64_t* out_gen) {
+    if (cap == 0) return 0;
     char* base = reinterpret_cast<char*>(table_base);
     uint64_t start = hash % cap;
     for (uint64_t step = 0; step < cap; step++) {
         uint64_t idx = start + step;
         if (idx >= cap) idx -= cap;
-        uint32_t* ep = ht_epoch_ptr(base, idx);
-        // seqlock 读 (hash, slot_id)
-        uint64_t eh = 0;
-        int32_t es = ARENA_HT_EMPTY;
-        int tries = 0;
-        for (;;) {
-            uint32_t e0 = __atomic_load_n(ep, __ATOMIC_ACQUIRE);
-            if (e0 & 1u) {                       // 写入中
-                if (++tries > 64) return -1;     // 兜底: 当 miss (fail-closed)
-                continue;
-            }
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            eh = __atomic_load_n(ht_hash_ptr(base, idx), __ATOMIC_RELAXED);
-            es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_RELAXED);
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            uint32_t e1 = __atomic_load_n(ep, __ATOMIC_ACQUIRE);
-            if (e0 == e1) break;                 // 一致
-            if (++tries > 64) return -1;
-        }
-        if (es == ARENA_HT_EMPTY) return -1;       // 探测链尽头 -> miss
+        int64_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
+        if (es == ARENA_HT_EMPTY) return 0;        // 探测链尽头 -> miss
         if (es == ARENA_HT_TOMBSTONE) continue;    // 墓碑, 继续
-        if (eh == hash) return (int64_t)es;        // 命中
+        uint64_t eh = __atomic_load_n(ht_hash_ptr(base, idx), __ATOMIC_ACQUIRE);
+        if (eh == hash) {                          // 命中
+            if (out_slot) *out_slot = es;
+            if (out_gen) {
+                *out_gen = __atomic_load_n(ht_gen_ptr(base, idx),
+                                           __ATOMIC_ACQUIRE);
+            }
+            return 1;
+        }
         // hash 不同 -> 线性继续
     }
-    return -1;
+    return 0;
 }
 
 int arena_ht_insert(void* table_base, uint64_t cap,
-                    uint64_t hash, int32_t slot_id) {
+                    uint64_t hash, int64_t slot_id) {
     if (cap == 0) return 0;
     char* base = reinterpret_cast<char*>(table_base);
     uint64_t start = hash % cap;
@@ -250,10 +239,10 @@ int arena_ht_insert(void* table_base, uint64_t cap,
     for (uint64_t step = 0; step < cap; step++) {
         uint64_t idx = start + step;
         if (idx >= cap) idx -= cap;
-        int32_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
+        int64_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
         if (es == ARENA_HT_EMPTY) {
             uint64_t put = (first_tomb >= 0) ? (uint64_t)first_tomb : idx;
-            ht_write_entry(base, put, hash, slot_id);
+            ht_put(base, put, hash, slot_id, ARENA_HT_GEN_UNPUB);  // 插入未发布
             return 1;
         }
         if (es == ARENA_HT_TOMBSTONE) {
@@ -261,17 +250,36 @@ int arena_ht_insert(void* table_base, uint64_t cap,
             continue;
         }
         uint64_t eh = __atomic_load_n(ht_hash_ptr(base, idx), __ATOMIC_RELAXED);
-        if (eh == hash) {                          // 已存在 -> 更新 slot_id
-            ht_write_entry(base, idx, hash, slot_id);
+        if (eh == hash) {                          // 已存在 -> 重置 slot+未发布
+            ht_put(base, idx, hash, slot_id, ARENA_HT_GEN_UNPUB);
             return 1;
         }
     }
-    // 扫满未遇 EMPTY: 还能用 tombstone
     if (first_tomb >= 0) {
-        ht_write_entry(base, (uint64_t)first_tomb, hash, slot_id);
+        ht_put(base, (uint64_t)first_tomb, hash, slot_id, ARENA_HT_GEN_UNPUB);
         return 1;
     }
     return 0;  // 表满
+}
+
+int arena_ht_set_gen(void* table_base, uint64_t cap,
+                     uint64_t hash, uint64_t gen) {
+    if (cap == 0) return 0;
+    char* base = reinterpret_cast<char*>(table_base);
+    uint64_t start = hash % cap;
+    for (uint64_t step = 0; step < cap; step++) {
+        uint64_t idx = start + step;
+        if (idx >= cap) idx -= cap;
+        int64_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
+        if (es == ARENA_HT_EMPTY) return 0;
+        if (es == ARENA_HT_TOMBSTONE) continue;
+        uint64_t eh = __atomic_load_n(ht_hash_ptr(base, idx), __ATOMIC_RELAXED);
+        if (eh == hash) {
+            __atomic_store_n(ht_gen_ptr(base, idx), gen, __ATOMIC_RELEASE);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int arena_ht_remove(void* table_base, uint64_t cap, uint64_t hash) {
@@ -281,12 +289,13 @@ int arena_ht_remove(void* table_base, uint64_t cap, uint64_t hash) {
     for (uint64_t step = 0; step < cap; step++) {
         uint64_t idx = start + step;
         if (idx >= cap) idx -= cap;
-        int32_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
+        int64_t es = __atomic_load_n(ht_slot_ptr(base, idx), __ATOMIC_ACQUIRE);
         if (es == ARENA_HT_EMPTY) return 0;        // 探测链尽头, 未找到
         if (es == ARENA_HT_TOMBSTONE) continue;
         uint64_t eh = __atomic_load_n(ht_hash_ptr(base, idx), __ATOMIC_RELAXED);
         if (eh == hash) {
-            ht_write_entry(base, idx, hash, (int32_t)ARENA_HT_TOMBSTONE);
+            __atomic_store_n(ht_slot_ptr(base, idx),
+                             (int64_t)ARENA_HT_TOMBSTONE, __ATOMIC_RELEASE);
             return 1;
         }
     }
@@ -400,13 +409,22 @@ static void py_refcnt_set(uint64_t addr, uint64_t v) {
 }
 
 // ---- Stage 6: hash 表 ----
-static int64_t py_ht_probe(uint64_t base, uint64_t cap, uint64_t hash) {
-    return arena_ht_probe(reinterpret_cast<void*>(base), cap, hash);
+// probe 返回 (slot_id, gen); miss 时 (-1, 0). gen=0 表示已占位未发布.
+static py::tuple py_ht_probe(uint64_t base, uint64_t cap, uint64_t hash) {
+    int64_t slot = -1;
+    uint64_t gen = 0;
+    int found = arena_ht_probe(reinterpret_cast<void*>(base), cap, hash,
+                               &slot, &gen);
+    if (!found) { slot = -1; gen = 0; }
+    return py::make_tuple(slot, gen);
 }
 static int py_ht_insert(uint64_t base, uint64_t cap,
                         uint64_t hash, int64_t slot_id) {
-    return arena_ht_insert(reinterpret_cast<void*>(base), cap,
-                           hash, (int32_t)slot_id);
+    return arena_ht_insert(reinterpret_cast<void*>(base), cap, hash, slot_id);
+}
+static int py_ht_set_gen(uint64_t base, uint64_t cap,
+                         uint64_t hash, uint64_t gen) {
+    return arena_ht_set_gen(reinterpret_cast<void*>(base), cap, hash, gen);
 }
 static int py_ht_remove(uint64_t base, uint64_t cap, uint64_t hash) {
     return arena_ht_remove(reinterpret_cast<void*>(base), cap, hash);
@@ -478,12 +496,14 @@ PYBIND11_MODULE(licht_arena_atomic, m) {
     m.def("refcnt_get", &py_refcnt_get, py::arg("addr"));
     m.def("refcnt_set", &py_refcnt_set, py::arg("addr"), py::arg("v"));
 
-    // Stage 6: hash 表
-    m.def("ht_probe",  &py_ht_probe,  py::arg("base"), py::arg("cap"), py::arg("hash"));
-    m.def("ht_insert", &py_ht_insert, py::arg("base"), py::arg("cap"),
+    // Stage 6: hash 表 (probe 返回 (slot, gen) 元组)
+    m.def("ht_probe",   &py_ht_probe,   py::arg("base"), py::arg("cap"), py::arg("hash"));
+    m.def("ht_insert",  &py_ht_insert,  py::arg("base"), py::arg("cap"),
           py::arg("hash"), py::arg("slot_id"));
-    m.def("ht_remove", &py_ht_remove, py::arg("base"), py::arg("cap"), py::arg("hash"));
-    m.def("ht_clear",  &py_ht_clear,  py::arg("base"), py::arg("cap"));
+    m.def("ht_set_gen", &py_ht_set_gen, py::arg("base"), py::arg("cap"),
+          py::arg("hash"), py::arg("gen"));
+    m.def("ht_remove",  &py_ht_remove,  py::arg("base"), py::arg("cap"), py::arg("hash"));
+    m.def("ht_clear",   &py_ht_clear,   py::arg("base"), py::arg("cap"));
 
     // Stage 6: 链式 block hash
     m.def("block_hash", &py_block_hash, py::arg("prev"), py::arg("data"));

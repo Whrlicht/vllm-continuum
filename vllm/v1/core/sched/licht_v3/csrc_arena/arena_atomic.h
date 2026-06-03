@@ -56,18 +56,24 @@ extern "C" {
 // ============================================================
 // Stage 6: 内容寻址 hash 表 entry 编码常量
 // ============================================================
-// hash_table[i] 占 16 字节:
+// hash_table[i] 占 24 字节:
 //   offset 0  : uint64 hash       (内容指纹, 链式)
-//   offset 8  : int32  slot_id    (EMPTY=-1 / TOMBSTONE=-2 / >=0 物理 slot)
-//   offset 12 : uint32 epoch      (seqlock 序号: 偶=稳定, 奇=写入中)
+//   offset 8  : int64  slot_id    (EMPTY=-1 / TOMBSTONE=-2 / >=0 物理 slot)
+//   offset 16 : uint64 gen        (发布时的 slot gen; 0=已占位未发布 UNPUB)
 // 设计:
-//   - insert/remove 在 alloc_mutex 内 (单写者), 但仍维护 epoch,
-//     供 Stage 6c 跨进程无锁 probe (多读者) 检测撕裂读.
+//   - insert/set_gen/remove 在 alloc_mutex 内 (单写者). probe 无锁 (多读者).
+//   - 不用 seqlock: 每字段 8B 对齐原子读 (release/acquire); 撕裂读最坏读到
+//     不一致 (slot/gen 错配), 但下游 try_pin(slot, entry.gen) 必失配 fail-closed
+//     -> 当 miss 重算, 绝不读错数据. 故无需序号保护.
+//   - entry.gen 让 cross-job load 拿到"内容对应的 gen": try_pin(slot, gen) 若
+//     slot 被淘后复用 (gen 已变) 则失败. insert 时 gen=UNPUB(0), CS2 publish 后
+//     ht_set_gen 写真实 gen; reader 见 UNPUB 跳过 (半写窗口对 reader 不可见).
 //   - open-addressing 线性探测; remove 用 tombstone 不回填, 保探测链完整.
 //   - EMPTY != 0 (零页是 slot_id=0 有效 slot), 故 create 时必须 ht_clear.
-#define ARENA_HT_ENTRY_BYTES   16
+#define ARENA_HT_ENTRY_BYTES   24
 #define ARENA_HT_EMPTY         (-1)
 #define ARENA_HT_TOMBSTONE     (-2)
+#define ARENA_HT_GEN_UNPUB     (0ULL)
 
 // ============================================================
 // 跨进程 mutex 操作
@@ -155,14 +161,19 @@ void     arena_refcnt_set(uint16_t* p, uint16_t v);
 // ============================================================
 // table_base: hash_table 区起始地址; cap: HASH_CAP (entry 数).
 //
-// probe: 无锁多读者安全 (seqlock epoch 检测撕裂). 返回 slot_id (>=0) 或 -1 (miss).
+// probe: 无锁多读者安全. 命中返回 1 并写 *out_slot/*out_gen; miss 返回 0.
 //        遇 EMPTY 即停 (探测链尽头); 遇 TOMBSTONE 继续.
-// insert/remove: 仅在 alloc_mutex 内 (单写者); 仍维护 epoch 供 probe.
-int64_t arena_ht_probe(void* table_base, uint64_t cap, uint64_t hash);
-int     arena_ht_insert(void* table_base, uint64_t cap,
-                        uint64_t hash, int32_t slot_id);  // 1 成功 / 0 表满
-int     arena_ht_remove(void* table_base, uint64_t cap, uint64_t hash);  // 1 删除 / 0 未找到
-void    arena_ht_clear(void* table_base, uint64_t cap);   // 全置 EMPTY (create 时调)
+// insert: 仅在 alloc_mutex 内. 插入时 gen=UNPUB(0); 1 成功 / 0 表满.
+// set_gen: 仅在 alloc_mutex 内. CS2 publish 后写真实 gen; 1 成功 / 0 未找到.
+// remove: 仅在 alloc_mutex 内. 1 删除 / 0 未找到.
+int  arena_ht_probe(void* table_base, uint64_t cap, uint64_t hash,
+                    int64_t* out_slot, uint64_t* out_gen);
+int  arena_ht_insert(void* table_base, uint64_t cap,
+                     uint64_t hash, int64_t slot_id);   // gen=UNPUB
+int  arena_ht_set_gen(void* table_base, uint64_t cap,
+                      uint64_t hash, uint64_t gen);
+int  arena_ht_remove(void* table_base, uint64_t cap, uint64_t hash);
+void arena_ht_clear(void* table_base, uint64_t cap);    // 全置 EMPTY (create 时调)
 
 // ============================================================
 // Stage 6: 链式 block hash (xxhash XXH3, seed=prev)

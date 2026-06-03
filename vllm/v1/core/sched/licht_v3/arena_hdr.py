@@ -104,9 +104,12 @@ class ArenaHdrLayout:
         slot_refcnt_bytes_aligned = _round_up(slot_refcnt_bytes, 8)
 
         hash_cap = _next_prime_at_least(2 * num_slots)
-        # 每 entry 16 字节: hash(8) + slot_id(4) + epoch(4)
+        # 每 entry 24 字节: hash(8) + slot_id(8) + gen(8).
+        # ★ Stage 6c: entry 带 published gen, 跨 job load 用 try_pin(slot, entry.gen)
+        # 检测 slot 是否被复用 (own-job 用自己 .slot 的 gen, cross-job 没自己的
+        # .slot, 必须从 entry 拿 gen). gen=0 = 已占位未发布哨兵.
         hash_table_off = slot_refcnt_off + slot_refcnt_bytes_aligned
-        hash_table_bytes = hash_cap * 16
+        hash_table_bytes = hash_cap * 24
 
         total_used = hash_table_off + hash_table_bytes
         # 取 max(总用量, 1 MB), 然后页对齐

@@ -565,7 +565,7 @@ class LruArenaStore:
         try:
             miss_is: List[int] = []
             for i, h in enumerate(inc_hashes):
-                slot = _atomic.ht_probe(ht_base, ht_cap, h)
+                slot, _g = _atomic.ht_probe(ht_base, ht_cap, h)
                 if slot >= 0:
                     plan[i][0] = 'H'
                     plan[i][1] = slot
@@ -614,14 +614,14 @@ class LruArenaStore:
                     self._data_writer(plan[i][1], i, source_obj)
             # records: (slot, gen, hash). HIT gen=当前; MISS gen=当前+1(待发布)
             records: List[Tuple[int, int, int]] = []
-            miss_pub: List[Tuple[int, int]] = []   # (slot, new_gen) 待 publish
+            miss_pub: List[Tuple[int, int, int]] = []  # (slot,new_gen,hash) 待发布
             for i in range(n_blocks):
                 kind, slot, h = plan[i][0], plan[i][1], plan[i][2]
                 cur_gen = _atomic.get_gen(self._hdr.slot_state_addr(slot))
                 if kind == 'M':
                     new_gen = cur_gen + 1
                     records.append((slot, new_gen, h))
-                    miss_pub.append((slot, new_gen))
+                    miss_pub.append((slot, new_gen, h))
                 else:
                     records.append((slot, cur_gen, h))
             slot_path = self._slot_path(job_id, start_block, end_block)
@@ -642,8 +642,10 @@ class LruArenaStore:
                            rc)
             return False
         try:
-            for (slot, new_gen) in miss_pub:
+            for (slot, new_gen, h) in miss_pub:
                 _atomic.publish_slot(self._hdr.slot_state_addr(slot), new_gen)
+                # ★ 把发布 gen 写进 hash entry, 供跨 job load 的 try_pin 校验
+                _atomic.ht_set_gen(ht_base, ht_cap, h, new_gen)
             self._last_stored[job_id] = end_block
             self._touch_job_lru(job_id)
         finally:
@@ -1046,7 +1048,8 @@ class LruArenaStore:
                 continue   # pinned, 不能动, 留下轮
             # 校验该 slot 仍持有这个 hash 的内容 (防 slot 被淘后复用给别 hash
             # 时误减别人的 refcnt). 正常 refcnt 记账下恒成立, 此为纵深防御.
-            if _atomic.ht_probe(self._ht_base, self._ht_cap, h) != slot_id:
+            probe_slot, _g = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+            if probe_slot != slot_id:
                 continue
             new_rc = _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(slot_id))
             if new_rc == 0:

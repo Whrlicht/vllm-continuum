@@ -7,8 +7,9 @@ Group A - 链式 block hash:
   - 确定性 / 区分前缀 / 共享前缀逐块相等且首分叉块 diverge / 跨进程一致 (纯函数)
 Group B - slot refcnt (atomic uint16, 经真 ArenaHdr):
   - inc/dec/get/set / 跨 slot 不串扰 / 初始为 0
-Group C - hash 表 (open-addressing + seqlock, 经真 ArenaHdr):
+Group C - hash 表 (open-addressing, 24B entry 带 gen, 经真 ArenaHdr):
   - clear / probe miss / insert+probe hit / remove+tombstone 探测链 / 更新 / 表满
+  - gen: insert 后 gen=UNPUB(0); set_gen 后 probe 返回该 gen
 Group D - 跨进程 (fork, 两进程共享同一 hdr 文件):
   - 子进程 insert / refcnt++, 父进程 probe / refcnt_get 可见
 """
@@ -29,6 +30,11 @@ from vllm.v1.core.sched.licht_v3.arena_hdr import ArenaHdr
 @pytest.fixture
 def tmp_hdr_path(tmp_path):
     return str(tmp_path / "test_arena.hdr")
+
+
+def _ps(base, cap, h):
+    """ht_probe 现在返回 (slot, gen); 多数断言只关心 slot."""
+    return A.ht_probe(base, cap, h)[0]
 
 
 # ============================================================
@@ -131,7 +137,7 @@ class TestGroupCHashTable:
         try:
             hdr.content_addr_init()
             base, cap = hdr.hash_table_addr, hdr.hash_table_capacity
-            assert A.ht_probe(base, cap, 0x1234) == -1
+            assert _ps(base, cap, 0x1234) == -1
         finally:
             hdr.close()
 
@@ -142,9 +148,9 @@ class TestGroupCHashTable:
             base, cap = hdr.hash_table_addr, hdr.hash_table_capacity
             # 不调 content_addr_init: 零页. hash=0 落到的 entry slot_id=0,hash=0
             # -> probe(0) 会命中 slot 0 (错误!). clear 后才正确 miss.
-            assert A.ht_probe(base, cap, 0) == 0       # 零页伪命中
+            assert _ps(base, cap, 0) == 0       # 零页伪命中
             hdr.content_addr_init()
-            assert A.ht_probe(base, cap, 0) == -1       # clear 后正确 miss
+            assert _ps(base, cap, 0) == -1       # clear 后正确 miss
         finally:
             hdr.close()
 
@@ -154,12 +160,30 @@ class TestGroupCHashTable:
             hdr.content_addr_init()
             base, cap = hdr.hash_table_addr, hdr.hash_table_capacity
             h = 0xDEADBEEFCAFE
-            assert A.ht_probe(base, cap, h) == -1
+            assert _ps(base, cap, h) == -1
             assert A.ht_insert(base, cap, h, 42) == 1
-            assert A.ht_probe(base, cap, h) == 42
+            assert _ps(base, cap, h) == 42
             assert A.ht_remove(base, cap, h) == 1
-            assert A.ht_probe(base, cap, h) == -1
+            assert _ps(base, cap, h) == -1
             assert A.ht_remove(base, cap, h) == 0       # 再删返回 0
+        finally:
+            hdr.close()
+
+    def test_gen_field_unpub_then_set(self, tmp_hdr_path):
+        """insert 后 gen=0(UNPUB); set_gen 后 probe 返回该 gen (跨 job load 用)."""
+        hdr = ArenaHdr.create(tmp_hdr_path, num_slots=100)
+        try:
+            hdr.content_addr_init()
+            base, cap = hdr.hash_table_addr, hdr.hash_table_capacity
+            h = 0x5151
+            A.ht_insert(base, cap, h, 7)
+            slot, gen = A.ht_probe(base, cap, h)
+            assert slot == 7 and gen == 0          # 插入即未发布
+            assert A.ht_set_gen(base, cap, h, 99) == 1
+            slot, gen = A.ht_probe(base, cap, h)
+            assert slot == 7 and gen == 99          # 发布后带 gen
+            # set_gen 不存在的 hash 返回 0
+            assert A.ht_set_gen(base, cap, 0x9999, 5) == 0
         finally:
             hdr.close()
 
@@ -171,7 +195,7 @@ class TestGroupCHashTable:
             h = 0xABCD
             A.ht_insert(base, cap, h, 10)
             A.ht_insert(base, cap, h, 20)               # 同 hash 更新
-            assert A.ht_probe(base, cap, h) == 20
+            assert _ps(base, cap, h) == 20
         finally:
             hdr.close()
 
@@ -189,9 +213,9 @@ class TestGroupCHashTable:
             # 删中间那个
             assert A.ht_remove(base, cap, chain[1]) == 1
             # 链尾仍可探测到 (tombstone 不能截断)
-            assert A.ht_probe(base, cap, chain[2]) == 102
-            assert A.ht_probe(base, cap, chain[0]) == 100
-            assert A.ht_probe(base, cap, chain[1]) == -1
+            assert _ps(base, cap, chain[2]) == 102
+            assert _ps(base, cap, chain[0]) == 100
+            assert _ps(base, cap, chain[1]) == -1
         finally:
             hdr.close()
 
@@ -204,7 +228,7 @@ class TestGroupCHashTable:
             A.ht_insert(base, cap, h, 1)
             A.ht_remove(base, cap, h)
             assert A.ht_insert(base, cap, h, 2) == 1     # 复用墓碑
-            assert A.ht_probe(base, cap, h) == 2
+            assert _ps(base, cap, h) == 2
         finally:
             hdr.close()
 
@@ -234,7 +258,7 @@ class TestGroupCHashTable:
             for h, sid in hashes.items():
                 assert A.ht_insert(base, cap, h, sid % 2000) == 1
             for h, sid in hashes.items():
-                assert A.ht_probe(base, cap, h) == sid % 2000
+                assert _ps(base, cap, h) == sid % 2000
         finally:
             hdr.close()
 
@@ -260,7 +284,7 @@ class TestGroupDCrossProcess:
         assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 
         # 父进程在自己的 mmap 上 probe -> 看得到子进程写的
-        assert A.ht_probe(base, cap, h) == 77
+        assert _ps(base, cap, h) == 77
         hdr.close()
 
     def test_cross_process_refcnt(self, tmp_hdr_path):

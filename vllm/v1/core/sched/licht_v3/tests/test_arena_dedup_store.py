@@ -40,7 +40,7 @@ def _make_store(tmp_path, monkeypatch, num_slots, content=True):
 def _slot_of(store, token_ids, block_idx):
     """通过链式 hash + ht_probe 拿到某 block 对应的物理 slot."""
     hs = block_hashes(token_ids, BS, block_idx + 1)
-    return A.ht_probe(store._ht_base, store._ht_cap, hs[block_idx])
+    return A.ht_probe(store._ht_base, store._ht_cap, hs[block_idx])[0]
 
 
 def _refcnt(store, slot):
@@ -175,7 +175,7 @@ class TestEvictRefcnt:
         # hash 表里也已删除 (probe miss)
         for i in range(4):
             hs = block_hashes(toks_b, BS, i + 1)
-            assert A.ht_probe(store._ht_base, store._ht_cap, hs[i]) == -1
+            assert A.ht_probe(store._ht_base, store._ht_cap, hs[i])[0] == -1
 
     def test_evict_triggers_on_pressure(self, tmp_path, monkeypatch):
         """arena 满时 store 自动 evict 老 job 腾空间."""
