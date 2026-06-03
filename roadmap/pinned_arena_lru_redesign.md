@@ -1089,6 +1089,62 @@ writer 每次修改 entry 都先 `epoch++` 再改字段再 `epoch++`，使奇数
 
 ---
 
+## 12.14 实施记录 (as-built, 2026-06-03)
+
+第一部分 (6a 基础设施 + 6b store dedup + 6e refcnt evict) 已落地, `LICHT_ARENA_CONTENT_ADDR=1`
+门控, 关时旧路径字节级不变. commit: 6a `534df92`, 6b+6e `25f47c4`.
+
+### 相对前文设计的精化 (讨论后定稿)
+
+1. **HashEntry 不存 gen, 维持 16B `{hash(8), slot_id(4), epoch(4)}`**.
+   原 §12.2 纠结过把 gen 放进 entry. 定论: gen 48 位留在 `slot_state` 不动;
+   命中表拿到 slot_id 后, 期望 gen 从 **.slot (v2)** 读、当前 gen 从 slot_state 读
+   比对. epoch 仅用于无锁 probe 的 seqlock 防撕裂, 与 gen 无关.
+
+2. **保留 .slot, 不删** (一度考虑全部走表查、每 job 只剩 manifest). 定论保留并升
+   v2 (24B 含 hash): ① own-path 走 per-进程缓存的 .slot, 不碰共享表无跨进程 cache
+   争用; ② evict 直接读 .slot 拿 hash, 不必在锁内重算链式 hash. "收成 manifest-only"
+   挂为 6f 实测 own-vs-crossjob 比例后再议.
+
+3. **store 三段式 + insert 在 CS1** (§12.5 旧伪码 memcpy 在锁内、insert 时机模糊).
+   实际: CS1 probe+HIT(refcnt++)/MISS(alloc+**CS1 内 insert**+refcnt=1) → 锁外只对
+   MISS 搬数据 → CS2 只 publish MISS. insert 必须在 CS1: 跨进程同 mutex 串行, 并发
+   同内容写者出 CS1 即见 entry → HIT, 不会重复分配 slot.
+
+4. **HIT refcnt++ 必须排在 evict 之前**. 否则 evict 可能把某 HIT slot (若属受害 job)
+   refcnt 减到 0 释放, 之后 inc 到已释放 slot. 先 ++ 保证 evict 时它 refcnt>=2 不被淘.
+
+5. **写窗口 gen 安全 (补 §12.9 完整证明)**: A 锁外写 MISS 数据期间 slot_state.gen 停在
+   "淘汰后、未发布"的裸奔值; 旧引用期望值 < 它、新引用 (A 的 entry) 期望值 > 它, 且该值
+   从无 entry 认领 → 任何 reader try_pin 必失配 fail-closed, 绝不读半写数据. 写-写则
+   CS1 串行后者必 HIT 不重复写. 故无需额外锁/屏障.
+
+6. **pinned 块淘汰**: 只淘 `pin==0`; pinned 跳过留下轮 (不做延迟释放, 对齐 §12.8).
+   evict 另加 `ht_probe(hash)==slot` 纵深防御, 防 slot 被淘后复用给别 hash 时误减 refcnt.
+
+7. **崩溃恢复**: 接受 EOWNERDEAD 后罕见 refcnt 泄漏 (arena 非持久化, 重启自愈),
+   v1 不做 refcnt 重建 (原 §12.12 风险表里的"周期扫描"降级为按需 6h).
+
+### 部署不变量 (重要)
+
+**`LICHT_ARENA_CONTENT_ADDR` 必须在 prefill 和 decode 两端取值一致.** 否则一端写 v1 .slot
+(无 hash、无 refcnt/表), 另一端 (=1) 的 evict 用 v2 读会判为损坏直接 unlink, 破坏数据.
+启动脚本须对两个角色统一设置. 默认 0 (关), 安全.
+
+### SSD 分层挂载点 (本期不实现)
+
+CPU `lookup` 全 miss 返回 0/None 即为将来 SSD 层入口. CPU 与 SSD 分开: CPU 命中走
+arena load; CPU miss 才下探 SSD. 本期只做 CPU.
+
+### 待办 (第二部分 + 收尾)
+
+- 6c/6d 跨 job lookup (全新 job 直接命中别 job 前缀, 省 prefill 重算): 需改 lookup
+  Path2 (无锁 ht_probe 续链) + load 接表解析的跨 job slot 对. 测完第一部分 dedup 率再启.
+- 6f 收尾: 实跑 trace 验证 token-level 一致 + 跨进程双 writer refcnt 不泄漏 + 埋点看
+  dedup 命中率 / own-vs-crossjob 比例, 据此定是否收 manifest-only.
+
+---
+
 ## 附录 A · 相关已有技术对比
 
 ### vs LMCache

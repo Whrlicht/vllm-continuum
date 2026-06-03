@@ -175,9 +175,12 @@ class LruArenaStore:
         # 关: 完全等价旧路径 (alloc 全新 slot, .slot 写 v1), 字节级不变.
         self._content_addr = (
             os.environ.get("LICHT_ARENA_CONTENT_ADDR", "0") == "1")
-        # 埋点计数 (LICHT_ARENA_DEBUG): dedup 命中 / 新分配 block 数
+        # 埋点计数 (LICHT_ARENA_DEBUG): dedup 命中 / 新分配 block 数,
+        # evict 真释放 (refcnt->0) vs 仅减引用 (refcnt>0 数据留给别 job)
         self._stat_hit_blocks = 0
         self._stat_miss_blocks = 0
+        self._stat_evict_freed = 0
+        self._stat_evict_decref = 0
 
     # ============================================================
     # Lifecycle
@@ -1051,7 +1054,16 @@ class LruArenaStore:
                 _atomic.ht_remove(self._ht_base, self._ht_cap, h)
                 self._allocator.free_n([slot_id])
                 freed += 1
-            # else: refcnt>0, 数据留给别的 job, 仅摘本 job 引用
+            else:
+                # refcnt>0, 数据留给别的 job, 仅摘本 job 引用
+                self._stat_evict_decref += 1
+        self._stat_evict_freed += freed
+        if self._debug and (freed or left_pinned):
+            logger.info(
+                "LRU-DBG dedup evict-inc job=%s [%d,%d) freed=%d pinned=%d "
+                "(cum freed=%d decref=%d)",
+                str(job_id)[:32], s, e, freed, left_pinned,
+                self._stat_evict_freed, self._stat_evict_decref)
         if left_pinned == 0:
             cur_last = self._last_stored.get(job_id, e)
             if s < cur_last:
