@@ -859,6 +859,86 @@ class LruArenaStore:
         )
 
     # ============================================================
+    # ★ Stage 6c: 跨 job 表驱动 lookup + 显式 slot load
+    # ============================================================
+    def lookup_resolve(self, prompt_token_ids: List[int]
+                       ) -> Optional[Tuple[int, int, List[Tuple[int, int]]]]:
+        """跨 job 表驱动 lookup (job 无关, 无锁).
+
+        对 prompt 逐块链式 hash → ht_probe → 校验后连续命中计数. 因为任何 job
+        store 时都把块插了表, 这条同时覆盖 own-job 与 cross-job (谁存的都能命中).
+
+        校验一块 (slot, egen) 有效:
+          - slot >= 0 (probe 命中)
+          - egen != UNPUB(0)  (已发布, 非半写)
+          - slot_state.gen == egen  (slot 未被淘汰复用)
+          - refcnt > 0  (仍被引用)
+
+        返回 (matched_tokens, matched_blocks, slot_gen_list) 或 None.
+        slot_gen_list 是匹配前缀逐块的 (slot_id, gen), 供 load_pin_explicit
+        直接 pin+scatter (跨进程下由调用方经元数据传给 worker, 免得 worker 重算).
+
+        注意: 本函数不 pin (只读探测). lookup→load 之间 slot 可能被淘, 由
+        load_pin_explicit 的 try_pin(gen) fail-closed 兜底.
+        """
+        bs = self._block_size
+        n_full = len(prompt_token_ids) // bs
+        if n_full <= 0:
+            return None
+        hashes = block_hashes(prompt_token_ids, bs, n_full)
+        slot_gen: List[Tuple[int, int]] = []
+        for i in range(n_full):
+            slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, hashes[i])
+            if slot < 0 or egen == 0:
+                break
+            if _atomic.get_gen(self._hdr.slot_state_addr(slot)) != egen:
+                break   # slot 被淘汰/复用, gen 不匹配
+            if _atomic.refcnt_get(self._hdr.slot_refcnt_addr(slot)) == 0:
+                break   # 已无引用
+            slot_gen.append((slot, egen))
+        nb = len(slot_gen)
+        if nb <= 0:
+            return None
+        return nb * bs, nb, slot_gen
+
+    def load_pin_explicit(self, slot_gen_list: List[Tuple[int, int]],
+                          dst_block_ids: List[int]) -> Optional[LoadHandle]:
+        """按显式 (slot, gen) 列表 pin (跨 job load).
+
+        不查 .slot / 不查表 (lookup_resolve 已解析好), 直接对每个 slot
+        try_pin(gen). 任一失败 (gen 变 = 被淘) 回滚返回 None. 成功返回 LoadHandle,
+        调用者 scatter 完必须 release().
+
+        slot_gen_list 取前 len(dst_block_ids) 个 (与 dst 一一对应).
+        """
+        n = len(dst_block_ids)
+        if n == 0:
+            return LoadHandle([], [], [], [])
+        if len(slot_gen_list) < n:
+            return None
+        state_addrs: List[int] = []
+        slot_ids: List[int] = []
+        gens: List[int] = []
+        pinned: List[int] = []
+        for k in range(n):
+            slot, egen = slot_gen_list[k]
+            addr = self._hdr.slot_state_addr(slot)
+            if not _atomic.try_pin(addr, egen):
+                for a in pinned:
+                    _atomic.unpin(a)
+                return None
+            pinned.append(addr)
+            state_addrs.append(addr)
+            slot_ids.append(slot)
+            gens.append(egen)
+        return LoadHandle(
+            slot_state_addrs=state_addrs,
+            slot_ids=slot_ids,
+            gens=gens,
+            dst_block_ids=list(dst_block_ids),
+        )
+
+    # ============================================================
     # EVICT (LRU + tail-first + self-heal)
     # ============================================================
     def _evict_until_free_locked(self, need: int,

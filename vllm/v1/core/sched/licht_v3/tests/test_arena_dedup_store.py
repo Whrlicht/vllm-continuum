@@ -177,6 +177,71 @@ class TestEvictRefcnt:
             hs = block_hashes(toks_b, BS, i + 1)
             assert A.ht_probe(store._ht_base, store._ht_cap, hs[i])[0] == -1
 
+    def test_crossjob_lookup_then_evict_invalidates(self, tmp_path, monkeypatch):
+        """淘汰掉源 job 后, 之前 lookup_resolve 拿到的 slot 在 load 时失效."""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
+        toks_a = list(range(48))
+        store.write_inc("A", 0, 3, toks_a, [b"a0", b"a1", b"a2"])
+        res = store.lookup_resolve(toks_a)
+        assert res is not None
+        _, nb, sg = res
+        assert nb == 3
+        # 淘掉 A (refcnt 1->0, gen bump)
+        _evict_job(store, "A")
+        # 用淘汰前解析的 slot/gen 去 load -> try_pin 应失配 -> None
+        handle = store.load_pin_explicit(sg, dst_block_ids=[1, 2, 3])
+        assert handle is None
+
+
+# ============================================================
+# 跨 job lookup_resolve + load_pin_explicit (6c)
+# ============================================================
+
+class TestCrossJobLookup:
+    def test_brand_new_job_hits_other_job_prefix(self, tmp_path, monkeypatch):
+        """全新 job (从没 store 过) 的 prompt 共享 A 的前缀 → 命中 A 的 slot."""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
+        toks_a = list(range(48))                       # A: 3 block
+        store.write_inc("A", 0, 3, toks_a, [b"a0", b"a1", b"a2"])
+        a_slots = [_slot_of(store, toks_a, i) for i in range(3)]
+
+        # 全新 prompt: 共享 A 前 3 块, 第 4 块独有 (没人存过)
+        toks_new = list(range(48)) + list(range(900, 916))
+        res = store.lookup_resolve(toks_new)
+        assert res is not None
+        matched_tokens, nb, sg = res
+        assert nb == 3                                  # 只命中共享前缀 (第4块 miss)
+        assert matched_tokens == 3 * BS
+        # 解析出的 slot 正是 A 的物理 slot, gen 是已发布 gen (>0)
+        assert [s for (s, g) in sg] == a_slots
+        assert all(g > 0 for (s, g) in sg)
+
+        # 用这些 slot load (pin → 校验 → release)
+        handle = store.load_pin_explicit(sg, dst_block_ids=[20, 21, 22])
+        assert handle is not None
+        assert handle.slot_ids == a_slots
+        assert handle.dst_block_ids == [20, 21, 22]
+        for addr in handle.slot_state_addrs:
+            assert A.get_pin(addr) == 1
+        assert handle.post_load_validate()
+        handle.release()
+
+    def test_lookup_resolve_no_prefix_returns_none(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
+        store.write_inc("A", 0, 2, list(range(32)), [b"0", b"1"])
+        # 完全不同前缀 → 第 0 块就 miss
+        assert store.lookup_resolve(list(range(500, 532))) is None
+
+    def test_lookup_resolve_partial_prefix(self, tmp_path, monkeypatch):
+        """共享 2 块、第 3 块分叉 → 只解析出 2 块."""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
+        store.write_inc("A", 0, 3, list(range(48)), [b"0", b"1", b"2"])
+        toks = list(range(32)) + list(range(700, 716))  # 前2块同, 第3块异
+        res = store.lookup_resolve(toks)
+        assert res is not None
+        _, nb, _sg = res
+        assert nb == 2
+
     def test_evict_triggers_on_pressure(self, tmp_path, monkeypatch):
         """arena 满时 store 自动 evict 老 job 腾空间."""
         store, arena, _ = _make_store(tmp_path, monkeypatch, num_slots=4)
