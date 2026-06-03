@@ -514,7 +514,8 @@ class RoundKVStore:
         # arena_view 是 CPU shm 张量, source_obj 是 CPU 张量, host->host memcpy
         self._arena_view[slot_id].copy_(source_obj[block_idx])
 
-    def _write_inc_arena_lru(self, job_id, start, end, tensors) -> None:
+    def _write_inc_arena_lru(self, job_id, start, end, tensors,
+                             token_ids=None) -> None:
         """LRU 版 write_inc: 把 tensors 字典 permute 成 block-major,
         交给 LruArenaStore.write_inc 处理 (内部 alloc + evict + memcpy + publish).
         """
@@ -532,15 +533,14 @@ class RoundKVStore:
             perm = [1, 0, 2] + list(range(3, stk.dim()))
         bm = stk.permute(*perm).contiguous()     # [nbc, nL, 2, *rest]
 
-        # 读 token_ids: 由 _do_store 在 write_inc 之后 _write_manifest 时设置;
-        # 这里我们传当前能拿到的近似 (token_ids 在 callsite 还没传进来), 用 [] 占位.
-        # LruArenaStore.write_inc 会 rewrite manifest, 后面 _do_store 的
-        # _write_manifest 调用会再覆写一次 (atomic rename, 同内容, OK).
+        # token_ids: 由 _do_store 传入完整序列 (len >= end*block_size).
+        # ★ Stage 6 内容寻址必须有真实 token_ids 才能算链式 block hash 做 dedup;
+        # 非 content-addr 路径只用它写 manifest. 缺省 [] 时 dedup 会失败回退.
         ok = self._lru_store.write_inc(
             job_id=str(job_id),
             start_block=int(start),
             end_block=int(end),
-            token_ids=[],   # caller 之后 _write_manifest 会带正确 token_ids
+            token_ids=list(token_ids) if token_ids is not None else [],
             source_obj=bm)
         if not ok:
             logger.warning(
@@ -1127,7 +1127,7 @@ class RoundKVStore:
                 return
             # ---- write increment file + update manifest (off critical path) ----
             _t1 = time.time()
-            self._write_inc(job_id, last, end, tensors)
+            self._write_inc(job_id, last, end, tensors, token_ids)
             self._write_manifest(job_id, end, token_ids[:end * self.block_size])
             write_ms = (time.time() - _t1) * 1000.0
             self._last_stored[job_id] = end
@@ -1224,9 +1224,10 @@ class RoundKVStore:
                 pass
         return tensors
 
-    def _write_inc(self, job_id, start, end, tensors) -> None:
+    def _write_inc(self, job_id, start, end, tensors, token_ids=None) -> None:
         if self._arena and self._arena_mapped:
-            return self._write_inc_arena(job_id, start, end, tensors)
+            return self._write_inc_arena(job_id, start, end, tensors,
+                                         token_ids)
         if self._raw:
             return self._write_inc_raw(job_id, start, end, tensors)
         from safetensors.torch import save_file
@@ -1245,7 +1246,8 @@ class RoundKVStore:
                 pass
             raise
 
-    def _write_inc_arena(self, job_id, start, end, tensors) -> None:
+    def _write_inc_arena(self, job_id, start, end, tensors,
+                         token_ids=None) -> None:
         """Store the increment into the shared pinned ARENA (decode side).
         Build the block-major [nbc, nL, 2, *rest] (one slot per block), bump-
         allocate a contiguous slot run, memcpy into the shared pages, then
@@ -1253,7 +1255,8 @@ class RoundKVStore:
         validate it.  No data file, no per-load read on the prefill side."""
         # Stage 2 LRU dispatch
         if self._lru_store is not None:
-            return self._write_inc_arena_lru(job_id, start, end, tensors)
+            return self._write_inc_arena_lru(job_id, start, end, tensors,
+                                             token_ids)
         import torch
         layers = []
         for ln in self._kv_caches:

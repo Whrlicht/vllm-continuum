@@ -37,13 +37,17 @@ from typing import Callable, Iterable, List, Optional, Tuple
 import licht_arena_atomic as _atomic
 
 from vllm.v1.core.sched.licht_v3.arena_allocator import ArenaAllocator
+from vllm.v1.core.sched.licht_v3.arena_block_hash import block_hashes
 from vllm.v1.core.sched.licht_v3.arena_hdr import ArenaHdr
 from vllm.v1.core.sched.licht_v3.arena_slot_file import (
     SlotFileV1,
     parse_slot_filename,
     read_slot_file_v1,
+    read_slot_file_v2,
+    read_slot_file_version,
     slot_filename,
     write_slot_file_v1,
+    write_slot_file_v2,
 )
 
 
@@ -166,6 +170,15 @@ class LruArenaStore:
         # 细节, 用于验证 Phase 1/2 等路径下 LRU 真在工作且 slot/gen 对得上.
         self._debug = os.environ.get("LICHT_ARENA_DEBUG", "0") == "1"
 
+        # ★ Stage 6 内容寻址总开关 (LICHT_ARENA_CONTENT_ADDR=1).
+        # 开: store 走 dedup (probe hash 表, 命中 refcnt++ 不新分配), .slot 写 v2;
+        # 关: 完全等价旧路径 (alloc 全新 slot, .slot 写 v1), 字节级不变.
+        self._content_addr = (
+            os.environ.get("LICHT_ARENA_CONTENT_ADDR", "0") == "1")
+        # 埋点计数 (LICHT_ARENA_DEBUG): dedup 命中 / 新分配 block 数
+        self._stat_hit_blocks = 0
+        self._stat_miss_blocks = 0
+
     # ============================================================
     # Lifecycle
     # ============================================================
@@ -179,6 +192,9 @@ class LruArenaStore:
         store._hdr = ArenaHdr.create(hdr_path, num_slots=num_slots)
         store._allocator = ArenaAllocator(store._hdr)
         store._allocator.init_all_free()
+        # ★ Stage 6: 内容寻址开时初始化 hash 表 (零页非 EMPTY, 必须 clear)
+        if store._content_addr:
+            store._hdr.content_addr_init()
         return store
 
     @classmethod
@@ -211,6 +227,10 @@ class LruArenaStore:
         def _on_create(hdr):
             tmp_allocator = ArenaAllocator(hdr)
             tmp_allocator.init_all_free()
+            # ★ Stage 6: 内容寻址开时, 在 flock 临界区内 clear hash 表,
+            # 保证后到进程看到的是已 init 的完整状态 (与 bitmap init 同步).
+            if store._content_addr:
+                hdr.content_addr_init()
 
         store._hdr = ArenaHdr.open_or_create(
             hdr_path, num_slots=num_slots,
@@ -255,6 +275,18 @@ class LruArenaStore:
     @property
     def storage_path(self) -> str:
         return self._storage_path
+
+    @property
+    def content_addr(self) -> bool:
+        return self._content_addr
+
+    @property
+    def _ht_base(self) -> int:
+        return self._hdr.hash_table_addr
+
+    @property
+    def _ht_cap(self) -> int:
+        return self._hdr.hash_table_capacity
 
     def free_count(self) -> int:
         """快照空闲 slot 数. 仅在持 mutex 时严格准确."""
@@ -302,6 +334,23 @@ class LruArenaStore:
             out.append((s, e, os.path.join(d, name)))
         out.sort()
         return out
+
+    def _read_slot_sg(self, path: str) -> Optional[List[Tuple[int, int]]]:
+        """读 .slot 返回 [(slot_id, gen), ...], v1/v2 自适应 (lookup/load 用).
+
+        v2 (content-addr) 多带 hash 字段, 这里丢弃只取 (slot, gen).
+        损坏/不存在返回 None.
+        """
+        ver = read_slot_file_version(path)
+        if ver == 2:
+            sf2 = read_slot_file_v2(path)
+            if sf2 is None:
+                return None
+            return [(s, g) for (s, g, _h) in sf2.records]
+        sf1 = read_slot_file_v1(path)
+        if sf1 is None:
+            return None
+        return sf1.records
 
     def _read_manifest(self, job_id: str) -> Optional[dict]:
         try:
@@ -363,6 +412,11 @@ class LruArenaStore:
         if self._data_writer is None:
             logger.warning("write_inc: data_writer not bound, skipping")
             return False
+
+        # ★ Stage 6: 内容寻址 dedup 路径 (probe hash 表, 命中复用不新分配)
+        if self._content_addr:
+            return self._write_inc_dedup(
+                job_id, start_block, end_block, token_ids, source_obj)
 
         # ---- 临界区 1: alloc (+ evict if needed), 拿到 slot_ids ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
@@ -459,6 +513,178 @@ class LruArenaStore:
         return True
 
     # ============================================================
+    # ★ Stage 6: 内容寻址 dedup store
+    # ============================================================
+    def _write_inc_dedup(self,
+                         job_id: str,
+                         start_block: int,
+                         end_block: int,
+                         token_ids: List[int],
+                         source_obj: object) -> bool:
+        """内容寻址版 write_inc.
+
+        与非 dedup 版同样的三段式临界区, 但每块先 probe hash 表:
+          - HIT: refcnt++ 复用已有 slot, 不分配/不搬数据
+          - MISS: alloc 新 slot + 插表 + refcnt=1, 锁外搬数据, CS2 publish
+
+        正确性要点:
+          - insert 必须在 CS1 内 (跨进程同 mutex 串行), 并发同内容写者出 CS1
+            即看到 entry -> HIT, 不会给同内容重复分配 slot.
+          - HIT refcnt++ 必须在 evict 之前做: 否则 evict 可能把某 HIT slot 的
+            refcnt 减到 0 释放掉 (若它属于受害 job), 之后我们 inc 到一个已释放
+            slot. 先 inc 保证 evict 时它 refcnt>=2 不会被淘.
+          - gen 只在 MISS slot 上 publish; HIT slot 的 gen 已由原 owner 发布,
+            不动 (其他引用者还在用).
+        """
+        n_blocks = end_block - start_block
+        # 链式 hash 需要整个前缀 [0,end) 来算 [start,end) 段
+        all_hashes = block_hashes(token_ids, self._block_size, end_block)
+        if len(all_hashes) < end_block:
+            logger.warning(
+                "dedup write_inc: token_ids 不足 job=%s end=%d have=%d",
+                str(job_id)[:32], end_block, len(all_hashes))
+            return False
+        inc_hashes = all_hashes[start_block:end_block]
+        ht_base, ht_cap = self._ht_base, self._ht_cap
+
+        # 每块计划: [kind('H'/'M'), slot_id, hash]
+        plan: List[list] = [['?', -1, h] for h in inc_hashes]
+
+        # ---- 临界区 1: probe + HIT refcnt++ + MISS alloc/insert ----
+        rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if rc == _atomic.errno_eownerdead():
+            _atomic.mutex_recover(self._hdr.mutex_addr)
+            self._allocator.sync_from_bitmap()
+        elif rc != 0:
+            logger.warning("dedup write_inc: mutex_lock failed rc=%d", rc)
+            return False
+        hit_inced: List[int] = []   # 已 refcnt++ 的 HIT slot (回滚用)
+        try:
+            miss_is: List[int] = []
+            for i, h in enumerate(inc_hashes):
+                slot = _atomic.ht_probe(ht_base, ht_cap, h)
+                if slot >= 0:
+                    plan[i][0] = 'H'
+                    plan[i][1] = slot
+                else:
+                    plan[i][0] = 'M'
+                    miss_is.append(i)
+            # HIT 先 refcnt++ (保护其不被下面 evict 淘掉)
+            for i in range(n_blocks):
+                if plan[i][0] == 'H':
+                    _atomic.refcnt_inc(
+                        self._hdr.slot_refcnt_addr(plan[i][1]))
+                    hit_inced.append(plan[i][1])
+            # MISS alloc (+ evict)
+            n_miss = len(miss_is)
+            if n_miss > 0:
+                slot_ids = self._allocator.alloc_n(n_miss)
+                if slot_ids is None:
+                    accurate_free = self._allocator.count_free_accurate()
+                    need = n_miss - accurate_free
+                    if not self._evict_until_free_locked(
+                            need, exclude_job_id=job_id):
+                        for s in hit_inced:
+                            _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(s))
+                        return False
+                    slot_ids = self._allocator.alloc_n(n_miss)
+                    if slot_ids is None:
+                        for s in hit_inced:
+                            _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(s))
+                        logger.warning(
+                            "dedup write_inc: alloc failed after evict "
+                            "(job=%s n_miss=%d)", str(job_id)[:32], n_miss)
+                        return False
+                # MISS: 绑 slot + refcnt=1 + 插表 (插表在 CS1, 防并发重复分配)
+                for k, i in enumerate(miss_is):
+                    s = slot_ids[k]
+                    plan[i][1] = s
+                    _atomic.refcnt_set(self._hdr.slot_refcnt_addr(s), 1)
+                    _atomic.ht_insert(ht_base, ht_cap, plan[i][2], s)
+        finally:
+            _atomic.mutex_unlock(self._hdr.mutex_addr)
+
+        # ---- 锁外: 只对 MISS 搬数据 + 建 v2 records (慢) ----
+        try:
+            for i in range(n_blocks):
+                if plan[i][0] == 'M':
+                    self._data_writer(plan[i][1], i, source_obj)
+            # records: (slot, gen, hash). HIT gen=当前; MISS gen=当前+1(待发布)
+            records: List[Tuple[int, int, int]] = []
+            miss_pub: List[Tuple[int, int]] = []   # (slot, new_gen) 待 publish
+            for i in range(n_blocks):
+                kind, slot, h = plan[i][0], plan[i][1], plan[i][2]
+                cur_gen = _atomic.get_gen(self._hdr.slot_state_addr(slot))
+                if kind == 'M':
+                    new_gen = cur_gen + 1
+                    records.append((slot, new_gen, h))
+                    miss_pub.append((slot, new_gen))
+                else:
+                    records.append((slot, cur_gen, h))
+            slot_path = self._slot_path(job_id, start_block, end_block)
+            write_slot_file_v2(slot_path, records)
+        except Exception as e:
+            logger.warning("dedup write_inc: data/slot write failed job=%s: %s",
+                           str(job_id)[:32], e)
+            self._rollback_dedup(hit_inced, plan)
+            return False
+
+        # ---- 临界区 2: 只 publish MISS slot, 更新 LRU ----
+        rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if rc == _atomic.errno_eownerdead():
+            _atomic.mutex_recover(self._hdr.mutex_addr)
+            self._allocator.sync_from_bitmap()
+        elif rc != 0:
+            logger.warning("dedup write_inc: mutex_lock(publish) failed rc=%d",
+                           rc)
+            return False
+        try:
+            for (slot, new_gen) in miss_pub:
+                _atomic.publish_slot(self._hdr.slot_state_addr(slot), new_gen)
+            self._last_stored[job_id] = end_block
+            self._touch_job_lru(job_id)
+        finally:
+            _atomic.mutex_unlock(self._hdr.mutex_addr)
+
+        # ---- 锁外: 重写 manifest ----
+        self._write_manifest(
+            job_id, end_block, token_ids[:end_block * self._block_size])
+
+        n_hit = n_blocks - len(miss_pub)
+        self._stat_hit_blocks += n_hit
+        self._stat_miss_blocks += len(miss_pub)
+        if self._debug:
+            logger.info(
+                "LRU-DBG dedup write_inc job=%s [%d,%d) hit=%d miss=%d "
+                "acc_free=%d (cum hit=%d miss=%d)",
+                str(job_id)[:32], start_block, end_block, n_hit, len(miss_pub),
+                self._allocator.count_free_accurate(),
+                self._stat_hit_blocks, self._stat_miss_blocks)
+        return True
+
+    def _rollback_dedup(self, hit_inced: List[int], plan: List[list]) -> None:
+        """dedup write_inc 锁外阶段失败的回滚 (临界区内): HIT refcnt--,
+        MISS 删表 + free slot (gen 未发布, 无需动)."""
+        rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if rc not in (0, _atomic.errno_eownerdead()):
+            return
+        if rc == _atomic.errno_eownerdead():
+            _atomic.mutex_recover(self._hdr.mutex_addr)
+            self._allocator.sync_from_bitmap()
+        try:
+            for s in hit_inced:
+                _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(s))
+            miss_slots = [p[1] for p in plan if p[0] == 'M' and p[1] >= 0]
+            for i, p in enumerate(plan):
+                if p[0] == 'M' and p[1] >= 0:
+                    _atomic.ht_remove(self._ht_base, self._ht_cap, p[2])
+                    _atomic.refcnt_set(self._hdr.slot_refcnt_addr(p[1]), 0)
+            if miss_slots:
+                self._allocator.free_n(miss_slots)
+        finally:
+            _atomic.mutex_unlock(self._hdr.mutex_addr)
+
+    # ============================================================
     # LOOKUP (lock-free)
     # ============================================================
     def lookup(self, job_id: str,
@@ -492,11 +718,11 @@ class LruArenaStore:
         for (s, e, path) in self._list_incs(job_id):
             if s != valid_blocks:
                 break   # coverage gap (跨 inc 不连续)
-            sf = read_slot_file_v1(path)
-            if sf is None or len(sf.records) != (e - s):
+            recs = self._read_slot_sg(path)
+            if recs is None or len(recs) != (e - s):
                 break
             ok = True
-            for (slot_id, expected_gen) in sf.records:
+            for (slot_id, expected_gen) in recs:
                 cur_gen = _atomic.get_gen(
                     self._hdr.slot_state_addr(slot_id))
                 if cur_gen != expected_gen:
@@ -543,14 +769,14 @@ class LruArenaStore:
                 continue
             if s > covered:
                 return None   # coverage gap
-            sf = read_slot_file_v1(path)
-            if sf is None or len(sf.records) != (e - s):
+            recs = self._read_slot_sg(path)
+            if recs is None or len(recs) != (e - s):
                 return None
             a = max(s, lo)
             b = min(e, hi)
             # inc 内 block 下标 [a-s, b-s)
             for blk_in_inc in range(a - s, b - s):
-                all_records.append(sf.records[blk_in_inc])
+                all_records.append(recs[blk_in_inc])
             for blk_in_dst in range(a - lo, b - lo):
                 all_dst.append(dst_block_ids[blk_in_dst])
             covered = b
@@ -724,43 +950,48 @@ class LruArenaStore:
             if e > committed:
                 # 未提交的 inc (正在被 writer 写), 跳过, 不能淘
                 continue
-            sf = read_slot_file_v1(path)
-            if sf is None:
-                # 损坏的 .slot, 直接删
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                continue
-            slots_freed_here: List[int] = []
-            slots_left_pinned: List[int] = []
-            for (slot_id, _gen) in sf.records:
-                # 已经 free 的 slot 跳过 (防止跨进程/stale LRU 重复 free 把
-                # free_count 加错: 对方进程可能已 evict 过这个 job 的 slot).
-                if self._allocator.is_free(slot_id):
-                    continue
-                addr = self._hdr.slot_state_addr(slot_id)
-                if _atomic.can_evict(addr):
-                    _atomic.evict_slot(addr)
-                    slots_freed_here.append(slot_id)
-                else:
-                    slots_left_pinned.append(slot_id)
-            if slots_freed_here:
-                self._allocator.free_n(slots_freed_here)
-                released += len(slots_freed_here)
-                # 同步回退 _last_stored (self-heal)
-                cur_last = self._last_stored.get(job_id, e)
-                if s < cur_last:
-                    self._last_stored[job_id] = s
-                    # 同步回退 manifest 的 total_blocks
-                    self._rewrite_manifest_for_self_heal(job_id, s)
-                # 如果 inc 内还有 pinned slot, 不删 .slot 文件
-                # (next lookup 校验 gen 时自然发现 gap)
-                if not slots_left_pinned:
+            if self._content_addr:
+                # ---- ★ content-addr: refcnt--, 到 0 才真销毁 ----
+                released += self._evict_inc_content(job_id, s, e, path)
+            else:
+                # ---- 原始 plain 路径 (非 content-addr), 行为不变 ----
+                sf = read_slot_file_v1(path)
+                if sf is None:
+                    # 损坏的 .slot, 直接删
                     try:
                         os.unlink(path)
                     except OSError:
                         pass
+                    continue
+                slots_freed_here: List[int] = []
+                slots_left_pinned: List[int] = []
+                for (slot_id, _gen) in sf.records:
+                    # 已经 free 的 slot 跳过 (防止跨进程/stale LRU 重复 free 把
+                    # free_count 加错: 对方进程可能已 evict 过这个 job 的 slot).
+                    if self._allocator.is_free(slot_id):
+                        continue
+                    addr = self._hdr.slot_state_addr(slot_id)
+                    if _atomic.can_evict(addr):
+                        _atomic.evict_slot(addr)
+                        slots_freed_here.append(slot_id)
+                    else:
+                        slots_left_pinned.append(slot_id)
+                if slots_freed_here:
+                    self._allocator.free_n(slots_freed_here)
+                    released += len(slots_freed_here)
+                    # 同步回退 _last_stored (self-heal)
+                    cur_last = self._last_stored.get(job_id, e)
+                    if s < cur_last:
+                        self._last_stored[job_id] = s
+                        # 同步回退 manifest 的 total_blocks
+                        self._rewrite_manifest_for_self_heal(job_id, s)
+                    # 如果 inc 内还有 pinned slot, 不删 .slot 文件
+                    # (next lookup 校验 gen 时自然发现 gap)
+                    if not slots_left_pinned:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
         # 如果该 job 已被淘空 (没有 .slot 文件了), 从内存 LRU + 文件系统清理.
         # 关键: 无条件检查 (即使 released==0). 跨进程场景下对方可能已把这个
         # job evict 空了, 本进程 _job_lru 仍有它 (空壳). 选到空壳时 released=0,
@@ -781,6 +1012,56 @@ class LruArenaStore:
                         str(job_id)[:32], released,
                         self._allocator.count_free_accurate())
         return released
+
+    def _evict_inc_content(self, job_id: str, s: int, e: int,
+                           path: str) -> int:
+        """★ content-addr 版单 inc 淘汰 (在 alloc_mutex 内调用).
+
+        对该 inc 的每块 refcnt--; 减到 0 且 pin==0 才真销毁 (bump gen + 删表 +
+        free). refcnt>0 的块仅摘本 job 引用, 数据留给别的 job. pin>0 的块跳过
+        留下轮. 返回真正释放的 slot 数 (用于 evict 的 gained 计数).
+
+        self-heal + unlink: 当本 job 对该 inc 的引用被完全摘除 (无 pinned 残留)
+        即触发, 即使 freed==0 (全是 refcnt-- 未到 0) —— 因为 manifest/.slot 被
+        删后该 job 逻辑上不再持有这段, 下轮须从 s 续 store.
+        """
+        sf2 = read_slot_file_v2(path)
+        if sf2 is None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return 0
+        freed = 0
+        left_pinned = 0
+        for (slot_id, _gen, h) in sf2.records:
+            if self._allocator.is_free(slot_id):
+                continue   # 已被释放 (别的引用者把 refcnt 减到 0)
+            addr = self._hdr.slot_state_addr(slot_id)
+            if not _atomic.can_evict(addr):
+                left_pinned += 1
+                continue   # pinned, 不能动, 留下轮
+            # 校验该 slot 仍持有这个 hash 的内容 (防 slot 被淘后复用给别 hash
+            # 时误减别人的 refcnt). 正常 refcnt 记账下恒成立, 此为纵深防御.
+            if _atomic.ht_probe(self._ht_base, self._ht_cap, h) != slot_id:
+                continue
+            new_rc = _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(slot_id))
+            if new_rc == 0:
+                _atomic.evict_slot(addr)
+                _atomic.ht_remove(self._ht_base, self._ht_cap, h)
+                self._allocator.free_n([slot_id])
+                freed += 1
+            # else: refcnt>0, 数据留给别的 job, 仅摘本 job 引用
+        if left_pinned == 0:
+            cur_last = self._last_stored.get(job_id, e)
+            if s < cur_last:
+                self._last_stored[job_id] = s
+                self._rewrite_manifest_for_self_heal(job_id, s)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return freed
 
     def _rewrite_manifest_for_self_heal(self, job_id: str,
                                          new_total_blocks: int) -> None:

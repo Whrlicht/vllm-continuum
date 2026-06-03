@@ -45,6 +45,16 @@ class SlotFileV1:
         return len(self.records)
 
 
+@dataclass(frozen=True)
+class SlotFileV2:
+    """Stage 6 .slot 文件内容: 每 block 一条 (slot_id, gen, content_hash)."""
+    records: List[Tuple[int, int, int]]   # [(slot_id, gen, hash), ...]
+
+    @property
+    def n(self) -> int:
+        return len(self.records)
+
+
 def write_slot_file_v1(path: str,
                        records: List[Tuple[int, int]]) -> None:
     """原子写: mkstemp + write + atomic rename.
@@ -100,6 +110,77 @@ def read_slot_file_v1(path: str) -> SlotFileV1 | None:
         records.append((slot_id, gen))
         off += 16
     return SlotFileV1(records=records)
+
+
+def write_slot_file_v2(path: str,
+                       records: List[Tuple[int, int, int]]) -> None:
+    """★ Stage 6 原子写: 每 block (slot_id, gen, content_hash).
+
+    records: [(slot_id, gen, hash), ...] 长度 = inc 的 block 数.
+    hash 是 uint64 (无符号打包); slot_id/gen 为 int64.
+    """
+    n = len(records)
+    body = struct.pack("<4sHH", _MAGIC, VERSION_V2, 0)
+    body += struct.pack("<Q", n)
+    for (slot_id, gen, h) in records:
+        body += struct.pack("<qqQ", slot_id, gen, h & 0xFFFFFFFFFFFFFFFF)
+
+    dir_ = os.path.dirname(path) or "."
+    os.makedirs(dir_, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".slot_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_slot_file_v2(path: str) -> SlotFileV2 | None:
+    """读 v2 格式. 不存在/损坏/非 v2 返回 None."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    if len(raw) < _HEADER_SIZE:
+        return None
+    magic, version, _reserved = struct.unpack("<4sHH", raw[:8])
+    if magic != _MAGIC or version != VERSION_V2:
+        return None
+    (n,) = struct.unpack("<Q", raw[8:16])
+    expected_size = _HEADER_SIZE + n * 24
+    if len(raw) < expected_size:
+        return None
+    records: List[Tuple[int, int, int]] = []
+    off = _HEADER_SIZE
+    for _ in range(n):
+        slot_id, gen, h = struct.unpack("<qqQ", raw[off:off + 24])
+        records.append((slot_id, gen, h))
+        off += 24
+    return SlotFileV2(records=records)
+
+
+def read_slot_file_version(path: str) -> int | None:
+    """只读 header 里的 version (1/2). 不存在/损坏返回 None.
+
+    用于 evict/load 在两种格式间分派 (content-addr 模式下是 v2).
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_HEADER_SIZE)
+    except (FileNotFoundError, OSError):
+        return None
+    if len(head) < 8:
+        return None
+    magic, version, _reserved = struct.unpack("<4sHH", head[:8])
+    if magic != _MAGIC:
+        return None
+    return int(version)
 
 
 def slot_filename(start_block: int, end_block: int) -> str:
