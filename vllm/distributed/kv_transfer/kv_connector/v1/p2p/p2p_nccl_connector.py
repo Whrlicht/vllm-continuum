@@ -74,6 +74,39 @@ class RoundReqMeta:
     # cache, so block_ids (the destination) and the saved source stay
     # aligned even when a local hit and a round-kv hit coexist.
     src_block_offset: int = 0
+    # ★ Stage 6d cross-job: resolved (slot, gen) per dst block, from the
+    # scheduler-side lookup_resolve (content-addressing).  Two parallel int
+    # lists, aligned with block_ids.  None/empty = own-job load (worker reads
+    # its own .slot via src_block_offset).  Carries the table-resolved slots to
+    # the worker so a brand-new job can load another job's shared prefix.
+    src_slots: Optional[list] = None
+    src_gens: Optional[list] = None
+
+
+def _rl_slot_gen(rl: "RoundReqMeta"):
+    """★ Stage 6d: 从 RoundReqMeta 取跨 job 显式 (slot,gen) 列表 (与 block_ids
+    对齐); None = own-job (worker 走自己的 .slot)."""
+    if rl.src_slots and rl.src_gens:
+        return list(zip(rl.src_slots, rl.src_gens))
+    return None
+
+
+def _rl_item(rl: "RoundReqMeta"):
+    """构建 load_batch/pipelined 的 item. 无跨 job slot 时返回 3 元组 (与旧路径
+    完全一致, FIFO/raw/pipelined 消费者不受影响); 有则 4 元组带 (slot,gen) 列表
+    (仅 LRU content-addr 路径会消费)."""
+    sg = _rl_slot_gen(rl)
+    if sg is None:
+        return (rl.job_id, rl.block_ids, rl.src_block_offset)
+    return (rl.job_id, rl.block_ids, rl.src_block_offset, sg)
+
+
+def _rl_item_async(rl: "RoundReqMeta"):
+    """enqueue_load 的 item (带 request_id). 同样按需 4→5 元组."""
+    sg = _rl_slot_gen(rl)
+    if sg is None:
+        return (rl.request_id, rl.job_id, rl.block_ids, rl.src_block_offset)
+    return (rl.request_id, rl.job_id, rl.block_ids, rl.src_block_offset, sg)
 
 
 @dataclass
@@ -364,21 +397,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # in WAITING_FOR_REMOTE_KVS; get_finished reports them
                         # done (recving) once the bg load fills their blocks.
                         if metadata.round_load:
-                            self._round_store_obj.enqueue_load([
-                                (rl.request_id, rl.job_id, rl.block_ids,
-                                 rl.src_block_offset)
-                                for rl in metadata.round_load])
+                            self._round_store_obj.enqueue_load(
+                                [_rl_item_async(rl)
+                                 for rl in metadata.round_load])
                     elif self._round_store_obj.pipeline_enabled:
                         # (sync) Layer-wise pipelined load.
-                        _items = [
-                            (rl.job_id, rl.block_ids, rl.src_block_offset)
-                            for rl in metadata.round_load]
+                        _items = [_rl_item(rl) for rl in metadata.round_load]
                         self._round_store_obj.start_load_pipelined(_items)
                     elif metadata.round_load:
                         # (sync) Batched load: BLOCKS the engine until done.
-                        _items = [
-                            (rl.job_id, rl.block_ids, rl.src_block_offset)
-                            for rl in metadata.round_load]
+                        _items = [_rl_item(rl) for rl in metadata.round_load]
                         self._round_store_obj.load_batch(_items)
                 self._step_t_load_end = time.time()
                 # Bridge publication must happen after prefill forward.
@@ -459,8 +487,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if ((self._phase1_save_on_preempt or self._phase2_admission_gate)
                     and self._round_kv_enabled and metadata.round_load
                     and self._round_store_obj is not None):
-                _items = [(rl.job_id, rl.block_ids, rl.src_block_offset)
-                          for rl in metadata.round_load]
+                _items = [_rl_item(rl) for rl in metadata.round_load]
                 try:
                     _res = self._round_store_obj.load_batch(_items)
                     logger.info(
@@ -1018,10 +1045,13 @@ p2p_nccl_engine import get_fast_release_queue
             if self._round_kv_enabled:
                 job_id = getattr(request, "job_id", None)
                 if job_id:
-                    res = self._round_store_obj.lookup(
+                    # ★ Stage 6d: 用 lookup_resolve (content-addr 表驱动, job 无关)
+                    # 算可复用 token 数. 必须与 update_state_after_alloc 用同一口径,
+                    # 否则全新 job own-job lookup 返 0 → 不分配 → 跨 job 命中白费.
+                    res = self._round_store_obj.lookup_resolve(
                         str(job_id), request.prompt_token_ids)
                     if res is not None:
-                        matched_tokens, _ = res
+                        matched_tokens, _mb, _sg = res
                         ext = matched_tokens - num_computed_tokens
                         if ext > 0:
                             # async (True): park in WAITING_FOR_REMOTE_KVS,
@@ -1173,7 +1203,7 @@ p2p_nccl_engine import get_fast_release_queue
                                 local_hit_blocks + num_blocks]
                             self._round_load_reqs[
                                 request.request_id] = (
-                                    str(job_id), dst, local_hit_blocks)
+                                    str(job_id), dst, local_hit_blocks, None)
                             self._arena_sinked.discard(
                                 request.request_id)
                             logger.info(
@@ -1216,7 +1246,7 @@ p2p_nccl_engine import get_fast_release_queue
                                 local_hit_blocks + num_blocks]
                             self._round_load_reqs[
                                 request.request_id] = (
-                                    str(job_id), dst, local_hit_blocks)
+                                    str(job_id), dst, local_hit_blocks, None)
                             # One-shot: arena → GPU, drop the marker.
                             self._preempt_saved.pop(
                                 request.request_id, None)
@@ -1237,10 +1267,10 @@ p2p_nccl_engine import get_fast_release_queue
                 and num_external_tokens > 0):
             job_id = getattr(request, "job_id", None)
             if job_id and self._round_store_obj is not None:
-                res = self._round_store_obj.lookup(
+                res = self._round_store_obj.lookup_resolve(
                     str(job_id), request.prompt_token_ids)
                 if res is not None:
-                    _matched_tokens, matched_blocks = res
+                    _matched_tokens, matched_blocks, slot_gen = res
                     num_blocks = num_external_tokens // self._block_size
                     # local cache hit (in blocks) sits before the gap.
                     local_hit_blocks = matched_blocks - num_blocks
@@ -1250,8 +1280,16 @@ p2p_nccl_engine import get_fast_release_queue
                             >= local_hit_blocks + num_blocks):
                         dst = list(block_ids0)[
                             local_hit_blocks:local_hit_blocks + num_blocks]
+                        # ★ 跨 job: 把 lookup_resolve 解析的 slot 切到与 dst 对齐的
+                        # 段 [local_hit_blocks, local_hit_blocks+num_blocks).
+                        sg = None
+                        if slot_gen is not None:
+                            sg = slot_gen[
+                                local_hit_blocks:local_hit_blocks + num_blocks]
+                            if len(sg) != num_blocks:
+                                sg = None   # 解析不足, 退回 own-.slot
                         self._round_load_reqs[request.request_id] = (
-                            str(job_id), dst, local_hit_blocks)
+                            str(job_id), dst, local_hit_blocks, sg)
 
     # 回传 REMOVED (2026-05-21): enqueue_v3_pushback / enqueue_v3_offload /
     # enqueue_v3_offload_release deleted.
@@ -1277,13 +1315,20 @@ p2p_nccl_engine import get_fast_release_queue
         # (decode) during the forward.  Done before the role-specific
         # early returns below so both paths carry it.
         if self._round_kv_enabled:
-            for req_id, (job_id, dst_block_ids, src_offset) in \
-                    self._round_load_reqs.items():
+            for req_id, _v in self._round_load_reqs.items():
+                # _v 为 (job_id, dst, src_offset) 或 (..., slot_gen) 4 元组.
+                job_id, dst_block_ids, src_offset = _v[0], _v[1], _v[2]
+                slot_gen = _v[3] if len(_v) > 3 else None
+                src_slots = ([int(s) for (s, _g) in slot_gen]
+                             if slot_gen else None)
+                src_gens = ([int(g) for (_s, g) in slot_gen]
+                            if slot_gen else None)
                 meta.round_load.append(RoundReqMeta(
                     request_id=req_id, job_id=job_id,
                     block_ids=list(dst_block_ids), token_ids=[],
                     num_blocks=len(dst_block_ids),
-                    src_block_offset=src_offset))
+                    src_block_offset=src_offset,
+                    src_slots=src_slots, src_gens=src_gens))
             self._round_load_reqs.clear()
             for req_id, (job_id, block_ids0, token_ids) in \
                     self._pending_round_store.items():

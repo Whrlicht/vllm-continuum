@@ -554,15 +554,23 @@ class RoundKVStore:
 
     def _load_request_arena_lru(self, job_id: str,
                                  dst_block_ids: list,
-                                 src_block_offset: int) -> bool:
+                                 src_block_offset: int,
+                                 slot_gen: list = None) -> bool:
         """LRU 版 load_request: 用 LruArenaStore.load_request 拿 LoadHandle,
         然后 gather + H2D + per-layer scatter.
+
+        slot_gen: ★ 跨 job 显式 (slot,gen) 列表 (lookup_resolve 解析的). 提供时
+        走 load_pin_explicit (不查自己的 .slot); 否则 own-job 查 .slot.
 
         返回: True 成功, False miss/race
         """
         import torch
-        handle = self._lru_store.load_request(
-            str(job_id), list(dst_block_ids), int(src_block_offset))
+        if slot_gen:
+            handle = self._lru_store.load_pin_explicit(
+                list(slot_gen), list(dst_block_ids))
+        else:
+            handle = self._lru_store.load_request(
+                str(job_id), list(dst_block_ids), int(src_block_offset))
         if handle is None:
             return False
         try:
@@ -659,10 +667,12 @@ class RoundKVStore:
             return self._load_batch_arena_lru_direct(items)
         # fallback: 逐请求 (consumer 端 / kernel 不可用)
         results = []
-        for (job_id, dst_block_ids, src_block_offset) in items:
+        for item in items:
+            job_id, dst_block_ids, src_block_offset = item[0], item[1], item[2]
+            slot_gen = item[3] if len(item) > 3 else None
             try:
                 ok = self._load_request_arena_lru(
-                    job_id, dst_block_ids, src_block_offset)
+                    job_id, dst_block_ids, src_block_offset, slot_gen)
             except Exception as e:  # pragma: no cover
                 logger.warning("round-kv LRU load_request error job=%s: %s",
                                str(job_id)[:32], e)
@@ -1453,6 +1463,24 @@ class RoundKVStore:
     # ------------------------------------------------------------------
     # LOOKUP (prefill, scheduler thread, filesystem-only)
     # ------------------------------------------------------------------
+
+    def lookup_resolve(self, job_id: str, cur_token_ids: list) -> Optional[tuple]:
+        """★ Stage 6d 跨 job 表驱动 lookup.
+
+        返回 (matched_tokens, matched_blocks, slot_gen_list) 或 None.
+          - content_addr 开 (LRU): 走 LruArenaStore.lookup_resolve, job 无关,
+            命中 own/cross-job; slot_gen_list 是匹配前缀逐块 (slot,gen).
+          - content_addr 关 / 非 LRU: 退回 own-job lookup, slot_gen_list=None
+            (调用方据此走原 own-.slot load 路径).
+        """
+        if (self._lru_store is not None
+                and getattr(self._lru_store, "content_addr", False)):
+            return self._lru_store.lookup_resolve(list(cur_token_ids))
+        res = self.lookup(job_id, cur_token_ids)
+        if res is None:
+            return None
+        mt, mb = res
+        return mt, mb, None
 
     def lookup(self, job_id: str, cur_token_ids: list) -> Optional[tuple]:
         """Return (matched_tokens, matched_blocks) for the longest
@@ -2477,7 +2505,8 @@ class RoundKVStore:
                 continue
             if it is None:
                 break
-            rid, job_id, dst, off = it
+            rid, job_id, dst, off = it[0], it[1], it[2], it[3]
+            slot_gen = it[4] if len(it) > 4 else None   # ★ 跨 job 显式 slot
             _t0 = time.time()
             _nblk = len(dst)
             try:
@@ -2487,10 +2516,12 @@ class RoundKVStore:
                     import torch
                     if stream is not None:
                         with torch.cuda.stream(stream):
-                            self._load_request_arena_lru(job_id, dst, off)
+                            self._load_request_arena_lru(
+                                job_id, dst, off, slot_gen)
                         stream.synchronize()
                     else:
-                        self._load_request_arena_lru(job_id, dst, off)
+                        self._load_request_arena_lru(
+                            job_id, dst, off, slot_gen)
                         torch.cuda.current_stream().synchronize()
                 elif self._arena and self._arena_registered and self._is_cuda:
                     # ARENA: direct H2D from the resident pinned region.
@@ -2804,7 +2835,10 @@ class RoundKVStore:
         # Build per-request plans + open each unique increment file once.
         plans = []
         open_files: dict = {}
-        for (job_id, dst, off) in items:
+        for item in items:
+            # pipelined 是 FIFO-only 实验路径 (不支持跨 job 显式 slot); 容忍 4 元组
+            # 但忽略第 4 元素, 避免与 content-addr 组合时解包崩溃.
+            job_id, dst, off = item[0], item[1], item[2]
             p = self._plan_request(job_id, dst, off)
             plans.append(p)
             if p is not None:

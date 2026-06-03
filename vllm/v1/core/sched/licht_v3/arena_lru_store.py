@@ -833,11 +833,18 @@ class LruArenaStore:
         all_dst: List[int] = []
         all_gens: List[int] = []
         all_addrs: List[int] = []
-        for k, (job_id, dst_block_ids, src_block_offset) in enumerate(items):
-            # 复用单请求 load_request 的解析 + pin (它内部已处理 coverage gap、
-            # gen 校验、try_pin 回滚). 成功则把它的 slot/gen/dst 并入大数组.
-            handle = self.load_request(
-                str(job_id), list(dst_block_ids), int(src_block_offset))
+        for k, item in enumerate(items):
+            # item 可为 3 元组 (job_id, dst, src_offset) [own-job, 查 .slot],
+            # 或 4 元组 (..., slot_gen_list) [★ 跨 job, lookup_resolve 已解析好的
+            # (slot,gen) 列表, 直接 load_pin_explicit].
+            job_id, dst_block_ids, src_block_offset = item[0], item[1], item[2]
+            slot_gen = item[3] if len(item) > 3 else None
+            if slot_gen:
+                handle = self.load_pin_explicit(
+                    list(slot_gen), list(dst_block_ids))
+            else:
+                handle = self.load_request(
+                    str(job_id), list(dst_block_ids), int(src_block_offset))
             if handle is None:
                 continue
             per_item_ok[k] = True

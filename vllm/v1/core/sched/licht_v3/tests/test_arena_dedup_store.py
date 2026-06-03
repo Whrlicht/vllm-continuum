@@ -226,6 +226,24 @@ class TestCrossJobLookup:
         assert handle.post_load_validate()
         handle.release()
 
+    def test_load_batch_pin_explicit_4tuple(self, tmp_path, monkeypatch):
+        """connector 实际路径: load_batch_pin 收 4 元组 (含 slot_gen) → 走显式 pin."""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
+        toks_a = list(range(48))
+        store.write_inc("A", 0, 3, toks_a, [b"a0", b"a1", b"a2"])
+        _, _, sg = store.lookup_resolve(list(range(48)) + list(range(900, 916)))
+        # 全新 job B 用解析出的 slot 走 4 元组 batch load
+        bh = store.load_batch_pin([("B", [30, 31, 32], 0, sg)])
+        assert bh.per_item_ok == [True]
+        assert bh.slot_ids == [_slot_of(store, toks_a, i) for i in range(3)]
+        assert bh.dst_block_ids == [30, 31, 32]
+        assert bh.post_load_validate()
+        bh.release()
+        # 3 元组 (own-job) 仍正常 (向后兼容)
+        bh2 = store.load_batch_pin([("A", [40, 41, 42], 0)])
+        assert bh2.per_item_ok == [True]
+        bh2.release()
+
     def test_lookup_resolve_no_prefix_returns_none(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
         store.write_inc("A", 0, 2, list(range(32)), [b"0", b"1"])
