@@ -375,6 +375,40 @@ class RoundKVStore:
     def _arena_hdr_path(self) -> str:
         return os.path.join(self.storage_path, "_arena.hdr")
 
+    def _arena_meta_path(self) -> str:
+        # worker 写 {num_slots, block_size}, scheduler 侧据此 lazy 开只读表
+        return os.path.join(self.storage_path, "_arena_meta.json")
+
+    def _ensure_lookup_store(self) -> None:
+        """★ scheduler 侧 lazy 开一个"只读表"的 LruArenaStore (无 GPU 绑定).
+
+        bind_kv_caches 只在 worker 侧调 → 只有 worker 的 _lru_store 被建; 但 lookup
+        (get_num/update_state) 跑在 scheduler 侧实例上, _lru_store=None → lookup_resolve
+        过去落到 self.lookup 读 .slot 文件 (~32ms). 这里从 worker 写的 meta 拿 num_slots,
+        open_or_create 共享同一 shm hdr (只用来 ht_probe 查表), 让 lookup 走 C 表快路径.
+        worker 侧 _lru_store 已存在, 直接返回不进这里.
+        """
+        if self._lru_store is not None or not self._lru_enabled:
+            return
+        try:
+            with open(self._arena_meta_path()) as f:
+                meta = json.load(f)
+            from vllm.v1.core.sched.licht_v3.arena_lru_store import (
+                LruArenaStore)
+            self._lru_store = LruArenaStore.open_or_create(
+                self.storage_path,
+                num_slots=int(meta["num_slots"]),
+                block_size=int(meta["block_size"]),
+                wait_timeout_s=5.0)
+            logger.info(
+                "round-kv scheduler-side lookup store opened (table-only, "
+                "num_slots=%d, content_addr=%s)",
+                int(meta["num_slots"]), self._lru_store.content_addr)
+        except Exception:
+            # meta 还没写 (worker 未起完) / 打开失败 → 本次 lookup 退回文件路径,
+            # 下次再试 (文件 open 失败很快, 不 log 避免刷屏).
+            pass
+
     def _cuda_host_register(self, addr: int, size: int) -> int:
         import ctypes
         if self._cudart is None:
@@ -421,6 +455,17 @@ class RoundKVStore:
         self._num_slots = max(req // self._slot_bytes, 1)
         self._arena_bytes = self._num_slots * self._slot_bytes
         os.makedirs(self.storage_path, exist_ok=True)
+        # ★ 写 meta, 让 scheduler 侧 _ensure_lookup_store 能 lazy 开只读表 lookup.
+        try:
+            _mp = self._arena_meta_path()
+            _fd, _tmp = tempfile.mkstemp(dir=self.storage_path,
+                                         prefix=".meta_", suffix=".tmp")
+            with os.fdopen(_fd, "w") as _f:
+                json.dump({"num_slots": int(self._num_slots),
+                           "block_size": int(self.block_size)}, _f)
+            os.replace(_tmp, _mp)
+        except Exception:
+            pass
         # ---- arena data file ----
         fd = os.open(self._arena_path(), os.O_CREAT | os.O_RDWR, 0o600)
         os.ftruncate(fd, self._arena_bytes)
@@ -1480,6 +1525,8 @@ class RoundKVStore:
           - content_addr 关 / 非 LRU: 退回 own-job lookup, slot_gen_list=None
             (调用方据此走原 own-.slot load 路径).
         """
+        # scheduler 侧 lazy 开只读表, 否则 _lru_store=None 会落到文件路径 (~32ms).
+        self._ensure_lookup_store()
         if (self._lru_store is not None
                 and getattr(self._lru_store, "content_addr", False)):
             return self._lru_store.lookup_resolve(list(cur_token_ids))
