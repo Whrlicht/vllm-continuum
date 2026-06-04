@@ -16,6 +16,7 @@
 #include "arena_atomic.h"
 #include <errno.h>
 #include <string>
+#include <vector>
 #include <torch/extension.h>
 
 // xxhash single-header: 在本 TU 内联全部实现 (Stage 6 内容寻址 block hash 用)
@@ -310,6 +311,46 @@ uint64_t arena_block_hash(uint64_t prev, const void* data, uint64_t len) {
 }
 
 // ============================================================
+// Stage 6 perf: 整条 lookup_resolve 下沉 C
+// ============================================================
+uint64_t arena_lookup_resolve(
+    void* table_base, uint64_t cap,
+    uint64_t slot_state_base, uint64_t refcnt_base, uint64_t num_slots,
+    const void* tokens, uint64_t n_tokens, uint64_t block_size, uint64_t seed,
+    int64_t* out_slots, uint64_t* out_gens, uint64_t out_cap) {
+    if (block_size == 0) return 0;
+    uint64_t n_full = n_tokens / block_size;
+    const uint32_t* tok = reinterpret_cast<const uint32_t*>(tokens);
+    uint64_t prev = seed;
+    uint64_t matched = 0;
+    for (uint64_t i = 0; i < n_full && matched < out_cap; i++) {
+        // 链式 hash (与 arena_block_hash / Python block_hashes 完全一致)
+        const void* chunk = tok + i * block_size;
+        uint64_t h = (uint64_t)XXH3_64bits_withSeed(
+            chunk, (size_t)(block_size * 4), prev);
+        prev = h;
+        int64_t slot = -1;
+        uint64_t egen = 0;
+        if (!arena_ht_probe(table_base, cap, h, &slot, &egen)) break;
+        if (egen == 0) break;                       // UNPUB (未发布)
+        if (slot < 0 || (uint64_t)slot >= num_slots) break;
+        uint64_t cur_gen = __atomic_load_n(
+            reinterpret_cast<uint64_t*>(
+                slot_state_base + (uint64_t)slot * 8),
+            __ATOMIC_ACQUIRE) & ARENA_GEN_MASK;
+        if (cur_gen != egen) break;                 // slot 被淘汰/复用
+        uint16_t rc = __atomic_load_n(
+            reinterpret_cast<uint16_t*>(refcnt_base + (uint64_t)slot * 2),
+            __ATOMIC_ACQUIRE);
+        if (rc == 0) break;                         // 无引用
+        out_slots[matched] = slot;
+        out_gens[matched] = egen;
+        matched++;
+    }
+    return matched;
+}
+
+// ============================================================
 // Python binding
 // ============================================================
 //
@@ -440,6 +481,32 @@ static uint64_t py_block_hash(uint64_t prev, py::bytes data) {
     return arena_block_hash(prev, s.data(), (uint64_t)s.size());
 }
 
+// ---- Stage 6 perf: 整条 lookup_resolve ----
+// tokens: 整条 prompt 打包成 uint32 LE bytes (Python 一次 struct.pack).
+// 返回 (matched_blocks, slots_list, gens_list).
+static py::tuple py_lookup_resolve(
+    uint64_t table_base, uint64_t cap,
+    uint64_t slot_state_base, uint64_t refcnt_base, uint64_t num_slots,
+    py::bytes tokens, uint64_t block_size, uint64_t seed) {
+    std::string s = tokens;
+    uint64_t n_tokens = (uint64_t)s.size() / 4;
+    uint64_t n_full = (block_size > 0) ? (n_tokens / block_size) : 0;
+    std::vector<int64_t> slots(n_full);
+    std::vector<uint64_t> gens(n_full);
+    uint64_t matched;
+    {
+        py::gil_scoped_release release;   // 纯 C 计算, 放掉 GIL
+        matched = arena_lookup_resolve(
+            reinterpret_cast<void*>(table_base), cap,
+            slot_state_base, refcnt_base, num_slots,
+            s.data(), n_tokens, block_size, seed,
+            slots.data(), gens.data(), n_full);
+    }
+    slots.resize(matched);
+    gens.resize(matched);
+    return py::make_tuple(matched, slots, gens);
+}
+
 // ---- 常量查询 (Python 端避免 hardcode) ----
 static uint64_t py_arena_ht_entry_bytes() {
     return (uint64_t)ARENA_HT_ENTRY_BYTES;
@@ -507,6 +574,12 @@ PYBIND11_MODULE(licht_arena_atomic, m) {
 
     // Stage 6: 链式 block hash
     m.def("block_hash", &py_block_hash, py::arg("prev"), py::arg("data"));
+    // Stage 6 perf: 整条 lookup_resolve 下沉 C
+    m.def("lookup_resolve", &py_lookup_resolve,
+          py::arg("table_base"), py::arg("cap"),
+          py::arg("slot_state_base"), py::arg("refcnt_base"),
+          py::arg("num_slots"), py::arg("tokens"),
+          py::arg("block_size"), py::arg("seed"));
 
     // 常量查询
     m.def("pthread_mutex_size",      &py_pthread_mutex_size);

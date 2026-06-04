@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import struct
 import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Tuple
 import licht_arena_atomic as _atomic
 
 from vllm.v1.core.sched.licht_v3.arena_allocator import ArenaAllocator
-from vllm.v1.core.sched.licht_v3.arena_block_hash import block_hashes
+from vllm.v1.core.sched.licht_v3.arena_block_hash import SEED0, block_hashes
 from vllm.v1.core.sched.licht_v3.arena_hdr import ArenaHdr
 from vllm.v1.core.sched.licht_v3.arena_slot_file import (
     SlotFileV1,
@@ -52,6 +53,9 @@ from vllm.v1.core.sched.licht_v3.arena_slot_file import (
 
 
 logger = logging.getLogger(__name__)
+
+# Stage 6 perf: 整条 lookup_resolve 是否有 C 实现 (旧 .so 没有则回退 Python).
+_HAS_C_LOOKUP = hasattr(_atomic, "lookup_resolve")
 
 _MANIFEST = "manifest.json"
 _RESERVED_DIR_PREFIXES = ("_", ".")  # 不当作 job 处理的目录前缀
@@ -892,6 +896,23 @@ class LruArenaStore:
         n_full = len(prompt_token_ids) // bs
         if n_full <= 0:
             return None
+
+        # ★ C 快路径: 整条循环 (链式 hash + probe + gen/refcnt 校验 + 连续截断)
+        # 一个 C 调用跑完, 替掉 Python 逐块 (800 块=几千次跨语言调用 ~37ms → ~1ms).
+        if _HAS_C_LOOKUP:
+            n_tok = n_full * bs
+            tok_bytes = struct.pack("<%dI" % n_tok,
+                                    *prompt_token_ids[:n_tok])
+            nb, slots, gens = _atomic.lookup_resolve(
+                self._ht_base, self._ht_cap,
+                self._hdr.slot_state_addr(0),
+                self._hdr.slot_refcnt_addr(0),
+                self._num_slots, tok_bytes, bs, SEED0)
+            if nb <= 0:
+                return None
+            return nb * bs, nb, list(zip(slots, gens))
+
+        # Python fallback (旧 .so / 无 C lookup_resolve)
         hashes = block_hashes(prompt_token_ids, bs, n_full)
         slot_gen: List[Tuple[int, int]] = []
         for i in range(n_full):

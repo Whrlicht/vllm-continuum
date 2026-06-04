@@ -182,6 +182,21 @@ void arena_ht_clear(void* table_base, uint64_t cap);    // 全置 EMPTY (create 
 // 保证 "block i 命中 <=> 整个 [0,i] 前缀 token 完全相同". 跨进程确定性.
 uint64_t arena_block_hash(uint64_t prev, const void* data, uint64_t len);
 
+// ============================================================
+// Stage 6 perf: 整条 lookup_resolve 下沉 C
+// ============================================================
+// 把"逐块链式 hash + ht_probe + gen/refcnt 校验 + 连续命中截断"整个循环放进一个
+// C 调用, 替掉 Python 逐块 (800 块=几千次跨语言调用, ~37ms → ~1-2ms).
+// tokens: uint32 LE token 数组 (与 arena_block_hash 的打包一致); 无锁.
+// 返回从块 0 起连续有效的前缀块数; out_slots/out_gens (容量 out_cap) 填对应
+// (slot, gen). 一块有效需: probe 命中 && egen!=0(已发布) && slot_state.gen==egen
+// (未被淘汰复用) && refcnt>0. 任一不满足即截断.
+uint64_t arena_lookup_resolve(
+    void* table_base, uint64_t cap,
+    uint64_t slot_state_base, uint64_t refcnt_base, uint64_t num_slots,
+    const void* tokens, uint64_t n_tokens, uint64_t block_size, uint64_t seed,
+    int64_t* out_slots, uint64_t* out_gens, uint64_t out_cap);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

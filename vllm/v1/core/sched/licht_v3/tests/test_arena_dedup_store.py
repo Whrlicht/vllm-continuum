@@ -244,6 +244,33 @@ class TestCrossJobLookup:
         assert bh2.per_item_ok == [True]
         bh2.release()
 
+    def test_c_lookup_matches_python_reference(self, tmp_path, monkeypatch):
+        """C lookup_resolve 与 Python 逐块参考逻辑结果完全一致."""
+        from vllm.v1.core.sched.licht_v3.arena_block_hash import block_hashes
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=128)
+        store.write_inc("A", 0, 4, list(range(64)),
+                        [b"a0", b"a1", b"a2", b"a3"])
+        prompt = list(range(64)) + list(range(500, 516))  # 4 共享 + 1 未存
+        res_c = store.lookup_resolve(prompt)
+        # Python 参考 (复刻 fallback 逻辑)
+        bs = store.block_size
+        n_full = len(prompt) // bs
+        ref = []
+        for h in block_hashes(prompt, bs, n_full):
+            slot, egen = A.ht_probe(store._ht_base, store._ht_cap, h)
+            if slot < 0 or egen == 0:
+                break
+            if A.get_gen(store._hdr.slot_state_addr(slot)) != egen:
+                break
+            if A.refcnt_get(store._hdr.slot_refcnt_addr(slot)) == 0:
+                break
+            ref.append((slot, egen))
+        if not ref:
+            assert res_c is None
+        else:
+            assert res_c == (len(ref) * bs, len(ref), ref)
+            assert res_c[1] == 4   # 命中 4 个共享块
+
     def test_lookup_resolve_no_prefix_returns_none(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=64)
         store.write_inc("A", 0, 2, list(range(32)), [b"0", b"1"])
