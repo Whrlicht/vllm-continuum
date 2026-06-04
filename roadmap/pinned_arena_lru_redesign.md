@@ -1143,6 +1143,33 @@ arena load; CPU miss 才下探 SSD. 本期只做 CPU.
 - 6f 收尾: 实跑 trace 验证 token-level 一致 + 跨进程双 writer refcnt 不泄漏 + 埋点看
   dedup 命中率 / own-vs-crossjob 比例, 据此定是否收 manifest-only.
 
+## 12.15 lookup/load 性能优化 + idle 根因排查 (2026-06-04, 实跑驱动)
+
+6c/6d 上线后实跑发现 `idle_ms ≫ load_ms`。逐层埋点定位 + 三连优化 (均不改语义):
+
+1. **lookup 缓存** (commit 232d83a): `get_num_new_matched_tokens` 与
+   `update_state_after_alloc` 对同一请求各查一次 (每步 2×), 未准入还跨步反复 probe.
+   按 request_id 缓存 `lookup_resolve` 结果 (`_rk_lookup_cached`), build_connector_meta
+   每步丢弃未再 probe 的条目. load 末尾 try_pin fail-closed 兜底, 缓存安全.
+2. **lookup_resolve 下沉 C** (commit 875bc5e): 整条 per-block 循环 (链式 hash +
+   ht_probe + gen/refcnt 校验) 放进 `arena_lookup_resolve` 一个 C 调用, ~48× (微基准
+   800 块 1.35ms→0.028ms). Python 端 `struct.pack` 整条 prompt 一次传入.
+3. **★ 根因** (commit 954aae4): `bind_kv_caches` 只在 worker 侧建 `_lru_store`, 但
+   lookup 跑在 **scheduler 侧** connector 实例 → 一直落到 `self.lookup` 读 .slot 文件
+   (own-job, 文件 IO ~32ms/次), content-addr 表查询 + C-loop **从未在 scheduler 侧跑过**.
+   修复: worker 写 `_arena_meta.json {num_slots, block_size}`; scheduler 侧
+   `_ensure_lookup_store()` 据 meta lazy `open_or_create` 一个只读表 LruArenaStore
+   (共享同一 shm hdr, 不绑 GPU) → lookup 走 C 表; 顺带 load 改 `load_pin_explicit` 不读文件.
+   实测 (reqs≈22): lookup_ms 1565→~50, admit_loop 2500→~700, load_ms 3000→~100, idle 大降.
+
+**idle 根因结论 (排查到底)**: idle 大头是**模型 prefill forward 本身**. 用 CUDA event
+量 `gpu_fwd` (forward GPU 真实时长 3-11s) ≈ `fwd_ms`(CPU model() 发射, 被 GPU 反压拖住)
++ `bookkeep_sync`(`_bookkeeping_sync` D2H 采样 token 时同步等 forward 算完). GPU 全程
+满载, compute-bound, 只能靠减 token (复用) 缩短. 剩 <1s/步 GPU util=0 = 同步引擎循环里
+CPU 调度 (vLLM 块分配 + LICHT timeline + detokenize + handoff) 不与 forward 重叠,
+round-kv 只占 ~120ms. 消这 <1s 需引擎 async/重叠调度 (LICHT 侧, 非 round-kv).
+**round-kv 优化线到此为止.**
+
 ---
 
 ## 附录 A · 相关已有技术对比
