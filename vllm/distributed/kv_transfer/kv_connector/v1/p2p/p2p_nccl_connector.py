@@ -207,6 +207,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._round_async = (
             _os.environ.get("LICHT_ROUND_KV_ASYNC", "0") == "1")
         self._round_store_obj = None  # RoundKVStore (lazy)
+        # [Stage 6d perf] 按 request_id 缓存 lookup_resolve 结果: 同一请求在
+        # get_num + update_state (每步 ×2) 及跨步反复 probe 时只算一次. 每步
+        # build_connector_meta 丢弃本步未再 probe 的条目 (_rk_lk_seen), 不泄漏.
+        self._rk_lk_cache: dict[str, Any] = {}
+        self._rk_lk_seen: set = set()
         if self._round_kv_enabled:
             try:
                 from vllm.v1.core.sched.licht_v3.round_kv_store import (
@@ -1020,6 +1025,35 @@ p2p_nccl_engine import get_fast_release_queue
                     request.request_id, job_id, len(block_ids))
         return True
 
+    def _rk_lookup_cached(self, request: "Request"):
+        """[Stage 6d perf] 按 request_id 缓存 lookup_resolve 结果.
+
+        同一请求在一步内被 get_num + update_state 各查一次 (2×), 且未准入时跨步
+        反复 probe —— 这里首次算, 之后全 O(1) 复用 (含 None=miss 也缓存).
+
+        正确性: result 跨步复用即使 slot 后被淘, load 末尾 try_pin 用 entry.gen
+        校验 fail-closed → miss 重算, 绝不读错 (就是日志里的 fail=N). prompt 对
+        request_id 固定, 故按 request_id 缓存正确. 每步 build_connector_meta 丢弃
+        本步未再 probe 的条目, 不泄漏.
+        """
+        rid = request.request_id
+        self._rk_lk_seen.add(rid)
+        if rid in self._rk_lk_cache:
+            return self._rk_lk_cache[rid]
+        job_id = getattr(request, "job_id", None)
+        if not job_id or self._round_store_obj is None:
+            self._rk_lk_cache[rid] = None
+            return None
+        _t = time.time()
+        res = self._round_store_obj.lookup_resolve(
+            str(job_id), request.prompt_token_ids)
+        # [PROBE] 只在真正算 (cache miss) 时累计 lookup 耗时/次数.
+        self._sched_lk_ms = getattr(self, "_sched_lk_ms", 0.0) \
+            + (time.time() - _t) * 1000.0
+        self._sched_lk_n = getattr(self, "_sched_lk_n", 0) + 1
+        self._rk_lk_cache[rid] = res
+        return res
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -1045,11 +1079,11 @@ p2p_nccl_engine import get_fast_release_queue
             if self._round_kv_enabled:
                 job_id = getattr(request, "job_id", None)
                 if job_id:
-                    # ★ Stage 6d: 用 lookup_resolve (content-addr 表驱动, job 无关)
-                    # 算可复用 token 数. 必须与 update_state_after_alloc 用同一口径,
-                    # 否则全新 job own-job lookup 返 0 → 不分配 → 跨 job 命中白费.
-                    res = self._round_store_obj.lookup_resolve(
-                        str(job_id), request.prompt_token_ids)
+                    # ★ Stage 6d: lookup_resolve (content-addr 表驱动, job 无关)
+                    # 算可复用 token 数. 与 update_state_after_alloc 用同一口径
+                    # (同一缓存), 否则全新 job own-job lookup 返 0 → 不分配 → 跨 job
+                    # 命中白费. [perf] 走 _rk_lookup_cached: 同请求只算一次.
+                    res = self._rk_lookup_cached(request)
                     if res is not None:
                         matched_tokens, _mb, _sg = res
                         ext = matched_tokens - num_computed_tokens
@@ -1267,8 +1301,8 @@ p2p_nccl_engine import get_fast_release_queue
                 and num_external_tokens > 0):
             job_id = getattr(request, "job_id", None)
             if job_id and self._round_store_obj is not None:
-                res = self._round_store_obj.lookup_resolve(
-                    str(job_id), request.prompt_token_ids)
+                # [perf] 复用 get_num 这步算过的同一结果 (按 request_id 缓存).
+                res = self._rk_lookup_cached(request)
                 if res is not None:
                     _matched_tokens, matched_blocks, slot_gen = res
                     num_blocks = num_external_tokens // self._block_size
@@ -1309,6 +1343,20 @@ p2p_nccl_engine import get_fast_release_queue
 
         meta = P2pNcclConnectorMetadata()
         # 回传 REMOVED: no v3 push-back/offload drain.
+
+        # round-kv SCHED 指标: 每步在 arena lookup 上花的总时间/次数 (cache miss
+        # 才计). 配合 build_meta 自身耗时, 监控 admission 循环里 lookup 的开销.
+        _bcm_t0 = time.time()
+        _lk_ms = getattr(self, "_sched_lk_ms", 0.0)
+        _lk_n = getattr(self, "_sched_lk_n", 0)
+        self._sched_lk_ms = 0.0
+        self._sched_lk_n = 0
+        # [perf] 丢弃本步未再 probe 的 lookup 缓存条目 (已准入/已结束的请求 →
+        # 不在 _rk_lk_seen), 保留仍在反复 probe 的等待请求, 不泄漏.
+        if self._rk_lk_cache:
+            self._rk_lk_cache = {k: v for k, v in self._rk_lk_cache.items()
+                                 if k in self._rk_lk_seen}
+        self._rk_lk_seen.clear()
 
         # LICHT round-kv: drain scheduler-side reuse bookkeeping into the
         # metadata so the worker connector can load (prefill) / store
@@ -1398,6 +1446,11 @@ p2p_nccl_engine import get_fast_release_queue
                     remote_prefill_address=remote_prefill_address,
                     remote_decode_address=remote_decode_address,
                 )
+            if _lk_n > 0:
+                logger.info(
+                    "round-kv SCHED: lookups=%d lookup_ms=%.1f "
+                    "build_meta_ms=%.1f", _lk_n, _lk_ms,
+                    (time.time() - _bcm_t0) * 1000.0)
             return meta
 
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -1500,6 +1553,11 @@ p2p_nccl_engine import get_fast_release_queue
                                  block_size=self._block_size)
 
         self._requests_need_load.clear()
+        if _lk_n > 0:
+            logger.info(
+                "round-kv SCHED: lookups=%d lookup_ms=%.1f "
+                "build_meta_ms=%.1f", _lk_n, _lk_ms,
+                (time.time() - _bcm_t0) * 1000.0)
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
