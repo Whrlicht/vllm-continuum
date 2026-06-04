@@ -473,13 +473,20 @@ class RoundKVStore:
                 # 走 fallback 逐请求路径.
                 if register:
                     self._setup_arena_direct()
+                from vllm.v1.core.sched.licht_v3.arena_lru_store import (
+                    _HAS_C_LOOKUP)
                 logger.info(
                     "round-kv LRU arena bound (role=%s, num_slots=%d, "
-                    "slot_bytes=%.2fMB, free=%d, direct_kernel=%s)",
+                    "slot_bytes=%.2fMB, free=%d, direct_kernel=%s, "
+                    "content_addr=%s, lookup=%s)",
                     "producer" if register else "consumer",
                     self._num_slots, self._slot_bytes / 1e6,
                     self._lru_store.free_count(),
-                    self._arena_direct_fn is not None)
+                    self._arena_direct_fn is not None,
+                    self._lru_store.content_addr,
+                    ("C-fast" if (_HAS_C_LOOKUP
+                                  and self._lru_store.content_addr)
+                     else "PY/own-slot"))
                 return
             except Exception as e:
                 logger.warning(
