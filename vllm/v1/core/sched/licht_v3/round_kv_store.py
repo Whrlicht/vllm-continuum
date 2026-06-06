@@ -341,6 +341,11 @@ class RoundKVStore:
         self._plr_handle = None           # BatchLoadHandle (unpin)
         self._plr_active = False
         self._plr_pipe_ev = None          # (e0, e1, gb) 上波逐层总耗时, 下波打
+        # ★ 索引 GPU tensor 必须留活到 forward 后 (copy stream 跨 32 层引用它们):
+        # 否则函数返回即被 allocator 标记可复用, main stream 分配抢占覆写 → scatter
+        # 读乱 slot 越界. (批量版靠全局 wait_event 顺带保护; 流水版无全局 wait.)
+        self._plr_src = None
+        self._plr_dst = None
         # post-load gen 校验失败计数 (金丝雀). 理论上恒为 0: pin+gen 双原子机制
         # 保证 (1) pin 前被 evict -> gen 变 -> try_pin 失败 -> miss 重算;
         # (2) pin 后 -> can_evict 挡住 evict -> gen 不变. 所以 load 完 gen 必与
@@ -2933,6 +2938,16 @@ class RoundKVStore:
                 events[ln] = ev
             e1 = torch.cuda.Event(enable_timing=True)
             e1.record(lstream)
+        # ★ 关键: 索引 tensor 被 copy stream 跨 32 层引用, 必须 (1) record_stream
+        # 告诉 allocator copy stream 在用, (2) 留活到 finish_pipelined (forward 后).
+        # 否则函数返回即被复用覆写 → scatter 读乱 slot 越界 → 下个 gemm 爆 CUBLAS.
+        try:
+            src_slots.record_stream(lstream)
+            dst_idx.record_stream(lstream)
+        except Exception:
+            pass
+        self._plr_src = src_slots
+        self._plr_dst = dst_idx
         self._plr_events = events
         self._plr_handle = bh
         self._plr_active = True
@@ -2977,6 +2992,9 @@ class RoundKVStore:
                 next(reversed(events.values())).synchronize()
             except Exception:
                 pass
+        # copy 已全部落地, 索引 tensor 可释放 (留活到此防 forward 中被复用覆写)
+        self._plr_src = None
+        self._plr_dst = None
         if bh is None:
             return
         try:
