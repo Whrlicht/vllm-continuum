@@ -138,6 +138,13 @@ class RoundKVStore:
         # layer i.  Off by default (synchronous load_batch) for easy A/B.
         self._pipeline = (
             os.environ.get("LICHT_ROUND_KV_PIPELINE", "0") == "1")
+        # ★ consumer(decode)也 cudaHostRegister arena → 走直读 kernel(无 GPU
+        # staging). 默认开. 不开则 consumer 的复用 load 走逐请求 staging, 把整段
+        # 前缀一次性搬上 GPU, 长前缀(SWE-bench 等)在 gpu-mem-util~0.95 下 OOM.
+        # 代价: decode 启动多付一次 cudaHostRegister(大 arena ~分钟级) + 双向 pin.
+        # LICHT_ARENA_CONSUMER_DIRECT=0 退回旧 consumer-mmap-only(省启动 register).
+        self._consumer_direct = (
+            os.environ.get("LICHT_ARENA_CONSUMER_DIRECT", "1") == "1")
         self._load_stream = None
         self._pl_active = False
         self._pl_gen = 0
@@ -276,6 +283,7 @@ class RoundKVStore:
         self._arena_nL = 0
         self._arena_mapped = False     # mmap + slot layout derived
         self._arena_registered = False  # cudaHostRegister done (prefill)
+        self._is_producer = True        # set in bind_kv_caches (role label)
         self._arena_lock = threading.Lock()   # guards the bump counter
         # ---- Phase A: arena eviction policy (job-aware + prefix-protect)
         # _slot_to_inc: physical slot_id (in [0, num_slots)) -> (job_id,
@@ -359,6 +367,7 @@ class RoundKVStore:
     def bind_kv_caches(self, kv_caches: dict,
                        is_producer: bool = True) -> None:
         self._kv_caches = kv_caches or {}
+        self._is_producer = bool(is_producer)
         for v in self._kv_caches.values():
             layer = v[0] if isinstance(v, (list, tuple)) else v
             try:
@@ -369,10 +378,13 @@ class RoundKVStore:
             break
         if self._arena and self._is_cuda:
             try:
-                # Prefill (producer) LOADS -> needs cudaHostRegister (~12s once)
-                # for fast H2D.  Decode (consumer) only memcpys into the shared
-                # pages -> mmap is enough, skip the register cost + the pin.
-                self._arena_init(register=bool(is_producer))
+                # Prefill (producer) LOADS -> needs cudaHostRegister for fast H2D
+                # + the direct (no-staging) scatter kernel.  Decode (consumer)
+                # 原本只 memcpy 写 shm 故跳过 register; 但 consumer 现在也做复用
+                # LOAD, 不 register 就走逐请求 staging(整段前缀搬 GPU)→ 长前缀 OOM.
+                # 故 _consumer_direct 默认让 consumer 也 register → 直读无 staging.
+                register = bool(is_producer) or self._consumer_direct
+                self._arena_init(register=register)
             except Exception as e:  # pragma: no cover
                 logger.warning("round-kv ARENA init failed (%s); "
                                "falling back to .bin path", e)
@@ -527,18 +539,18 @@ class RoundKVStore:
                     wait_timeout_s=60.0)
                 self._lru_store.bind_data_writer(self._lru_data_writer)
                 self._arena_mapped = True
-                # 直读 kernel: 仅 producer (register=True, arena cudaHostRegister
-                # 过) 能用. consumer 端 arena 没 register, GPU 不能直读 host ptr,
-                # 走 fallback 逐请求路径.
+                # 直读 kernel 需 arena 已 cudaHostRegister (register=True). 默认
+                # producer + consumer 都 register → 两端都走直读无 stating. consumer
+                # 关掉 _consumer_direct 时不 register, 退回 fallback 逐请求 staging.
                 if register:
                     self._setup_arena_direct()
                 from vllm.v1.core.sched.licht_v3.arena_lru_store import (
                     _HAS_C_LOOKUP)
                 logger.info(
-                    "round-kv LRU arena bound (role=%s, num_slots=%d, "
-                    "slot_bytes=%.2fMB, free=%d, direct_kernel=%s, "
+                    "round-kv LRU arena bound (role=%s, registered=%s, "
+                    "num_slots=%d, slot_bytes=%.2fMB, free=%d, direct_kernel=%s, "
                     "content_addr=%s, lookup=%s)",
-                    "producer" if register else "consumer",
+                    "producer" if self._is_producer else "consumer", register,
                     self._num_slots, self._slot_bytes / 1e6,
                     self._lru_store.free_count(),
                     self._arena_direct_fn is not None,
