@@ -327,11 +327,20 @@ class RoundKVStore:
         # 直读 kernel (arena host pinned -> paged, 无 GPU staging). prefill 端
         # arena cudaHostRegister 后可用; 由 _setup_arena_direct 设置.
         self._arena_direct_fn = None      # licht_scatter_from_arena callable
+        self._arena_direct_layer_fn = None  # ★ per-layer 流水 callable
+        self._arena_direct_layer_names = []  # 有序层名 (与 _arena_direct_layers 对齐)
         self._arena_direct_layer_ptrs = None  # int64 GPU [nL] paged data_ptr
+        self._arena_direct_layers = []    # 各层 paged tensor (keep alive)
         self._arena_direct_P = 0          # prod(rest)
         self._arena_direct_NBLK = 0       # blocks per layer
         # LRU 直读 load 的 pipelined GPU timing (上一波 load 的 event, 下波读)
         self._lru_pipe_ev = None
+        # ★ arena 逐层流水 load 状态: 每层 copy-stream scatter 的 CUDA event
+        # (wait_layer 用) + 整波 pin handle (finish_pipelined 用).
+        self._plr_events: dict = {}       # layer_name -> cuda.Event
+        self._plr_handle = None           # BatchLoadHandle (unpin)
+        self._plr_active = False
+        self._plr_pipe_ev = None          # (e0, e1, gb) 上波逐层总耗时, 下波打
         # post-load gen 校验失败计数 (金丝雀). 理论上恒为 0: pin+gen 双原子机制
         # 保证 (1) pin 前被 evict -> gen 变 -> try_pin 失败 -> miss 重算;
         # (2) pin 后 -> can_evict 挡住 evict -> gen 不变. 所以 load 完 gen 必与
@@ -696,12 +705,22 @@ class RoundKVStore:
                 [int(l.data_ptr()) for l in layers], dtype=torch.int64,
                 device=self._device)
             self._arena_direct_layers = layers   # keep refs alive
+            self._arena_direct_layer_names = layer_names  # 有序, 与 layers 对齐
             self._arena_direct_fn = fn
+            # ★ 流水线: per-layer scatter callable (旧 .so 没这符号则 None,
+            # 流水回退批量直读). 与 attention 的 wait_for_layer_load 配合逐层重叠.
+            try:
+                from vllm.v1.core.sched.licht_v3.fused_scatter import (
+                    get_arena_scatter_layer)
+                self._arena_direct_layer_fn = get_arena_scatter_layer()
+            except Exception:
+                self._arena_direct_layer_fn = None
             logger.info(
                 "round-kv DIRECT arena scatter ON: nL=%d P=%d NBLK=%d dim=%d "
-                "arena_host=0x%x",
+                "arena_host=0x%x pipeline=%s",
                 len(layers), self._arena_direct_P, self._arena_direct_NBLK,
-                self._arena_dim, self._arena_addr)
+                self._arena_dim, self._arena_addr,
+                self._arena_direct_layer_fn is not None)
         except Exception as e:  # pragma: no cover
             logger.warning("round-kv DIRECT setup failed: %s; per-request "
                            "fallback", e)
@@ -2833,157 +2852,142 @@ class RoundKVStore:
             return None
         return list(dst_block_ids), pieces
 
-    def _pl_finish_all(self) -> None:
-        """Set every still-unset issued event (e.g. early miss / error) so a
-        waiting forward never hangs on a layer the driver skipped."""
-        for ln, e in self._pl_issued.items():
-            if not e.is_set():
-                self._pl_cuda_evt.setdefault(ln, None)
-                e.set()
-
     def start_load_pipelined(self, items: list) -> None:
-        """Kick off a non-blocking layer-wise load for an admit wave and
-        return immediately.  A background driver thread reads+scatters layer
-        by layer on a copy stream; the forward syncs per layer via
-        wait_layer().  Call this EVERY producer forward: with empty `items`
-        it just deactivates (so wait_layer is a no-op for that forward)."""
-        # The previous wave's driver is essentially done (the forward
-        # already waited on its last layer); join before resetting state.
-        prev = self._pl_driver
-        if prev is not None and prev.is_alive():
-            prev.join(timeout=5.0)
+        """★ 逐层流水加载: 在 copy stream 上把整波各层的 arena 直读 scatter 一次性
+        发出 (各记一个 CUDA event), 立即返回; forward 每层前 wait_layer(layer) 让
+        compute stream 等该层 event → 第 i 层算时 copy stream 已在搬第 i+1 层, 重叠.
+
+        每个 producer forward 都调: 空 items 只 deactivate (wait_layer 变 no-op).
+        前提: LRU + per-layer 直读 kernel 可用; 否则回退批量 load_batch (同步, 不流水).
+        """
+        # 上一波先收尾 (unpin), 防 pin 泄漏
+        if self._plr_active:
+            self.finish_pipelined()
         if not self.ready or not items:
-            self._pl_active = False
-            self._pl_issued = {}
-            self._pl_cuda_evt = {}
+            self._plr_active = False
+            self._plr_events = {}
+            self._plr_handle = None
             return
-        if not self._is_cuda:
-            # No copy stream / events off-GPU -> just do it synchronously.
-            self._pl_active = False
+        # 回退: 非 CUDA / 无 LRU / 无 per-layer kernel / 直读未就绪
+        if (not self._is_cuda or self._lru_store is None
+                or self._arena_direct_layer_fn is None
+                or self._arena_direct_fn is None):
+            self._plr_active = False
             self.load_batch(items)
             return
-        self._pl_gen += 1
-        gen = self._pl_gen
-        self._pl_issued = {ln: threading.Event() for ln in self._kv_caches}
-        self._pl_cuda_evt = {}
-        self._pl_active = True
-        t = threading.Thread(target=self._load_driver,
-                             args=(list(items), gen), daemon=True,
-                             name="RoundKVLoadPipe")
-        self._pl_driver = t
-        t.start()
+        try:
+            self._start_load_arena_pipelined(items)
+        except Exception as e:  # pragma: no cover
+            logger.warning("round-kv PIPELINE start failed (%s); fallback "
+                           "batched", e)
+            self._plr_active = False
+            self._plr_events = {}
+            self._plr_handle = None
+            self.load_batch(items)
 
-    def _load_driver(self, items: list, gen: int) -> None:
-        try:
-            import torch
-            from safetensors import safe_open
-        except Exception:
-            self._pl_finish_all()
-            return
-        try:
-            torch.cuda.set_device(self._device)
-        except Exception:
-            pass
-        stream = self._get_load_stream()
-        _t0 = time.time()
-        # Build per-request plans + open each unique increment file once.
-        plans = []
-        open_files: dict = {}
-        for item in items:
-            # pipelined 是 FIFO-only 实验路径 (不支持跨 job 显式 slot); 容忍 4 元组
-            # 但忽略第 4 元素, 避免与 content-addr 组合时解包崩溃.
-            job_id, dst, off = item[0], item[1], item[2]
-            p = self._plan_request(job_id, dst, off)
-            plans.append(p)
-            if p is not None:
-                for (path, _fl, _fh) in p[1]:
-                    if path not in open_files:
-                        try:
-                            open_files[path] = safe_open(
-                                path, framework="pt", device="cpu")
-                        except Exception:
-                            open_files[path] = None
-        nblk = sum(len(p[0]) for p in plans if p)
-        nfail = sum(1 for p in plans if p is None)
-        try:
-            for layer_name, kv in self._kv_caches.items():
-                if gen != self._pl_gen:
-                    break               # superseded by a newer wave
-                layer = kv[0] if isinstance(kv, (list, tuple)) else kv
-                if layer.shape[0] == 2:        # FlashAttention [2, blk, ...]
-                    dim = 1
-                elif layer.shape[1] == 2:      # MLA / FlashInfer [blk, 2, ...]
-                    dim = 0
-                else:
-                    dim = None
-                cev = None
-                if dim is not None and stream is not None:
-                    try:
-                        with torch.cuda.stream(stream):
-                            for plan in plans:
-                                if plan is None:
-                                    continue
-                                dst, pieces = plan
-                                parts = []
-                                ok = True
-                                for (path, fl, fh) in pieces:
-                                    f = open_files.get(path)
-                                    if f is None:
-                                        ok = False
-                                        break
-                                    sl = f.get_slice(layer_name)
-                                    parts.append(sl[:, fl:fh] if dim == 1
-                                                 else sl[fl:fh])
-                                if not ok or not parts:
-                                    continue
-                                cpu_t = (parts[0] if len(parts) == 1 else
-                                         torch.cat(parts, dim=dim)).contiguous()
-                                src = self._to_device_pinned(cpu_t, layer.device)
-                                if dim == 1:
-                                    layer[:, dst, ...] = src
-                                else:
-                                    layer[dst, ...] = src
-                            cev = torch.cuda.Event()
-                            cev.record()        # on the copy stream
-                    except Exception as e:  # pragma: no cover
-                        logger.warning(
-                            "round-kv PIPELINE layer=%s failed: %s",
-                            layer_name, e)
-                        cev = None
-                self._pl_cuda_evt[layer_name] = cev
-                iss = self._pl_issued.get(layer_name)
-                if iss is not None:
-                    iss.set()
-        finally:
-            self._pl_finish_all()
-            open_files.clear()
-            logger.info(
-                "round-kv PIPELINE: reqs=%d blocks=%d fail=%d layers=%d "
-                "driver_ms=%.0f", len(items), nblk, nfail,
-                len(self._kv_caches), (time.time() - _t0) * 1000.0)
-
-    def wait_layer(self, layer_name: str) -> None:
-        """Forward-thread per-layer sync point.  Cheap no-op when this
-        forward has no pipelined load.  Otherwise wait until the driver has
-        issued this layer's scatter, then make the COMPUTE stream wait on its
-        completion event (GPU-side wait; does not block the CPU thread)."""
-        if not self._pl_active:
-            return
-        iss = self._pl_issued.get(layer_name)
-        if iss is None:
-            return                      # layer not part of this wave's load
-        iss.wait()
-        cev = self._pl_cuda_evt.get(layer_name)
-        if cev is None:
-            return
-        try:
-            import torch
-            torch.cuda.current_stream().wait_event(cev)
-        except Exception:
+    def _start_load_arena_pipelined(self, items: list) -> None:
+        import torch
+        # 上一波逐层总耗时 (event 已完成, 不阻塞)
+        if self._plr_pipe_ev is not None:
             try:
-                cev.synchronize()
+                _e0, _e1, _gb = self._plr_pipe_ev
+                _ms = _e0.elapsed_time(_e1)
+                logger.info(
+                    "round-kv PIPELINE gpu(prev): %.2fGB layer_scatter_ms=%.1f "
+                    "(%.1f GB/s, 与 forward 重叠)", _gb, _ms,
+                    (_gb / (_ms / 1e3)) if _ms else 0.0)
             except Exception:
                 pass
+            self._plr_pipe_ev = None
+
+        _t0 = time.time()
+        # 1) resolve + pin 整波 (含跨 job 4 元组), 一次
+        bh = self._lru_store.load_batch_pin(items)
+        nblk = len(bh.slot_ids)
+        if nblk == 0:
+            bh.release()                 # 无可复用块 -> 不流水, forward 全重算
+            self._plr_active = False
+            self._plr_events = {}
+            self._plr_handle = None
+            return
+        src_slots = torch.tensor(bh.slot_ids, dtype=torch.int64,
+                                 device=self._device)
+        dst_idx = torch.tensor(bh.dst_block_ids, dtype=torch.int64,
+                               device=self._device)
+        gb = nblk * self._slot_bytes / 1e9
+        lstream = self._get_load_stream()
+        events = {}
+        e0 = e1 = None
+        # 2) 逐层在 copy stream launch per-layer scatter + 记 event
+        with torch.cuda.stream(lstream):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record(lstream)
+            for i, ln in enumerate(self._arena_direct_layer_names):
+                layer_ptr = int(self._arena_direct_layers[i].data_ptr())
+                self._arena_direct_layer_fn(
+                    int(self._arena_addr), src_slots, dst_idx, layer_ptr,
+                    nblk, self._arena_nL, i, self._arena_dim,
+                    self._arena_direct_NBLK, self._arena_direct_P)
+                ev = torch.cuda.Event()
+                ev.record(lstream)
+                events[ln] = ev
+            e1 = torch.cuda.Event(enable_timing=True)
+            e1.record(lstream)
+        self._plr_events = events
+        self._plr_handle = bh
+        self._plr_active = True
+        self._plr_pipe_ev = (e0, e1, gb)
+        logger.info(
+            "round-kv PIPELINE start: reqs=%d blocks=%d GB=%.2f layers=%d "
+            "issue_ms=%.0f (copy stream, 逐层 event)",
+            len(items), nblk, gb, len(events), (time.time() - _t0) * 1000.0)
+
+    def wait_layer(self, layer_name: str) -> None:
+        """forward 每层前调: 让 compute stream 等该层 copy event (GPU 侧等, 不阻塞
+        CPU). 第 i 层算时 copy stream 已在搬后面的层, 实现重叠. 无流水时 no-op."""
+        if not self._plr_active:
+            return
+        ev = self._plr_events.get(layer_name)
+        if ev is None:
+            return                          # 该层不在本波 load 内
+        try:
+            import torch
+            torch.cuda.current_stream().wait_event(ev)
+        except Exception:
+            try:
+                ev.synchronize()
+            except Exception:
+                pass
+
+    def finish_pipelined(self) -> None:
+        """forward 后调 (wait_for_save): 确保各层 copy 真完成 → post-load gen 校验
+        → unpin. 必须等 copy 完成再 unpin: 否则 pin 早释放, slot 可能被淘+复用,
+        而 copy stream 还在读它 → 脏数据. 此时 copy(~百 ms) 早被 forward 盖掉, 同步
+        最后一层 event 通常 ~0 等待."""
+        if not self._plr_active:
+            return
+        bh = self._plr_handle
+        events = self._plr_events
+        self._plr_active = False
+        self._plr_events = {}
+        self._plr_handle = None
+        if events:
+            try:
+                # 同步最后一层 copy event = 等所有 scatter 落地 (copy stream 顺序)
+                next(reversed(events.values())).synchronize()
+            except Exception:
+                pass
+        if bh is None:
+            return
+        try:
+            if not bh.post_load_validate():
+                self._lru_postload_fail_count += 1
+                logger.error(
+                    "round-kv PIPELINE post-load gen MISMATCH (canary,total=%d):"
+                    " pin/evict 不变量被破坏 — 查 evict 是否绕过 can_evict.",
+                    self._lru_postload_fail_count)
+        finally:
+            bh.release()
 
     # ------------------------------------------------------------------
     # Lifecycle / cleanup

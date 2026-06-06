@@ -93,3 +93,32 @@ def get_arena_scatter():
             "to get licht_scatter_from_arena. Falling back.", e)
         _fn_arena = None
     return _fn_arena
+
+
+_fn_arena_layer = None
+_tried_arena_layer = False
+
+
+def get_arena_scatter_layer():
+    """Return the prebuilt `licht_scatter_from_arena_layer` callable, or None.
+
+    Per-layer 流水线版: 只 scatter 单层 (固定 layer_idx) -> 单层 paged ptr.
+    用于逐层加载与 forward 重叠. 旧 .so 没这符号 -> None, 调用方回退批量直读.
+    Signature: fn(arena_host_ptr, src_slots, dst_idx, layer_ptr,
+                  nb, nL, layer_idx, dim, NBLK, P)
+    """
+    global _fn_arena_layer, _tried_arena_layer
+    if _tried_arena_layer:
+        return _fn_arena_layer
+    _tried_arena_layer = True
+    try:
+        import licht_fused_scatter as _ext
+        _fn_arena_layer = _ext.licht_scatter_from_arena_layer
+        logger.info("round-kv PIPELINE per-layer arena scatter: using prebuilt "
+                    "licht_fused_scatter.licht_scatter_from_arena_layer")
+    except (ImportError, AttributeError) as e:
+        logger.warning(
+            "round-kv per-layer arena scatter unavailable (%s); rebuild csrc/. "
+            "Pipeline falls back to batched direct.", e)
+        _fn_arena_layer = None
+    return _fn_arena_layer

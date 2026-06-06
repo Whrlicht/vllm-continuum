@@ -756,6 +756,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
             if self.direct_block_mode:
+                # ★ 逐层流水: forward 各层已 wait 过各自 copy event, 此处收尾——
+                # post-load gen 校验 + unpin (no-op if 本步没流水加载).
+                if (self._round_kv_enabled
+                        and self._round_store_obj is not None):
+                    try:
+                        self._round_store_obj.finish_pipelined()
+                    except Exception as e:  # pragma: no cover
+                        logger.warning("round-kv finish_pipelined failed: %s", e)
                 # Pure decode-pull mode: only stage bridge metadata
                 # locally.  Decode will fetch via BRIDGE_POP RPC in its
                 # own forward step.

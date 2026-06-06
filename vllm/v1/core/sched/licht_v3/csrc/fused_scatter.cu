@@ -125,6 +125,72 @@ void licht_scatter_from_arena(int64_t arena_host_ptr,
                 cudaGetErrorString(err));
 }
 
+// ── Per-layer 变体 (流水线逐层加载) ──────────────────────────────────────
+// 只 scatter 单层 layer_idx 的 block: arena[(slot*nL+layer_idx)*2+kv] -> 单层 paged.
+// nL 仍传真实层数 (算 slot stride), layer_ptr 是该层 paged tensor 的 data_ptr.
+// grid 循环 nb*2 (kv*nb), 不乘 nL. 与批量 kernel 第 layer_idx 层切片结果一致.
+__global__ void licht_scatter_from_arena_layer_kernel(
+    const uint16_t* __restrict__ arena_host,
+    const int64_t*  __restrict__ src_slots,
+    const int64_t*  __restrict__ dst_idx,
+    int64_t layer_ptr,
+    int nb, int nL, int layer_idx, int dim, long NBLK, long P)
+{
+    long total_runs = (long)nb * 2;
+    long P8 = P >> 3;
+    uint16_t* dstbase = (uint16_t*)layer_ptr;
+    for (long run = blockIdx.x; run < total_runs; run += gridDim.x) {
+        int  kv   = (int)(run & 1L);
+        long j    = run >> 1;
+        long slot = src_slots[j];
+        long blk  = dst_idx[j];
+        const uint16_t* src = arena_host
+            + (((slot * (long)nL + layer_idx) * 2 + kv) * P);
+        long dstoff = (dim == 1) ? ((kv * NBLK + blk) * P)
+                                 : ((blk * 2 + kv) * P);
+        const int4* s4 = (const int4*)src;
+        int4* d4 = (int4*)(dstbase + dstoff);
+        for (long r = threadIdx.x; r < P8; r += blockDim.x) d4[r] = s4[r];
+    }
+}
+
+void licht_scatter_from_arena_layer(int64_t arena_host_ptr,
+                                    torch::Tensor src_slots,
+                                    torch::Tensor dst_idx, int64_t layer_ptr,
+                                    int64_t nb, int64_t nL, int64_t layer_idx,
+                                    int64_t dim, int64_t NBLK, int64_t P) {
+    TORCH_CHECK(arena_host_ptr != 0,
+                "licht_scatter_from_arena_layer: arena_host_ptr is null");
+    TORCH_CHECK(layer_ptr != 0,
+                "licht_scatter_from_arena_layer: layer_ptr is null");
+    TORCH_CHECK(src_slots.is_cuda() && dst_idx.is_cuda(),
+                "licht_scatter_from_arena_layer: src_slots/dst_idx must be CUDA");
+    TORCH_CHECK(src_slots.scalar_type() == at::kLong,
+                "licht_scatter_from_arena_layer: src_slots must be int64");
+    TORCH_CHECK(dst_idx.scalar_type() == at::kLong,
+                "licht_scatter_from_arena_layer: dst_idx must be int64");
+    TORCH_CHECK((P & 7) == 0,
+                "licht_scatter_from_arena_layer: P must be a multiple of 8");
+    TORCH_CHECK(src_slots.numel() >= nb && dst_idx.numel() >= nb,
+                "licht_scatter_from_arena_layer: src_slots/dst_idx too small");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < nL,
+                "licht_scatter_from_arena_layer: layer_idx out of range");
+    long total_runs = nb * 2;
+    if (total_runs < 1) return;
+    int  threads = 256;
+    long blocks  = total_runs < 65535 ? total_runs : 65535;
+    const at::cuda::CUDAGuard device_guard(src_slots.device());
+    auto stream  = at::cuda::getCurrentCUDAStream();
+    licht_scatter_from_arena_layer_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(arena_host_ptr),
+        src_slots.data_ptr<int64_t>(), dst_idx.data_ptr<int64_t>(),
+        layer_ptr, (int)nb, (int)nL, (int)layer_idx, (int)dim, NBLK, P);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "licht_scatter_from_arena_layer launch failed: ",
+                cudaGetErrorString(err));
+}
+
 void licht_scatter(torch::Tensor staging, torch::Tensor idx,
                    torch::Tensor layer_ptrs, int64_t nb, int64_t nL,
                    int64_t dim, int64_t NBLK, int64_t P) {
@@ -164,4 +230,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("arena_host_ptr"), py::arg("src_slots"), py::arg("dst_idx"),
           py::arg("layer_ptrs"), py::arg("nb"), py::arg("nL"), py::arg("dim"),
           py::arg("NBLK"), py::arg("P"));
+    m.def("licht_scatter_from_arena_layer", &licht_scatter_from_arena_layer,
+          "Per-layer host-pinned-arena -> single paged layer scatter (pipeline)",
+          py::arg("arena_host_ptr"), py::arg("src_slots"), py::arg("dst_idx"),
+          py::arg("layer_ptr"), py::arg("nb"), py::arg("nL"), py::arg("layer_idx"),
+          py::arg("dim"), py::arg("NBLK"), py::arg("P"));
 }
