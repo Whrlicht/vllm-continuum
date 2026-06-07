@@ -504,17 +504,24 @@ class RoundKVStore:
             # 712 = cudaErrorHostMemoryAlreadyRegistered: the physical pages are
             # already pinned (e.g. re-bind, or two stores in one process) -> the
             # region is usable, treat as success.
-            if rc not in (0, 712):
-                mm.close()
-                os.close(fd)
-                logger.warning("round-kv ARENA cudaHostRegister rc=%d -> "
-                               "fall back to .bin path", rc)
-                return
-            self._arena_registered = True
-            logger.info("round-kv ARENA: registered %.1fGB in %.1fs "
-                        "(%.1f GB/s)", self._arena_bytes / 1e9,
-                        time.time() - _t,
-                        (self._arena_bytes / 1e9) / max(time.time() - _t, 1e-3))
+            if rc in (0, 712):
+                self._arena_registered = True
+                logger.info(
+                    "round-kv ARENA: registered %.1fGB in %.1fs (%.1f GB/s)",
+                    self._arena_bytes / 1e9, time.time() - _t,
+                    (self._arena_bytes / 1e9) / max(time.time() - _t, 1e-3))
+            else:
+                # ★ 注册失败 (如 consumer 跨进程双 pin 返回 rc=1): cudaHostRegister
+                # 只是【直读 kernel】的优化, 失败【绝不能】废掉整个 arena/LRU!
+                # 旧代码这里 close+return → decode 退回 .bin/FIFO, content_addr 关,
+                # 不插哈希表 → prefill 查表全 miss → 跨轮复用归零 (回归). 现仅禁用
+                # 直读: _arena_registered=False, 继续用未注册 mmap arena (staging
+                # load), content_addr/LRU/复用全部正常.
+                self._arena_registered = False
+                logger.warning(
+                    "round-kv ARENA cudaHostRegister rc=%d -> 直读 kernel 禁用, "
+                    "改用未注册 arena + staging load (content_addr/复用不受影响)",
+                    rc)
         at = torch.frombuffer(mm, dtype=layer0.dtype)
         self._arena_view = at.view((self._num_slots, nL, 2) + rest)
         self._arena_mm = mm
@@ -539,10 +546,10 @@ class RoundKVStore:
                     wait_timeout_s=60.0)
                 self._lru_store.bind_data_writer(self._lru_data_writer)
                 self._arena_mapped = True
-                # 直读 kernel 需 arena 已 cudaHostRegister (register=True). 默认
-                # producer + consumer 都 register → 两端都走直读无 stating. consumer
-                # 关掉 _consumer_direct 时不 register, 退回 fallback 逐请求 staging.
-                if register:
+                # 直读 kernel 需 arena 真的 cudaHostRegister 成功 (_arena_registered).
+                # 按【实际注册结果】门控, 不按请求值 register: 注册失败 (rc!=0/712)
+                # 时仍走 staging load, 但 LRU/content_addr/复用照常.
+                if self._arena_registered:
                     self._setup_arena_direct()
                 from vllm.v1.core.sched.licht_v3.arena_lru_store import (
                     _HAS_C_LOOKUP)
@@ -550,7 +557,8 @@ class RoundKVStore:
                     "round-kv LRU arena bound (role=%s, registered=%s, "
                     "num_slots=%d, slot_bytes=%.2fMB, free=%d, direct_kernel=%s, "
                     "content_addr=%s, lookup=%s)",
-                    "producer" if self._is_producer else "consumer", register,
+                    "producer" if self._is_producer else "consumer",
+                    self._arena_registered,
                     self._num_slots, self._slot_bytes / 1e6,
                     self._lru_store.free_count(),
                     self._arena_direct_fn is not None,
