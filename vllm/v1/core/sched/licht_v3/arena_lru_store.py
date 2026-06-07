@@ -1116,9 +1116,14 @@ class LruArenaStore:
         incs = self._list_incs(job_id)
         if not incs:
             return 0
-        # 已提交边界: 没有 manifest 视为 0 (整个 job 都是未提交的, 全跳过)
-        manifest = self._read_manifest(job_id)
-        committed = int(manifest.get("total_blocks", 0)) if manifest else 0
+        # 已提交边界: 本进程自己 store 的 job 用内存 _last_stored (O(1), 即 manifest
+        # total_blocks 的内存镜像, 二者由 write_inc/self-heal 同步更新), 避免在锁内
+        # _read_manifest 把全量 token_ids 也 parse 一遍 (O(token), ×victim = 淘汰慢源).
+        # 跨进程他人 job (内存无) 才回退读 manifest (罕见, 走文件系统 victim 那路).
+        committed = self._last_stored.get(job_id)
+        if committed is None:
+            manifest = self._read_manifest(job_id)
+            committed = int(manifest.get("total_blocks", 0)) if manifest else 0
         released = 0
         # 反向遍历 (tail first)
         for (s, e, path) in reversed(incs):
