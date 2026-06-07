@@ -593,16 +593,18 @@ class RoundKVStore:
         self._arena_view[slot_id].copy_(source_obj[block_idx])
 
     def _write_inc_arena_lru(self, job_id, start, end, tensors,
-                             token_ids=None) -> None:
+                             token_ids=None) -> bool:
         """LRU 版 write_inc: 把 tensors 字典 permute 成 block-major,
         交给 LruArenaStore.write_inc 处理 (内部 alloc + evict + memcpy + publish).
+
+        返回 True 成功 / False 失败 (让 _do_store 失败时不推进进度, 下轮重试).
         """
         import torch
         layers = []
         for ln in self._kv_caches:
             t = tensors.get(ln)
             if t is None:
-                return                           # incomplete -> skip
+                return False                     # incomplete -> skip (不推进)
             layers.append(t.contiguous())
         stk = torch.stack(layers)
         if stk.shape[1] == 2:                    # FA per-layer [2, nbc, *rest]
@@ -624,6 +626,7 @@ class RoundKVStore:
             logger.warning(
                 "round-kv LRU write_inc failed (job=%s start=%d end=%d nbc=%d)",
                 str(job_id)[:32], start, end, bm.shape[0])
+        return bool(ok)
 
     def _lookup_lru(self, job_id: str,
                     cur_token_ids: list):
@@ -1210,6 +1213,12 @@ class RoundKVStore:
             if last is None:
                 last = self._read_total_blocks(job_id)   # cross-restart
             end = align_blocks(len(token_ids), self.block_size)
+            # ★ block_ids 可能短于累积 token 推出的块数 (多轮: token_ids 累积, 但
+            # 本轮 block_ids 不含全部复用前缀块). 切片 block_ids[last:end] 会静默
+            # 截断 → inc 实际块数 < end-last, 而 write_inc 按 end-start 当块数会越界
+            # (index out of bounds). 用实际 block_ids 长度夹住 end, 保证 [last,end)
+            # 与 gather 出的块数一致, manifest 也不会过度声明.
+            end = min(end, len(block_ids))
             if end <= last:
                 # No new COMPLETE block this round (e.g., output < 1 block).
                 self._mark_done(request_id)
@@ -1225,7 +1234,15 @@ class RoundKVStore:
                 return
             # ---- write increment file + update manifest (off critical path) ----
             _t1 = time.time()
-            self._write_inc(job_id, last, end, tensors, token_ids)
+            ok = self._write_inc(job_id, last, end, tensors, token_ids)
+            if ok is False:
+                # 存失败 (块数不符已被上面夹住; 这里兜其余: alloc/evict 失败等).
+                # 不推进 _last_stored / 不写 manifest → 下轮 (多轮同 job) 重试这段,
+                # 避免 manifest 过度声明 (声称存了实际没存) + 永久丢复用.
+                logger.warning(
+                    "round-kv STORE inc write failed job=%s [%d,%d) — 进度不推进",
+                    str(job_id)[:32], last, end)
+                return
             self._write_manifest(job_id, end, token_ids[:end * self.block_size])
             write_ms = (time.time() - _t1) * 1000.0
             self._last_stored[job_id] = end
