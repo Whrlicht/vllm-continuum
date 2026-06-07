@@ -31,6 +31,7 @@ import logging
 import os
 import struct
 import tempfile
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple
@@ -179,6 +180,9 @@ class LruArenaStore:
         # 关: 完全等价旧路径 (alloc 全新 slot, .slot 写 v1), 字节级不变.
         self._content_addr = (
             os.environ.get("LICHT_ARENA_CONTENT_ADDR", "0") == "1")
+        # 临时探针: dedup write_inc 分段计时 (hash/cs1/data/slot/cs2). 默认关.
+        self._write_profile = (
+            os.environ.get("LICHT_ROUND_KV_WRITE_PROFILE", "0") == "1")
         # 埋点计数 (LICHT_ARENA_DEBUG): dedup 命中 / 新分配 block 数,
         # evict 真释放 (refcnt->0) vs 仅减引用 (refcnt>0 数据留给别 job)
         self._stat_hit_blocks = 0
@@ -544,8 +548,13 @@ class LruArenaStore:
             不动 (其他引用者还在用).
         """
         n_blocks = end_block - start_block
+        _prof = self._write_profile
+        _tp = time.time() if _prof else 0.0
+        _seg = {}
         # 链式 hash 需要整个前缀 [0,end) 来算 [start,end) 段
         all_hashes = block_hashes(token_ids, self._block_size, end_block)
+        if _prof:
+            _seg['hash'] = (time.time() - _tp) * 1000.0; _tp = time.time()
         if len(all_hashes) < end_block:
             logger.warning(
                 "dedup write_inc: token_ids 不足 job=%s end=%d have=%d",
@@ -559,6 +568,8 @@ class LruArenaStore:
 
         # ---- 临界区 1: probe + HIT refcnt++ + MISS alloc/insert ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if _prof:
+            _seg['cs1_lockwait'] = (time.time() - _tp) * 1000.0; _tp = time.time()
         if rc == _atomic.errno_eownerdead():
             _atomic.mutex_recover(self._hdr.mutex_addr)
             self._allocator.sync_from_bitmap()
@@ -610,12 +621,16 @@ class LruArenaStore:
                     _atomic.ht_insert(ht_base, ht_cap, plan[i][2], s)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
+        if _prof:
+            _seg['cs1_work'] = (time.time() - _tp) * 1000.0; _tp = time.time()
 
         # ---- 锁外: 只对 MISS 搬数据 + 建 v2 records (慢) ----
         try:
             for i in range(n_blocks):
                 if plan[i][0] == 'M':
                     self._data_writer(plan[i][1], i, source_obj)
+            if _prof:
+                _seg['data'] = (time.time() - _tp) * 1000.0; _tp = time.time()
             # records: (slot, gen, hash). HIT gen=当前; MISS gen=当前+1(待发布)
             records: List[Tuple[int, int, int]] = []
             miss_pub: List[Tuple[int, int, int]] = []  # (slot,new_gen,hash) 待发布
@@ -630,6 +645,8 @@ class LruArenaStore:
                     records.append((slot, cur_gen, h))
             slot_path = self._slot_path(job_id, start_block, end_block)
             write_slot_file_v2(slot_path, records)
+            if _prof:
+                _seg['slot'] = (time.time() - _tp) * 1000.0; _tp = time.time()
         except Exception as e:
             logger.warning("dedup write_inc: data/slot write failed job=%s: %s",
                            str(job_id)[:32], e)
@@ -654,10 +671,24 @@ class LruArenaStore:
             self._touch_job_lru(job_id)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
+        if _prof:
+            _seg['cs2'] = (time.time() - _tp) * 1000.0; _tp = time.time()
 
         # ---- 锁外: 重写 manifest ----
         self._write_manifest(
             job_id, end_block, token_ids[:end_block * self._block_size])
+        if _prof:
+            _seg['manifest'] = (time.time() - _tp) * 1000.0
+            _nm = len(miss_pub)
+            logger.info(
+                "WRITE-PROF job=%s nblk=%d miss=%d | hash=%.0f lockwait=%.0f "
+                "cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f man=%.0f",
+                str(job_id)[:24], n_blocks, _nm, _seg.get('hash', 0),
+                _seg.get('cs1_lockwait', 0), _seg.get('cs1_work', 0),
+                _seg.get('data', 0),
+                (_seg.get('data', 0) / _nm) if _nm else 0.0,
+                _seg.get('slot', 0), _seg.get('cs2', 0),
+                _seg.get('manifest', 0))
 
         n_hit = n_blocks - len(miss_pub)
         self._stat_hit_blocks += n_hit
