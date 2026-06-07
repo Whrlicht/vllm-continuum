@@ -1389,8 +1389,8 @@ class RoundKVStore:
                         "round-kv STORE-DIRECT inc write failed job=%s [%d,%d)"
                         " — 进度不推进", str(job_id)[:32], last, end)
                     return
-                self._write_manifest(
-                    job_id, end, token_ids[:end * self.block_size])
+                # manifest 已由 LruArenaStore.write_inc 写过同一文件同内容
+                # (store-direct 必走 LRU), 不重复写 (省 O(token) JSON).
                 self._last_stored[job_id] = end
                 logger.info(
                     "round-kv STORE-DIRECT: job=%s inc_blocks=%d write_ms=%.0f",
@@ -1415,7 +1415,12 @@ class RoundKVStore:
                     "round-kv STORE inc write failed job=%s [%d,%d) — 进度不推进",
                     str(job_id)[:32], last, end)
                 return
-            self._write_manifest(job_id, end, token_ids[:end * self.block_size])
+            # LRU arena 路径下 manifest 已由 LruArenaStore.write_inc 写过 (同一
+            # 文件同内容), 不重复写; 仅非 LRU fallback (raw/safetensors) 才写.
+            if not (self._arena and self._arena_mapped
+                    and self._lru_store is not None):
+                self._write_manifest(
+                    job_id, end, token_ids[:end * self.block_size])
             write_ms = (time.time() - _t1) * 1000.0
             self._last_stored[job_id] = end
             logger.info(

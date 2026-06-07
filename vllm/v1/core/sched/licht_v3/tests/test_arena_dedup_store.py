@@ -124,6 +124,23 @@ class TestDedupStore:
         for i in range(3):               # 共享块 refcnt 升到 2
             assert _refcnt(store, _slot_of(store, toks_b, i)) == 2
 
+    def test_evict_deferred_self_heal(self, tmp_path, monkeypatch):
+        """write_inc 内部淘汰走 deferred self-heal (锁外批量重写 manifest):
+        淘汰 victim 尾 inc 后, 其 manifest total_blocks 正确回退, 新 job 存入."""
+        store, arena, _ = _make_store(tmp_path, monkeypatch, num_slots=4)
+        toks_a = list(range(64))                      # A: 4 block, 两个 inc
+        assert store.write_inc("A", 0, 2, toks_a, [b"a0", b"a1"])
+        assert store.write_inc("A", 2, 4, toks_a, [b"a2", b"a3"])
+        assert store._read_manifest("A")["total_blocks"] == 4   # arena 满 (4/4)
+        # B 全新 1 block → alloc 失败 → 内部淘汰 A 尾 inc [2,4) (free 2 >= need 1)
+        toks_b = list(range(200, 216))
+        assert store.write_inc("B", 0, 1, toks_b, [b"b0"])
+        rb = store.lookup("B", toks_b)
+        assert rb is not None and rb[0] == 1 * BS        # B 存入命中
+        # A 尾 inc 被淘, [0,2) 存活 → deferred self-heal 把 total_blocks 4→2
+        ma = store._read_manifest("A")
+        assert ma is not None and ma["total_blocks"] == 2
+
     def test_slot_file_is_v2(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=32)
         store.write_inc("J", 0, 2, list(range(32)), [b"0", b"1"])

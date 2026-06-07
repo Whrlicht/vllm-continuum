@@ -568,6 +568,10 @@ class LruArenaStore:
 
         # 每块计划: [kind('H'/'M'), slot_id, hash]
         plan: List[list] = [['?', -1, h] for h in inc_hashes]
+        # ★ 淘汰 self-heal 延迟收集 (job_id -> 最小 s): 全量 manifest 重写是淘汰里
+        # 最贵的一段 (O(token) JSON, 锁内 ×N inc = 22s 主因). 收集到这里, CS1 解锁
+        # 后锁外按 job 各重写一次, 把它移出跨进程临界区.
+        evict_deferred: dict = {}
 
         # ---- 临界区 1: probe + HIT refcnt++ + MISS alloc/insert ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
@@ -604,7 +608,8 @@ class LruArenaStore:
                     accurate_free = self._allocator.count_free_accurate()
                     need = n_miss - accurate_free
                     if not self._evict_until_free_locked(
-                            need, exclude_job_id=job_id):
+                            need, exclude_job_id=job_id,
+                            deferred=evict_deferred):
                         for s in hit_inced:
                             _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(s))
                         return False
@@ -626,6 +631,10 @@ class LruArenaStore:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
         if _prof:
             _seg['cs1_work'] = (time.time() - _tp) * 1000.0; _tp = time.time()
+        # ★ 锁外: 批量 self-heal (淘汰收集的 job->min_s), 每 job 重写一次 manifest.
+        # 已出临界区, 不再阻塞别的 store/alloc. 内存 _last_stored 已在锁内更新过.
+        for _hj, _hs in evict_deferred.items():
+            self._rewrite_manifest_for_self_heal(_hj, _hs)
 
         # ---- 锁外: 只对 MISS 搬数据 + 建 v2 records (慢) ----
         try:
@@ -1014,32 +1023,42 @@ class LruArenaStore:
     # EVICT (LRU + tail-first + self-heal)
     # ============================================================
     def _evict_until_free_locked(self, need: int,
-                                 exclude_job_id: Optional[str] = None) -> bool:
+                                 exclude_job_id: Optional[str] = None,
+                                 deferred: Optional[dict] = None) -> bool:
         """在 alloc_mutex 内调用. 释放至少 need 个 slot.
 
         exclude_job_id: 写新 inc 的 job 自己不应被淘 (避免自淘)
+        deferred: 非 None 时把 self-heal (job->min_s) 收集到此, 由调用方锁外批量
+                  执行 (把全量 manifest 重写移出临界区). None 则锁内 inline (旧行为).
         返回: True 成功 / False 失败 (即便挖光 LRU 也不够)
         """
         if need <= 0:
             return True
         gained = 0
-        # 反复挑 victim, 直到够 need
-        attempted: set[str] = set()
+        # 单遍: 内存 LRU 快照 (最老在前) 逐 victim, O(jobs) (旧版每轮重扫 ~O(jobs²)).
+        # 快照 list(): _evict_job_tail_first 可能 _drop_job_lru 改动 _job_lru.
+        seen: set[str] = set()
+        for victim in list(self._job_lru):
+            if gained >= need:
+                break
+            if exclude_job_id is not None and victim == exclude_job_id:
+                continue
+            seen.add(victim)
+            gained += self._evict_job_tail_first(victim, need - gained,
+                                                 deferred)
+        # 单遍不够 (victim 多被 pin / 内存 LRU 不全, 罕见): 兜底反复挑 (含文件系统)
+        attempted: set[str] = set(seen)
+        if exclude_job_id is not None:
+            attempted.add(exclude_job_id)
         while gained < need:
-            victim = self._pick_lru_victim(
-                exclude={exclude_job_id} | attempted
-                if exclude_job_id else attempted)
+            victim = self._pick_lru_victim(exclude=attempted)
             if victim is None:
                 logger.warning("evict_until_free: no victim job found, "
                                "gained=%d need=%d", gained, need)
                 return False
             attempted.add(victim)
-            v_gained = self._evict_job_tail_first(victim,
-                                                  need - gained)
-            gained += v_gained
-            if v_gained == 0:
-                # 这个 victim 全部被 pin 住, 跳到下一个
-                continue
+            gained += self._evict_job_tail_first(victim, need - gained,
+                                                 deferred)
         return True
 
     def _pick_lru_victim(self,
@@ -1082,7 +1101,8 @@ class LruArenaStore:
         self._job_lru.pop(job_id, None)
 
     def _evict_job_tail_first(self, job_id: str,
-                              max_need: int) -> int:
+                              max_need: int,
+                              deferred: Optional[dict] = None) -> int:
         """从该 job 尾巴 inc 开始释放 slot, 直到释放够 max_need 或 inc 用完.
 
         返回实际释放数.
@@ -1109,7 +1129,8 @@ class LruArenaStore:
                 continue
             if self._content_addr:
                 # ---- ★ content-addr: refcnt--, 到 0 才真销毁 ----
-                released += self._evict_inc_content(job_id, s, e, path)
+                released += self._evict_inc_content(job_id, s, e, path,
+                                                    deferred)
             else:
                 # ---- 原始 plain 路径 (非 content-addr), 行为不变 ----
                 sf = read_slot_file_v1(path)
@@ -1171,7 +1192,7 @@ class LruArenaStore:
         return released
 
     def _evict_inc_content(self, job_id: str, s: int, e: int,
-                           path: str) -> int:
+                           path: str, deferred: Optional[dict] = None) -> int:
         """★ content-addr 版单 inc 淘汰 (在 alloc_mutex 内调用).
 
         对该 inc 的每块 refcnt--; 减到 0 且 pin==0 才真销毁 (bump gen + 删表 +
@@ -1222,8 +1243,13 @@ class LruArenaStore:
         if left_pinned == 0:
             cur_last = self._last_stored.get(job_id, e)
             if s < cur_last:
-                self._last_stored[job_id] = s
-                self._rewrite_manifest_for_self_heal(job_id, s)
+                self._last_stored[job_id] = s   # 内存进度 (锁内, 便宜) 立即更新
+                if deferred is not None:
+                    # 延迟: 收集 job 最小 s, 调用方锁外按 job 重写一次 manifest
+                    prev = deferred.get(job_id)
+                    deferred[job_id] = s if prev is None else min(prev, s)
+                else:
+                    self._rewrite_manifest_for_self_heal(job_id, s)
             try:
                 os.unlink(path)
             except OSError:
