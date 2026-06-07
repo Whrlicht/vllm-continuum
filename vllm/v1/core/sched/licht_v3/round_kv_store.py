@@ -462,6 +462,43 @@ class RoundKVStore:
         except Exception:
             return "?"
 
+    def _arena_numa_interleave(self, addr: int, size: int) -> None:
+        """mbind(MPOL_INTERLEAVE) 把 arena 页摊到所有 NUMA 节点, 提聚合内存带宽.
+        默认关 (LICHT_ARENA_NUMA_INTERLEAVE=1 开): 拓扑相关, 单 GPU DMA 可能跨
+        socket 反受 UPI 限制, 建议实测 A/B. 仅作用于 arena mmap, 不动模型权重.
+        必须在 cudaHostRegister 前调 (注册 fault 页时才按此策略落节点)."""
+        if os.environ.get("LICHT_ARENA_NUMA_INTERLEAVE", "0") != "1":
+            return
+        try:
+            import ctypes
+            nodes = sorted(
+                int(d[4:]) for d in os.listdir("/sys/devices/system/node")
+                if d.startswith("node") and d[4:].isdigit())
+            if len(nodes) < 2:
+                return                       # 单节点无可摊
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            SYS_mbind = 237                  # x86_64
+            MPOL_INTERLEAVE = 3
+            nwords = (max(nodes) // 64) + 1
+            words = [0] * nwords
+            for n in nodes:
+                words[n // 64] |= (1 << (n % 64))
+            NMask = ctypes.c_ulong * nwords
+            nodemask = NMask(*words)
+            maxnode = nwords * 64
+            rc = libc.syscall(
+                ctypes.c_long(SYS_mbind), ctypes.c_void_p(addr),
+                ctypes.c_size_t(size), ctypes.c_int(MPOL_INTERLEAVE),
+                nodemask, ctypes.c_ulong(maxnode), ctypes.c_uint(0))
+            if rc != 0:
+                logger.warning(
+                    "round-kv ARENA mbind(INTERLEAVE) 失败 rc=%d errno=%d "
+                    "-> 留单节点", rc, ctypes.get_errno())
+            else:
+                logger.info("round-kv ARENA NUMA interleave 跨节点 %s", nodes)
+        except Exception as e:  # pragma: no cover
+            logger.warning("round-kv ARENA NUMA interleave 异常: %s", e)
+
     def _arena_init(self, register: bool) -> None:
         """mmap the shared arena + header, derive the per-slot block-major
         layout from kv_caches, and (prefill only) cudaHostRegister the region
@@ -514,6 +551,10 @@ class RoundKVStore:
         mm = _mmap.mmap(fd, self._arena_bytes, _mmap.MAP_SHARED,
                         _mmap.PROT_READ | _mmap.PROT_WRITE)
         addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        # ★ P2 提带宽: NUMA interleave arena 跨节点, 摊内存控制器带宽 (arena 读/写
+        # 不再挤单节点). 必须在 register 前设 (注册 fault 页时按此策略落节点). 默认
+        # 关 (拓扑相关, 可能因 GPU 跨 socket DMA 反而略降); 用 mbind 只作用于 arena.
+        self._arena_numa_interleave(addr, self._arena_bytes)
         if register:
             # ① 防创建竞态: 确保 arena.bin 已是全尺寸 (两端各自 ftruncate, 但若
             #    另一端正在创建, 这里再夹一次, 避免 register 的范围超出文件)。
