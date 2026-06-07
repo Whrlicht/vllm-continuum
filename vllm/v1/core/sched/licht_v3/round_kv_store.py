@@ -442,9 +442,19 @@ class RoundKVStore:
             rt.cudaHostRegister.restype = ctypes.c_int
             rt.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                                             ctypes.c_uint]
+            rt.cudaGetErrorString.restype = ctypes.c_char_p
+            rt.cudaGetErrorString.argtypes = [ctypes.c_int]
             self._cudart = rt
         return self._cudart.cudaHostRegister(
             ctypes.c_void_p(addr), ctypes.c_size_t(size), ctypes.c_uint(0))
+
+    def _cuda_err_str(self, rc: int) -> str:
+        try:
+            import ctypes
+            s = self._cudart.cudaGetErrorString(ctypes.c_int(int(rc)))
+            return s.decode() if s else "?"
+        except Exception:
+            return "?"
 
     def _arena_init(self, register: bool) -> None:
         """mmap the shared arena + header, derive the per-slot block-major
@@ -499,11 +509,33 @@ class RoundKVStore:
                         _mmap.PROT_READ | _mmap.PROT_WRITE)
         addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
         if register:
+            # ① 防创建竞态: 确保 arena.bin 已是全尺寸 (两端各自 ftruncate, 但若
+            #    另一端正在创建, 这里再夹一次, 避免 register 的范围超出文件)。
+            try:
+                if os.fstat(fd).st_size < self._arena_bytes:
+                    os.ftruncate(fd, self._arena_bytes)
+            except OSError:
+                pass
             _t = time.time()
-            rc = self._cuda_host_register(addr, self._arena_bytes)
-            # 712 = cudaErrorHostMemoryAlreadyRegistered: the physical pages are
-            # already pinned (e.g. re-bind, or two stores in one process) -> the
-            # region is usable, treat as success.
+            # ② 失败重试退避: decode 早到注册 256GB 偶发 rc=1 (瞬态: CUDA ctx/节点
+            #    内存/文件就绪时序), 同 arena 稍后注册即成 (实测 prefill 晚 2min 成功)。
+            #    退避重试跨过瞬态, 让两端都拿到直读 kernel。次数/退避可 env 调。
+            _retries = int(os.environ.get("LICHT_ARENA_REG_RETRIES", "6"))
+            _backoff = [3, 6, 12, 20, 30]
+            rc = 1
+            for _att in range(max(1, _retries)):
+                rc = self._cuda_host_register(addr, self._arena_bytes)
+                # 712 = cudaErrorHostMemoryAlreadyRegistered: 物理页已 pin (re-bind
+                # 或同进程两 store) -> 区域可用, 视为成功.
+                if rc in (0, 712):
+                    break
+                if _att < max(1, _retries) - 1:
+                    _slp = _backoff[min(_att, len(_backoff) - 1)]
+                    logger.warning(
+                        "round-kv ARENA cudaHostRegister attempt %d/%d rc=%d (%s)"
+                        " -> %ds 后重试", _att + 1, _retries, rc,
+                        self._cuda_err_str(rc), _slp)
+                    time.sleep(_slp)
             if rc in (0, 712):
                 self._arena_registered = True
                 logger.info(
@@ -519,9 +551,10 @@ class RoundKVStore:
                 # load), content_addr/LRU/复用全部正常.
                 self._arena_registered = False
                 logger.warning(
-                    "round-kv ARENA cudaHostRegister rc=%d -> 直读 kernel 禁用, "
-                    "改用未注册 arena + staging load (content_addr/复用不受影响)",
-                    rc)
+                    "round-kv ARENA cudaHostRegister 重试 %d 次仍失败 rc=%d (%s) -> "
+                    "直读 kernel 禁用, 改用未注册 arena + staging load "
+                    "(content_addr/复用不受影响)",
+                    _retries, rc, self._cuda_err_str(rc))
         at = torch.frombuffer(mm, dtype=layer0.dtype)
         self._arena_view = at.view((self._num_slots, nL, 2) + rest)
         self._arena_mm = mm
