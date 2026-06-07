@@ -191,6 +191,72 @@ void licht_scatter_from_arena_layer(int64_t arena_host_ptr,
                 cudaGetErrorString(err));
 }
 
+// ── Per-layer 直写 (store: GPU paged -> arena host) ──────────────────────
+// licht_scatter_from_arena_layer 的镜像, 方向反过来: src=单层 paged 块 (src_idx),
+// dst=arena host slot (dst_slots). GPU kernel 经 PCIe 直写 cudaHostRegister 的 arena,
+// 省掉 D2H gather + CPU memcpy. 索引公式与读版完全一致 (arena/paged 布局不变).
+__global__ void licht_gather_to_arena_layer_kernel(
+    uint16_t* __restrict__ arena_host,        // dst (host pinned, 可写)
+    const int64_t*  __restrict__ dst_slots,   // arena 物理 slot per block
+    const int64_t*  __restrict__ src_idx,     // 源 paged block id per block
+    int64_t layer_ptr,                        // 单层 paged tensor data_ptr (src)
+    int nb, int nL, int layer_idx, int dim, long NBLK, long P)
+{
+    long total_runs = (long)nb * 2;
+    long P8 = P >> 3;
+    const uint16_t* srcbase = (const uint16_t*)layer_ptr;
+    for (long run = blockIdx.x; run < total_runs; run += gridDim.x) {
+        int  kv   = (int)(run & 1L);
+        long j    = run >> 1;
+        long slot = dst_slots[j];           // arena dst slot
+        long blk  = src_idx[j];             // paged src block
+        uint16_t* dst = arena_host
+            + (((slot * (long)nL + layer_idx) * 2 + kv) * P);
+        long srcoff = (dim == 1) ? ((kv * NBLK + blk) * P)
+                                 : ((blk * 2 + kv) * P);
+        const int4* s4 = (const int4*)(srcbase + srcoff);
+        int4* d4 = (int4*)dst;
+        for (long r = threadIdx.x; r < P8; r += blockDim.x) d4[r] = s4[r];
+    }
+}
+
+void licht_gather_to_arena_layer(int64_t arena_host_ptr,
+                                 torch::Tensor dst_slots,
+                                 torch::Tensor src_idx, int64_t layer_ptr,
+                                 int64_t nb, int64_t nL, int64_t layer_idx,
+                                 int64_t dim, int64_t NBLK, int64_t P) {
+    TORCH_CHECK(arena_host_ptr != 0,
+                "licht_gather_to_arena_layer: arena_host_ptr is null");
+    TORCH_CHECK(layer_ptr != 0,
+                "licht_gather_to_arena_layer: layer_ptr is null");
+    TORCH_CHECK(dst_slots.is_cuda() && src_idx.is_cuda(),
+                "licht_gather_to_arena_layer: dst_slots/src_idx must be CUDA");
+    TORCH_CHECK(dst_slots.scalar_type() == at::kLong,
+                "licht_gather_to_arena_layer: dst_slots must be int64");
+    TORCH_CHECK(src_idx.scalar_type() == at::kLong,
+                "licht_gather_to_arena_layer: src_idx must be int64");
+    TORCH_CHECK((P & 7) == 0,
+                "licht_gather_to_arena_layer: P must be a multiple of 8");
+    TORCH_CHECK(dst_slots.numel() >= nb && src_idx.numel() >= nb,
+                "licht_gather_to_arena_layer: dst_slots/src_idx too small");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < nL,
+                "licht_gather_to_arena_layer: layer_idx out of range");
+    long total_runs = nb * 2;
+    if (total_runs < 1) return;
+    int  threads = 256;
+    long blocks  = total_runs < 65535 ? total_runs : 65535;
+    const at::cuda::CUDAGuard device_guard(dst_slots.device());
+    auto stream  = at::cuda::getCurrentCUDAStream();
+    licht_gather_to_arena_layer_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<uint16_t*>(arena_host_ptr),
+        dst_slots.data_ptr<int64_t>(), src_idx.data_ptr<int64_t>(),
+        layer_ptr, (int)nb, (int)nL, (int)layer_idx, (int)dim, NBLK, P);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "licht_gather_to_arena_layer launch failed: ",
+                cudaGetErrorString(err));
+}
+
 void licht_scatter(torch::Tensor staging, torch::Tensor idx,
                    torch::Tensor layer_ptrs, int64_t nb, int64_t nL,
                    int64_t dim, int64_t NBLK, int64_t P) {
@@ -233,6 +299,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("licht_scatter_from_arena_layer", &licht_scatter_from_arena_layer,
           "Per-layer host-pinned-arena -> single paged layer scatter (pipeline)",
           py::arg("arena_host_ptr"), py::arg("src_slots"), py::arg("dst_idx"),
+          py::arg("layer_ptr"), py::arg("nb"), py::arg("nL"), py::arg("layer_idx"),
+          py::arg("dim"), py::arg("NBLK"), py::arg("P"));
+    m.def("licht_gather_to_arena_layer", &licht_gather_to_arena_layer,
+          "Per-layer single paged layer -> host-pinned-arena direct write (store)",
+          py::arg("arena_host_ptr"), py::arg("dst_slots"), py::arg("src_idx"),
           py::arg("layer_ptr"), py::arg("nb"), py::arg("nL"), py::arg("layer_idx"),
           py::arg("dim"), py::arg("NBLK"), py::arg("P"));
 }

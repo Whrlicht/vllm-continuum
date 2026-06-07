@@ -122,3 +122,33 @@ def get_arena_scatter_layer():
             "Pipeline falls back to batched direct.", e)
         _fn_arena_layer = None
     return _fn_arena_layer
+
+
+_fn_gather_layer = None
+_tried_gather_layer = False
+
+
+def get_arena_gather_layer():
+    """Return the prebuilt `licht_gather_to_arena_layer` callable, or None.
+
+    Per-layer 直写 (store): 单层 paged 块 -> arena host pinned slot. GPU kernel
+    经 PCIe 直写, 省掉 D2H gather + CPU memcpy. 旧 .so 没此符号 -> None, 调用方
+    回退旧 gather+memcpy 存路径.
+    Signature: fn(arena_host_ptr, dst_slots, src_idx, layer_ptr,
+                  nb, nL, layer_idx, dim, NBLK, P)
+    """
+    global _fn_gather_layer, _tried_gather_layer
+    if _tried_gather_layer:
+        return _fn_gather_layer
+    _tried_gather_layer = True
+    try:
+        import licht_fused_scatter as _ext
+        _fn_gather_layer = _ext.licht_gather_to_arena_layer
+        logger.info("round-kv STORE-DIRECT per-layer arena write: using prebuilt "
+                    "licht_fused_scatter.licht_gather_to_arena_layer")
+    except (ImportError, AttributeError) as e:
+        logger.warning(
+            "round-kv per-layer arena write unavailable (%s); rebuild csrc/. "
+            "Store falls back to gather+memcpy.", e)
+        _fn_gather_layer = None
+    return _fn_gather_layer
