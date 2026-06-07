@@ -336,6 +336,12 @@ class RoundKVStore:
         # arena cudaHostRegister 后可用; 由 _setup_arena_direct 设置.
         self._arena_direct_fn = None      # licht_scatter_from_arena callable
         self._arena_direct_layer_fn = None  # ★ per-layer 流水 callable
+        self._arena_gather_layer_fn = None  # ★ per-layer 直写 callable (store)
+        # store-direct: GPU kernel 直写 KV 到 arena (省 D2H gather + CPU memcpy).
+        # 需 content_addr + 直写 kernel + arena registered. 默认开; 缺前提自动回退
+        # 旧 gather+memcpy. LICHT_ROUND_KV_STORE_DIRECT=0 强制关.
+        self._store_direct = (
+            os.environ.get("LICHT_ROUND_KV_STORE_DIRECT", "1") == "1")
         self._arena_direct_layer_names = []  # 有序层名 (与 _arena_direct_layers 对齐)
         self._arena_direct_layer_ptrs = None  # int64 GPU [nL] paged data_ptr
         self._arena_direct_layers = []    # 各层 paged tensor (keep alive)
@@ -776,16 +782,81 @@ class RoundKVStore:
                 self._arena_direct_layer_fn = get_arena_scatter_layer()
             except Exception:
                 self._arena_direct_layer_fn = None
+            # ★ store-direct: per-layer 直写 callable (GPU paged -> arena).
+            try:
+                from vllm.v1.core.sched.licht_v3.fused_scatter import (
+                    get_arena_gather_layer)
+                self._arena_gather_layer_fn = get_arena_gather_layer()
+            except Exception:
+                self._arena_gather_layer_fn = None
             logger.info(
                 "round-kv DIRECT arena scatter ON: nL=%d P=%d NBLK=%d dim=%d "
-                "arena_host=0x%x pipeline=%s",
+                "arena_host=0x%x pipeline=%s store_direct=%s",
                 len(layers), self._arena_direct_P, self._arena_direct_NBLK,
                 self._arena_dim, self._arena_addr,
-                self._arena_direct_layer_fn is not None)
+                self._arena_direct_layer_fn is not None,
+                self._arena_gather_layer_fn is not None)
         except Exception as e:  # pragma: no cover
             logger.warning("round-kv DIRECT setup failed: %s; per-request "
                            "fallback", e)
             self._arena_direct_fn = None
+
+    def _store_direct_available(self) -> bool:
+        """store-direct 前提: 开关 + content_addr + 直写 kernel + arena registered
+        + 直读 layer 元数据已就绪 (复用 load 的 _arena_direct_layers/NBLK/P)."""
+        return bool(
+            self._store_direct
+            and self._is_cuda
+            and self._lru_store is not None
+            and getattr(self._lru_store, "content_addr", False)
+            and self._arena_gather_layer_fn is not None
+            and self._arena_registered
+            and self._arena_direct_layers)
+
+    def _gpu_write_miss(self, miss_slots: list, miss_paged: list,
+                        ev, stream) -> None:
+        """GPU 直写: 把 MISS 块从 paged KV 经 PCIe 直写进 arena slot (全 nL 层).
+        wait_event(ev) 等本步 forward 把 KV 算完; 写完 sync, 保证 CS2 publish gen
+        前 arena 数据已落地 (reader 看到 gen 即数据就绪, 维持 gen/pin 不变量)."""
+        import torch
+        if not miss_slots:
+            return
+        dst_slots = torch.tensor(miss_slots, dtype=torch.int64,
+                                 device=self._device)
+        src_idx = torch.tensor(miss_paged, dtype=torch.int64,
+                               device=self._device)
+        nb = len(miss_slots)
+        sctx = (torch.cuda.stream(stream) if stream is not None
+                else _nullctx())
+        with sctx:
+            if stream is not None and ev is not None:
+                stream.wait_event(ev)
+            for i in range(self._arena_nL):
+                layer_ptr = int(self._arena_direct_layers[i].data_ptr())
+                self._arena_gather_layer_fn(
+                    int(self._arena_addr), dst_slots, src_idx, layer_ptr,
+                    nb, self._arena_nL, i, self._arena_dim,
+                    self._arena_direct_NBLK, self._arena_direct_P)
+        # 必须同步: CS2 publish gen 前 arena 数据要已写完 (否则 reader pin 到半写)
+        if stream is not None:
+            stream.synchronize()
+        else:
+            torch.cuda.current_stream().synchronize()
+
+    def _store_direct_arena_lru(self, job_id, start, end, inc_block_ids,
+                                token_ids, ev, stream) -> bool:
+        """store-direct: 不 gather, 不 CPU memcpy. CS1 定 MISS slot → GPU 直写
+        (paged->arena) → CS2 publish. dedup 记账复用 write_inc (gpu_write_fn 钩子)."""
+        def _gpu_write(miss_slots, miss_pos):
+            miss_paged = [int(inc_block_ids[p]) for p in miss_pos]
+            self._gpu_write_miss(miss_slots, miss_paged, ev, stream)
+        return bool(self._lru_store.write_inc(
+            job_id=str(job_id),
+            start_block=int(start),
+            end_block=int(end),
+            token_ids=list(token_ids) if token_ids is not None else [],
+            source_obj=None,
+            gpu_write_fn=_gpu_write))
 
     def _load_batch_arena_lru(self, items: list) -> list:
         """LRU 版 batch load.
@@ -1265,6 +1336,25 @@ class RoundKVStore:
                 self._mark_done(request_id)
                 return
             inc_block_ids = list(block_ids[last:end])
+            # ---- store-direct: GPU kernel 直写 paged->arena, 省 gather+memcpy ----
+            if self._store_direct_available():
+                _t1 = time.time()
+                ok = self._store_direct_arena_lru(
+                    job_id, last, end, inc_block_ids, token_ids, ev, stream)
+                # GPU 写已 sync 完成 -> paged 块可释放
+                self._mark_done(request_id)
+                if ok is False:
+                    logger.warning(
+                        "round-kv STORE-DIRECT inc write failed job=%s [%d,%d)"
+                        " — 进度不推进", str(job_id)[:32], last, end)
+                    return
+                self._write_manifest(
+                    job_id, end, token_ids[:end * self.block_size])
+                self._last_stored[job_id] = end
+                logger.info(
+                    "round-kv STORE-DIRECT: job=%s inc_blocks=%d write_ms=%.0f",
+                    str(job_id)[:32], end - last, (time.time() - _t1) * 1000.0)
+                return
             # ---- gather the increment (own stream; never touches engine) ----
             _t0 = time.time()
             tensors = self._gather(inc_block_ids, ev, stream)

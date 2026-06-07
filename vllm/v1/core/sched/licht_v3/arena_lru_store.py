@@ -396,7 +396,8 @@ class LruArenaStore:
                   start_block: int,
                   end_block: int,
                   token_ids: List[int],
-                  source_obj: object) -> bool:
+                  source_obj: object,
+                  gpu_write_fn=None) -> bool:
         """把 [start_block, end_block) 这段 inc 写入 arena.
 
         参数:
@@ -427,7 +428,8 @@ class LruArenaStore:
         # ★ Stage 6: 内容寻址 dedup 路径 (probe hash 表, 命中复用不新分配)
         if self._content_addr:
             return self._write_inc_dedup(
-                job_id, start_block, end_block, token_ids, source_obj)
+                job_id, start_block, end_block, token_ids, source_obj,
+                gpu_write_fn=gpu_write_fn)
 
         # ---- 临界区 1: alloc (+ evict if needed), 拿到 slot_ids ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
@@ -531,7 +533,8 @@ class LruArenaStore:
                          start_block: int,
                          end_block: int,
                          token_ids: List[int],
-                         source_obj: object) -> bool:
+                         source_obj: object,
+                         gpu_write_fn=None) -> bool:
         """内容寻址版 write_inc.
 
         与非 dedup 版同样的三段式临界区, 但每块先 probe hash 表:
@@ -626,9 +629,19 @@ class LruArenaStore:
 
         # ---- 锁外: 只对 MISS 搬数据 + 建 v2 records (慢) ----
         try:
-            for i in range(n_blocks):
-                if plan[i][0] == 'M':
-                    self._data_writer(plan[i][1], i, source_obj)
+            if gpu_write_fn is not None:
+                # ★ store-direct: GPU kernel 直写 (paged -> arena), 一次批量, 内部
+                # wait_event(forward) + sync, 省掉 D2H gather + 逐块 CPU memcpy.
+                # 传 MISS 的 (arena slot, inc 内位置), 调用方据位置映射 paged block id.
+                _miss_slots = [plan[i][1] for i in range(n_blocks)
+                               if plan[i][0] == 'M']
+                _miss_pos = [i for i in range(n_blocks)
+                             if plan[i][0] == 'M']
+                gpu_write_fn(_miss_slots, _miss_pos)
+            else:
+                for i in range(n_blocks):
+                    if plan[i][0] == 'M':
+                        self._data_writer(plan[i][1], i, source_obj)
             if _prof:
                 _seg['data'] = (time.time() - _tp) * 1000.0; _tp = time.time()
             # records: (slot, gen, hash). HIT gen=当前; MISS gen=当前+1(待发布)

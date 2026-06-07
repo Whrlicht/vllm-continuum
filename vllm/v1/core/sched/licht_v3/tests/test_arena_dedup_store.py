@@ -87,6 +87,43 @@ class TestDedupStore:
         for i in range(3):
             assert _slot_of(store, toks_a, i) == _slot_of(store, toks_b, i)
 
+    def test_gpu_write_fn_hook(self, tmp_path, monkeypatch):
+        """store-direct: gpu_write_fn 钩子替代逐块 CPU 搬运. 只对 MISS 块调钩子
+        (传 arena slot + inc 内位置), HIT 不调; dedup/refcnt/gen/lookup 全正常."""
+        store, arena, writes = _make_store(tmp_path, monkeypatch, num_slots=64)
+        # 用钩子模拟 GPU 直写: (miss_slots, miss_pos) -> 从 src[pos] 写 slot
+        src_a = [b"a0", b"a1", b"a2"]
+        cap = []
+        def gw_a(miss_slots, miss_pos):
+            cap.append((list(miss_slots), list(miss_pos)))
+            for s, p in zip(miss_slots, miss_pos):
+                arena[s] = src_a[p]
+        toks_a = list(range(48))
+        assert store.write_inc("A", 0, 3, toks_a, source_obj=None,
+                               gpu_write_fn=gw_a)
+        # 全 MISS: 钩子拿到 3 块, 位置 0/1/2; CPU data_writer 没被调
+        assert cap[-1][1] == [0, 1, 2]
+        assert writes == []
+        assert len(arena) == 3
+        # gen 已 publish -> lookup own 命中
+        res = store.lookup("A", toks_a)
+        assert res is not None and res[0] == 3 * BS
+
+        # job B 共享 A 前 3 块 -> 只第 4 块 MISS 经钩子, 前 3 块 HIT refcnt++
+        src_b = [b"b0", b"b1", b"b2", b"b3"]
+        cap.clear()
+        def gw_b(miss_slots, miss_pos):
+            cap.append((list(miss_slots), list(miss_pos)))
+            for s, p in zip(miss_slots, miss_pos):
+                arena[s] = src_b[p]
+        toks_b = list(range(48)) + list(range(100, 116))
+        assert store.write_inc("B", 0, 4, toks_b, source_obj=None,
+                               gpu_write_fn=gw_b)
+        assert cap[-1][1] == [3]          # 仅 MISS 第 4 块
+        assert len(arena) == 4            # 共享 3 + 新 1, 不是 7
+        for i in range(3):               # 共享块 refcnt 升到 2
+            assert _refcnt(store, _slot_of(store, toks_b, i)) == 2
+
     def test_slot_file_is_v2(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=32)
         store.write_inc("J", 0, 2, list(range(32)), [b"0", b"1"])
