@@ -141,6 +141,21 @@ class TestDedupStore:
         ma = store._read_manifest("A")
         assert ma is not None and ma["total_blocks"] == 2
 
+    def test_evict_lockfree(self, tmp_path, monkeypatch):
+        """锁外两阶段淘汰 _evict_lockfree: 释放 slot + 尾 inc self-heal + 存活块可查."""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks_a = list(range(64))                       # A: 4 block, 两个 inc
+        assert store.write_inc("A", 0, 2, toks_a, [b"a0", b"a1"])
+        assert store.write_inc("A", 2, 4, toks_a, [b"a2", b"a3"])
+        free_before = store._allocator.free_count      # 8-4=4
+        freed = store._evict_lockfree(1)               # 淘 A 尾 inc [2,4) → free 2
+        assert freed == 2
+        assert store._allocator.free_count == free_before + 2
+        # 尾 inc 淘掉, [0,2) 存活 → inline self-heal manifest 回退到 2
+        assert store._read_manifest("A")["total_blocks"] == 2
+        r = store.lookup("A", toks_a)                  # 前 2 块仍可查
+        assert r is not None and r[0] == 2 * BS
+
     def test_slot_file_is_v2(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=32)
         store.write_inc("J", 0, 2, list(range(32)), [b"0", b"1"])

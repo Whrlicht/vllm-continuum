@@ -31,6 +31,7 @@ import logging
 import os
 import struct
 import tempfile
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -189,6 +190,10 @@ class LruArenaStore:
         self._stat_miss_blocks = 0
         self._stat_evict_freed = 0
         self._stat_evict_decref = 0
+        # 进程内淘汰锁: 锁外两阶段淘汰要改 _job_lru/_last_stored 等进程内结构,
+        # 多 store 线程并发淘汰需串行 (跨进程一致性仍靠 alloc_mutex). 只 1 个线程
+        # 在本进程淘汰, 其余等 (淘汰是后台路径, 串行可接受).
+        self._evict_lock = threading.Lock()
 
     # ============================================================
     # Lifecycle
@@ -573,6 +578,27 @@ class LruArenaStore:
         # 后锁外按 job 各重写一次, 把它移出跨进程临界区.
         evict_deferred: dict = {}
 
+        # ---- 锁外预淘汰: arena 估计不够时, 先用锁外两阶段淘汰腾出 slot, 让下面
+        # CS1 的 alloc 直接命中, 不必在长临界区内做淘汰的文件 I/O (那是 2-12s 锁
+        # 残留的来源). est_miss 用锁外 ht_probe (lookup 同款无锁读), free 用廉价计数.
+        # 估偏了也没关系: CS1 会重新 probe+alloc, 仍不够再走锁内 _evict 兜底 (罕见).
+        try:
+            est_miss = 0
+            for h in inc_hashes:
+                ps, _g = _atomic.ht_probe(ht_base, ht_cap, h)
+                if ps < 0:
+                    est_miss += 1
+            if est_miss > 0:
+                free_est = int(self._allocator.free_count)
+                if est_miss > free_est:
+                    self._evict_lockfree(est_miss - free_est,
+                                         exclude_job_id=job_id,
+                                         deferred=evict_deferred)
+        except Exception as _e:  # pragma: no cover
+            logger.debug("pre-evict (lockfree) skipped: %s", _e)
+        if _prof:
+            _seg['preevict'] = (time.time() - _tp) * 1000.0; _tp = time.time()
+
         # ---- 临界区 1: probe + HIT refcnt++ + MISS alloc/insert ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
         if _prof:
@@ -703,9 +729,10 @@ class LruArenaStore:
             _seg['manifest'] = (time.time() - _tp) * 1000.0
             _nm = len(miss_pub)
             logger.info(
-                "WRITE-PROF job=%s nblk=%d miss=%d | hash=%.0f lockwait=%.0f "
-                "cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f man=%.0f",
-                str(job_id)[:24], n_blocks, _nm, _seg.get('hash', 0),
+                "WRITE-PROF job=%s nblk=%d miss=%d | preevict=%.0f hash=%.0f "
+                "lockwait=%.0f cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f "
+                "man=%.0f", str(job_id)[:24], n_blocks, _nm,
+                _seg.get('preevict', 0), _seg.get('hash', 0),
                 _seg.get('cs1_lockwait', 0), _seg.get('cs1_work', 0),
                 _seg.get('data', 0),
                 (_seg.get('data', 0) / _nm) if _nm else 0.0,
@@ -1022,6 +1049,107 @@ class LruArenaStore:
     # ============================================================
     # EVICT (LRU + tail-first + self-heal)
     # ============================================================
+    def _evict_inc_apply_locked(self, records) -> tuple:
+        """★ 两阶段淘汰的【短锁】段: 对一个 inc 的 records 只做原子释放 + 逐块复核
+        (是 _evict_inc_content 锁内那段的纯原子版, 不含任何文件 I/O). 持 alloc_mutex
+        极短 (µs/块). 返回 (freed, left_pinned). content_addr 专用 (records 带 hash)."""
+        rc = _atomic.mutex_lock(self._hdr.mutex_addr)
+        if rc == _atomic.errno_eownerdead():
+            _atomic.mutex_recover(self._hdr.mutex_addr)
+            self._allocator.sync_from_bitmap()
+        elif rc != 0:
+            return 0, 0
+        freed = 0
+        left_pinned = 0
+        try:
+            for (slot_id, _gen, h) in records:
+                if self._allocator.is_free(slot_id):
+                    continue
+                addr = self._hdr.slot_state_addr(slot_id)
+                if not _atomic.can_evict(addr):
+                    left_pinned += 1
+                    continue
+                ps, _g = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+                if ps != slot_id:
+                    continue
+                if _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(slot_id)) == 0:
+                    _atomic.evict_slot(addr)
+                    _atomic.ht_remove(self._ht_base, self._ht_cap, h)
+                    self._allocator.free_n([slot_id])
+                    freed += 1
+                else:
+                    self._stat_evict_decref += 1
+        finally:
+            _atomic.mutex_unlock(self._hdr.mutex_addr)
+        self._stat_evict_freed += freed
+        return freed, left_pinned
+
+    def _evict_lockfree(self, need: int,
+                        exclude_job_id: Optional[str] = None,
+                        deferred: Optional[dict] = None) -> int:
+        """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 文件 I/O 全锁外
+        (list_incs / read_slot_file / unlink / self-heal), 只有每个 inc 的原子
+        释放走 _evict_inc_apply_locked 的短 alloc_mutex. 进程内用 _evict_lock 串行
+        (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
+
+        正确性: 短锁内逐块复核 (is_free/can_evict/ht_probe) 与原 _evict_inc_content
+        一致, 跨进程并发淘汰/复用安全 (最坏白读已被淘的 job)."""
+        if need <= 0 or not self._content_addr:
+            return 0
+        gained = 0
+        with self._evict_lock:
+            for victim in list(self._job_lru):
+                if gained >= need:
+                    break
+                if exclude_job_id is not None and victim == exclude_job_id:
+                    continue
+                incs = self._list_incs(victim)          # 锁外 listdir
+                committed = self._last_stored.get(victim)
+                if committed is None:
+                    m = self._read_manifest(victim)
+                    committed = int(m.get("total_blocks", 0)) if m else 0
+                for (s, e, path) in reversed(incs):
+                    if gained >= need:
+                        break
+                    if e > committed:
+                        continue
+                    sf = read_slot_file_v2(path)        # 锁外读
+                    if sf is None:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                        continue
+                    freed, left_pinned = self._evict_inc_apply_locked(
+                        sf.records)                     # 短锁原子释放
+                    gained += freed
+                    if left_pinned == 0:
+                        cur_last = self._last_stored.get(victim, e)
+                        if s < cur_last:
+                            self._last_stored[victim] = s
+                            if deferred is not None:
+                                prev = deferred.get(victim)
+                                deferred[victim] = (s if prev is None
+                                                    else min(prev, s))
+                            else:
+                                self._rewrite_manifest_for_self_heal(victim, s)
+                        try:
+                            os.unlink(path)             # 锁外 unlink
+                        except OSError:
+                            pass
+                # victim 淘空 -> 锁外清理 (内存 + 文件)
+                if not self._list_incs(victim):
+                    self._drop_job_lru(victim)
+                    self._last_stored.pop(victim, None)
+                    try:
+                        mp = self._manifest_path(victim)
+                        if os.path.exists(mp):
+                            os.unlink(mp)
+                        os.rmdir(self._job_dir(victim))
+                    except OSError:
+                        pass
+        return gained
+
     def _evict_until_free_locked(self, need: int,
                                  exclude_job_id: Optional[str] = None,
                                  deferred: Optional[dict] = None) -> bool:
