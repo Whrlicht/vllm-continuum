@@ -294,6 +294,15 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # then, every get_num_new_matched_tokens attempt for this
         # req checks arena instead of falling into NCCL.
         self._arena_sinked: set[str] = set()
+        # ★ 每个 sink 请求的发起时刻 (deadline 兜底用). ARENA_SINK RPC 偶发被
+        # prefill declined (bridge 已 RELEASE / 竞态), 此时 arena 永远没数据,
+        # 该 req 在 get_num_new_matched_tokens 会永远 lookup miss → return None
+        # 永久 defer (update_state 不被调 → 标记不清) → 挂到 600s 超时. 用 deadline:
+        # 超时未就绪就放弃 arena、退回 NCCL, 并标 failed 防再次 sink.
+        self._arena_sink_ts: dict[str, float] = {}
+        self._arena_sink_failed: set[str] = set()
+        self._arena_sink_deadline_s = float(
+            _os.environ.get("LICHT_ARENA_SINK_DEADLINE_S", "30"))
         # Worker-side store-completion is tracked inside RoundKVStore
         # (drain_done) now that the write is async; get_finished reads it.
 
@@ -1121,7 +1130,21 @@ p2p_nccl_engine import get_fast_release_queue
                     ext = matched_tokens - num_computed_tokens
                     if ext > 0:
                         return ext, False
-            # Arena not ready yet (D2H still in flight) -> defer.
+            # ★ deadline 兜底: arena 还没就绪. 正常 D2H ~数秒就好; 若超过 deadline
+            # 仍 miss, 多半是 RPC 被 declined (bridge 已 RELEASE/竞态), arena 永远
+            # 不会有数据. 放弃 arena → 标 failed (防再 sink) → 退回 NCCL, 避免永久
+            # defer 挂到 600s 超时. 未超时则继续 defer 等 D2H.
+            _t0 = self._arena_sink_ts.get(request.request_id)
+            if _t0 is not None and (time.time() - _t0) > \
+                    self._arena_sink_deadline_s:
+                self._arena_sinked.discard(request.request_id)
+                self._arena_sink_ts.pop(request.request_id, None)
+                self._arena_sink_failed.add(request.request_id)
+                logger.warning(
+                    "Phase2 arena-sink req=%s 超 %.0fs 未就绪 (RPC 多半被 declined)"
+                    " -> 放弃 arena, 退回 NCCL",
+                    request.request_id, self._arena_sink_deadline_s)
+                return 0, False
             return None, False
 
         # Phase 2 (PD path selector): first time we see this request
@@ -1130,6 +1153,7 @@ p2p_nccl_engine import get_fast_release_queue
         # ≤ threshold -> NCCL direct (current behaviour).
         if (self._phase2_admission_gate
                 and request.request_id not in self._preempt_saved
+                and request.request_id not in self._arena_sink_failed
                 and self._admission_kv_total_blocks > 0):
             try:
                 _need_tokens = max(
@@ -1161,6 +1185,7 @@ p2p_nccl_engine import get_fast_release_queue
                     str(_job), list(request.prompt_token_ids),
                     _remote or "")
                 self._arena_sinked.add(request.request_id)
+                self._arena_sink_ts[request.request_id] = time.time()
                 logger.info(
                     "Phase2 sink->arena req=%s usage=%.3f pred=%.3f "
                     "thr=%.2f need_blk=%d remote=%s",
@@ -1248,6 +1273,8 @@ p2p_nccl_engine import get_fast_release_queue
                                     str(job_id), dst, local_hit_blocks, None)
                             self._arena_sinked.discard(
                                 request.request_id)
+                            self._arena_sink_ts.pop(
+                                request.request_id, None)
                             logger.info(
                                 "Phase2 admit-from-arena req=%s job=%s "
                                 "matched_blocks=%d num_blocks=%d "
@@ -1259,6 +1286,7 @@ p2p_nccl_engine import get_fast_release_queue
                 # marker so a retry doesn't get stuck in the arena
                 # branch forever.
                 self._arena_sinked.discard(request.request_id)
+                self._arena_sink_ts.pop(request.request_id, None)
             # Phase 1 (save-on-preempt) consumer recovery: if this request
             # was preempt-saved, route to the arena-load path (matches the
             # producer's prefix-reuse flow) instead of the NCCL pull queue.
@@ -1596,6 +1624,10 @@ p2p_nccl_engine import get_fast_release_queue
 
         self.chunked_prefill.pop(request.request_id, None)
         self._requests_need_load.pop(request.request_id, None)
+        # Phase2 arena-sink markers 生命周期到此 (防 _arena_sink_failed 无界增长)
+        self._arena_sink_failed.discard(request.request_id)
+        self._arena_sink_ts.pop(request.request_id, None)
+        self._arena_sinked.discard(request.request_id)
         self._pending_failed_block_migrations.pop(request.request_id, None)
         if self.is_producer and self.direct_block_mode:
             # Bug 4 fix: only treat this request as delay-free (waiting
