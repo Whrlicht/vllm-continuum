@@ -196,6 +196,22 @@ class TestDedupStore:
         assert store._allocator.free_count == free_before + 2
         assert store._read_manifest("A")["total_blocks"] == 2
 
+    def test_evict_recheck_aborts_wasted(self, tmp_path, monkeypatch):
+        """Phase 0.1: recheck_fn 返回 0 (并发 store 已满足需求) → 不做无效淘汰;
+        返回正数则正常淘。直接对应 miss=0 的 116s '淘了个寂寞'。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        free_before = store._allocator.free_count
+        # recheck 说"已不缺槽" → 立即停, A 一个块都不淘
+        freed = store._evict_lockfree(4, recheck_fn=lambda: 0)
+        assert freed == 0
+        assert store._allocator.free_count == free_before
+        # recheck 返回正数 → 正常淘
+        freed2 = store._evict_lockfree(1, recheck_fn=lambda: 4)
+        assert freed2 == 2
+
     def test_evict_gen_revalidation(self, tmp_path, monkeypatch):
         """两阶段 apply 的 gen 复核: 记录 gen 与 slot 当前 gen 不符 (模拟锁外读后被
         别进程 free/复用), 则跳过 — 不误减引用、不 free。gen 对则正常淘。"""

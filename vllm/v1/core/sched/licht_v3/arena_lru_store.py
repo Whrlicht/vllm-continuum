@@ -616,10 +616,27 @@ class LruArenaStore:
                     _margin = int(_need * self._preevict_margin)
                     if self._preevict_margin > 0:
                         _margin = max(_margin, 64)   # 启用时给个固定下限
+
+                    # ★ Phase 0.1: 砍无效淘汰. preevict 的 est_miss 是无锁抢跑估的;
+                    # 淘汰要花时间, 这期间另一条路 (prefill ARENA_SINK / decode
+                    # round-persist 存同一请求的 prompt) 可能把同内容存进去 → 我的
+                    # miss 实时降到 0 → CS1 一看全命中 → 刚淘的全白做 (实测 116s 淘了
+                    # 个寂寞). recheck: 淘汰中实时重探我自己的 hash, 算"当前还真缺几个
+                    # 槽", gained 够了就立刻停, 不再白淘. 只读不写, 不改淘汰语义.
+                    def _recheck_need() -> int:
+                        _m = 0
+                        for _h in inc_hashes:
+                            _ps, _gg = _atomic.ht_probe(ht_base, ht_cap, _h)
+                            if _ps < 0:
+                                _m += 1
+                        return max(0, _m - int(
+                            self._allocator.count_free_accurate()))
+
                     self._evict_lockfree(_need + _margin,
                                          exclude_job_id=job_id,
                                          deferred=evict_deferred,
-                                         prof=(_pp if _prof else None))
+                                         prof=(_pp if _prof else None),
+                                         recheck_fn=_recheck_need)
         except Exception as _e:  # pragma: no cover
             logger.debug("pre-evict (lockfree) skipped: %s", _e)
         if _prof:
@@ -762,13 +779,13 @@ class LruArenaStore:
             _nm = len(miss_pub)
             logger.info(
                 "WRITE-PROF job=%s nblk=%d miss=%d | preevict=%.0f"
-                "(lw=%.0f work=%.0f vic=%d idx=%d file=%d) hash=%.0f "
+                "(lw=%.0f work=%.0f vic=%d idx=%d file=%d abort=%d) hash=%.0f "
                 "lockwait=%.0f cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f "
                 "man=%.0f", str(job_id)[:24], n_blocks, _nm,
                 _seg.get('preevict', 0),
                 _pp.get('lockwait', 0), _pp.get('work', 0),
                 _pp.get('victims', 0), _pp.get('idx_incs', 0),
-                _pp.get('file_incs', 0),
+                _pp.get('file_incs', 0), _pp.get('recheck_abort', 0),
                 _seg.get('hash', 0),
                 _seg.get('cs1_lockwait', 0), _seg.get('cs1_work', 0),
                 _seg.get('data', 0),
@@ -1139,7 +1156,8 @@ class LruArenaStore:
     def _evict_lockfree(self, need: int,
                         exclude_job_id: Optional[str] = None,
                         deferred: Optional[dict] = None,
-                        prof: Optional[dict] = None) -> int:
+                        prof: Optional[dict] = None,
+                        recheck_fn=None) -> int:
         """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 只有每个 inc 的原子
         释放走 _evict_inc_apply_locked 的短 alloc_mutex; 其余全锁外. 进程内用
         _evict_lock 串行 (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
@@ -1150,7 +1168,11 @@ class LruArenaStore:
         加速提示 → 过时也安全 (最坏白读已淘 slot, gen 复核挡住).
 
         prof: 非 None 时填分段诊断 (lockwait=等_evict_lock ms, work=锁内活 ms,
-        victims/idx_incs/file_incs=走索引 vs 回退读文件的 inc 数). 定位 preevict 尖刺."""
+        victims/idx_incs/file_incs=走索引 vs 回退读文件的 inc 数). 定位 preevict 尖刺.
+
+        recheck_fn: 非 None 时, 每 victim 前调它拿"当前还真缺几个槽"(实时重探调用方
+        自己的 hash). gained 已够就停 — 防"淘汰途中并发 store 把同内容存进去, 我的
+        需求实时降到 0, 却还在白淘"(Phase 0.1, 治 miss=0 的 116s 无效淘汰)."""
         if need <= 0 or not self._content_addr:
             return 0
         gained = 0
@@ -1164,6 +1186,12 @@ class LruArenaStore:
             _t_work = time.time()
             for victim in list(self._job_lru):
                 if gained >= need:
+                    break
+                # ★ Phase 0.1: 实时重核实际需求. 并发 store 把同内容存进去后, 我已
+                # 不缺槽 (或 gained 已够当前真实缺口) → 立即停, 不做无效淘汰.
+                if recheck_fn is not None and gained >= recheck_fn():
+                    if prof is not None:
+                        prof['recheck_abort'] = 1
                     break
                 if exclude_job_id is not None and victim == exclude_job_id:
                     continue
