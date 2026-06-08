@@ -379,8 +379,12 @@ class LruArenaStore:
                         token_ids: List[int]) -> None:
         d = self._job_dir(job_id)
         os.makedirs(d, exist_ok=True)
-        payload = {"total_blocks": int(total_blocks),
-                   "token_ids": [int(t) for t in token_ids]}
+        # ★ content_addr 下 lookup 走哈希表 (lookup_resolve), 不读 manifest token_ids
+        # → 不存全量 token_ids, manifest 瘦成 {total_blocks} (省每次 store 的 O(token)
+        # JSON 写 + 淘汰 self-heal 的大 JSON 重写). 仅 content_addr 关时存 token_ids
+        # 给 own-job lookup LCP 用. total_blocks 仍存 (淘汰 committed / 跨重启 resume).
+        _toks = [] if self._content_addr else [int(t) for t in token_ids]
+        payload = {"total_blocks": int(total_blocks), "token_ids": _toks}
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".man_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -782,6 +786,15 @@ class LruArenaStore:
 
         返回 (matched_tokens, matched_blocks); 无命中返回 None.
         """
+        # ★ content_addr 下哈希表是权威索引: 走 lookup_resolve (job 无关, 不读
+        # manifest token_ids — 已不存全量). own/cross-job 都覆盖, gen+refcnt 校验.
+        # content_addr 关时才用 manifest token_ids 算 own-job LCP (下面旧路径).
+        if self._content_addr:
+            res = self.lookup_resolve(prompt_token_ids)
+            if res is None:
+                return None
+            mt, mb, _sg = res
+            return mt, mb
         manifest = self._read_manifest(job_id)
         if not manifest:
             return None

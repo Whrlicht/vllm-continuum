@@ -718,7 +718,8 @@ class RoundKVStore:
 
     def _lookup_lru(self, job_id: str,
                     cur_token_ids: list):
-        """LRU 版 lookup: 直接调 LruArenaStore.lookup."""
+        """LRU 版 lookup: 调 LruArenaStore.lookup (content_addr 下它内部走哈希表
+        lookup_resolve, 不读 manifest token_ids)."""
         return self._lru_store.lookup(str(job_id), cur_token_ids)
 
     def _load_request_arena_lru(self, job_id: str,

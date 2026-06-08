@@ -176,6 +176,33 @@ class TestDedupStore:
         assert freed2 == 1
         assert store._allocator.is_free(slot0)
 
+    def test_content_addr_manifest_no_tokens(self, tmp_path, monkeypatch):
+        """content_addr 下 manifest 不存全量 token_ids (瘦身, 省 O(token) 写),
+        lookup 仍命中 (走哈希表 lookup_resolve), own + cross-job 都覆盖。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=16)
+        toks = list(range(48))                       # 3 block
+        assert store.write_inc("A", 0, 3, toks, [b"a0", b"a1", b"a2"])
+        m = store._read_manifest("A")
+        assert m["total_blocks"] == 3
+        assert m["token_ids"] == []                  # 不再存全量 token
+        # own-job lookup 仍命中 (内部走哈希表)
+        res = store.lookup("A", toks)
+        assert res is not None and res[0] == 3 * BS
+        # cross-job: 新 job 同前缀也命中
+        res2 = store.lookup_resolve(toks)
+        assert res2 is not None and res2[0] == 3 * BS
+
+    def test_content_addr_off_keeps_tokens(self, tmp_path, monkeypatch):
+        """content_addr 关时仍存 token_ids (own-job LCP lookup 依赖它)。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=16,
+                                  content=False)
+        toks = list(range(32))
+        assert store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        m = store._read_manifest("A")
+        assert len(m["token_ids"]) == 32             # 仍存全量
+        res = store.lookup("A", toks)
+        assert res is not None and res[0] == 2 * BS
+
     def test_slot_file_is_v2(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=32)
         store.write_inc("J", 0, 2, list(range(32)), [b"0", b"1"])
