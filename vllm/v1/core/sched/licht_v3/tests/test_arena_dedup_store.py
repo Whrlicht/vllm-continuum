@@ -26,6 +26,8 @@ BS = 16
 
 def _make_store(tmp_path, monkeypatch, num_slots, content=True):
     monkeypatch.setenv("LICHT_ARENA_CONTENT_ADDR", "1" if content else "0")
+    # 关后台 evictor: 单测要确定性 (后台线程会异步淘汰干扰断言). 单独测它.
+    monkeypatch.setenv("LICHT_ARENA_BG_EVICTOR", "0")
     store = LruArenaStore.create(str(tmp_path / "arena"),
                                  num_slots=num_slots, block_size=BS)
     arena = {}          # slot_id -> value
@@ -211,6 +213,45 @@ class TestDedupStore:
         # recheck 返回正数 → 正常淘
         freed2 = store._evict_lockfree(1, recheck_fn=lambda: 4)
         assert freed2 == 2
+
+    def test_evict_index_only_skips_file_victim(self, tmp_path, monkeypatch):
+        """Phase 1a: index_only=True 跳过非本进程索引(文件回退)的 victim →
+        后台 evictor 不会淘对方进程的 job (杜绝跨进程 double-decref)。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        store._job_slot_index.pop("A", None)        # 模拟 A 是"对方进程"的 job
+        free_before = store._allocator.free_count
+        freed = store._evict_lockfree(4, index_only=True)   # 跳过 A
+        assert freed == 0
+        assert store._allocator.free_count == free_before
+        freed2 = store._evict_lockfree(1, index_only=False)  # 回退文件淘 A
+        assert freed2 == 2
+
+    def test_bg_evictor_frees(self, tmp_path, monkeypatch):
+        """Phase 1a: 后台 evictor 启动后, free<low 时自动把池淘到 high 附近。"""
+        import time as _t
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=16)
+        store._bg_evictor_on = True                  # fixture 默认关, 这里开
+        store._bg_low = 2
+        store._bg_high = 4
+        store._bg_interval = 0.01
+        for j in range(8):                           # 8 job × 2 块 = 填满 16 槽
+            base = j * 1000                          # 每 job 唯一 token → 唯一内容
+            store.write_inc(f"J{j}", 0, 2,
+                            list(range(base, base + 2 * BS)),
+                            [f"{j}a".encode(), f"{j}b".encode()])
+        store._ensure_bg_evictor()
+        store._signal_bg_evictor()
+        ok = False
+        for _ in range(300):                         # 最多 ~3s 等后台
+            if store._stat_bg_freed > 0:
+                ok = True
+                break
+            _t.sleep(0.01)
+        store._bg_stop = True
+        assert ok and store._stat_bg_freed > 0
 
     def test_evict_gen_revalidation(self, tmp_path, monkeypatch):
         """两阶段 apply 的 gen 复核: 记录 gen 与 slot 当前 gen 不符 (模拟锁外读后被

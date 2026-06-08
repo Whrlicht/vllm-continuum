@@ -204,6 +204,27 @@ class LruArenaStore:
         # 在本进程淘汰, 其余等 (淘汰是后台路径, 串行可接受).
         self._evict_lock = threading.Lock()
 
+        # ★ Phase 1a: 后台 evictor —— 一个后台线程按水位提前补满空闲池, 让 store
+        # 进来时大多直接 alloc 命中、跳过自己的同步淘汰 (淘汰整体移到后台, 不卡 store).
+        # 复用现有 _evict_lockfree (分小 chunk, 每 chunk 短持 _evict_lock, 让 store
+        # preevict 能插队). 为安全只淘【本进程索引内】的 job (index_only, 不走文件回退)
+        # → 杜绝跨进程 double-decref (跨进程淘汰留给 store 兜底 + Phase 1b claim).
+        # store 路径的 preevict 保留作兜底; 后台追不上时 store 仍能自己同步淘 (不丢).
+        self._bg_evictor_on = (
+            os.environ.get("LICHT_ARENA_BG_EVICTOR", "1") == "1")
+        # 水位: 固定保守默认 (131072 槽下 4096/8192 ≈ 3%/6%), 可按写入突发量调.
+        self._bg_low = int(os.environ.get("LICHT_ARENA_BG_LOW", "4096"))
+        self._bg_high = int(os.environ.get("LICHT_ARENA_BG_HIGH", "8192"))
+        self._bg_chunk = int(os.environ.get("LICHT_ARENA_BG_CHUNK", "256"))
+        self._bg_interval = float(
+            os.environ.get("LICHT_ARENA_BG_INTERVAL_S", "0.05"))
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_started = False
+        self._bg_stop = False
+        self._bg_cv = threading.Condition()
+        self._stat_bg_freed = 0
+        self._stat_bg_rounds = 0
+
     # ============================================================
     # Lifecycle
     # ============================================================
@@ -267,6 +288,13 @@ class LruArenaStore:
         return store
 
     def close(self) -> None:
+        # Phase 1a: 停后台 evictor (daemon, 进程退出也会自然结束; 这里干净关闭)
+        self._bg_stop = True
+        if self._bg_started:
+            with self._bg_cv:
+                self._bg_cv.notify_all()
+            if self._bg_thread is not None:
+                self._bg_thread.join(timeout=2.0)
         if self._hdr is not None:
             self._hdr.close()
             self._hdr = None
@@ -442,6 +470,7 @@ class LruArenaStore:
         if self._data_writer is None:
             logger.warning("write_inc: data_writer not bound, skipping")
             return False
+        self._ensure_bg_evictor()   # Phase 1a: 写端惰性启动后台 evictor
 
         # ★ Stage 6: 内容寻址 dedup 路径 (probe hash 表, 命中复用不新分配)
         if self._content_addr:
@@ -607,6 +636,8 @@ class LruArenaStore:
                 # _allocator.free_count (进程内缓存, 看不到另一进程的 alloc → 偏高 →
                 # 预淘汰误跳过 → 淘汰掉回 CS1 锁内慢路径). 锁外读近似即可 (估算).
                 free_est = int(self._allocator.count_free_accurate())
+                if free_est < self._bg_low:
+                    self._signal_bg_evictor()   # 池低于水位, 踢醒后台赶紧补货
                 if est_miss > free_est:
                     # ★ 留余量: 锁外预淘汰多腾一些, 给 "preevict→CS1 之间空 slot 被
                     # 别的线程/进程抢走" 留缓冲, 让 CS1 alloc 几乎必命中, 把锁内
@@ -1157,7 +1188,8 @@ class LruArenaStore:
                         exclude_job_id: Optional[str] = None,
                         deferred: Optional[dict] = None,
                         prof: Optional[dict] = None,
-                        recheck_fn=None) -> int:
+                        recheck_fn=None,
+                        index_only: bool = False) -> int:
         """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 只有每个 inc 的原子
         释放走 _evict_inc_apply_locked 的短 alloc_mutex; 其余全锁外. 进程内用
         _evict_lock 串行 (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
@@ -1195,10 +1227,15 @@ class LruArenaStore:
                     break
                 if exclude_job_id is not None and victim == exclude_job_id:
                     continue
-                _nvictim += 1
                 # inc 列表: 优先内存索引 [(s,e,records)], 缺则回退读 .slot 文件.
                 mem = self._job_slot_index.get(victim)
                 in_index = mem is not None
+                # ★ Phase 1a: 后台 evictor 用 index_only=True 跳过非本进程索引的
+                # victim (那些要读对方进程的 .slot 文件), 避免后台并发淘对方 job →
+                # 杜绝跨进程 double-decref. 这类 victim 交给 store 兜底 + Phase 1b claim.
+                if index_only and not in_index:
+                    continue
+                _nvictim += 1
                 if in_index:
                     inc_list = list(mem)
                     _idx_incs += len(inc_list)
@@ -1270,6 +1307,70 @@ class LruArenaStore:
                 prof['idx_incs'] = _idx_incs
                 prof['file_incs'] = _file_incs
         return gained
+
+    # ============================================================
+    # Phase 1a: 后台 evictor (按水位提前补满空闲池, 把淘汰移出 store 热路径)
+    # ============================================================
+    def _ensure_bg_evictor(self) -> None:
+        """惰性启动后台 evictor 线程 (仅 content_addr + 开关开 + 写端). 幂等."""
+        if (self._bg_started or not self._bg_evictor_on
+                or not self._content_addr):
+            return
+        with self._bg_cv:
+            if self._bg_started:
+                return
+            # 水位封顶在 num_slots 的一定比例, 防小 arena 被全淘 (默认 4096/8192
+            # 在 131072 槽下生效; 小 arena 自动缩到 1/8 与 1/4).
+            try:
+                _ns = int(self._allocator.num_slots)
+            except Exception:
+                _ns = 0
+            if _ns > 0:
+                self._bg_low = min(self._bg_low, max(1, _ns // 8))
+                self._bg_high = min(self._bg_high, max(2, _ns // 4))
+                if self._bg_high <= self._bg_low:
+                    self._bg_high = self._bg_low + 1
+            self._bg_started = True
+            self._bg_thread = threading.Thread(
+                target=self._bg_evictor_loop, name="licht-arena-evictor",
+                daemon=True)
+            self._bg_thread.start()
+            logger.info("round-kv BG-EVICTOR started: low=%d high=%d chunk=%d",
+                        self._bg_low, self._bg_high, self._bg_chunk)
+
+    def _signal_bg_evictor(self) -> None:
+        """踢醒后台 evictor (store preevict 发现池低于水位时调, 让它赶紧补货)."""
+        if self._bg_started:
+            with self._bg_cv:
+                self._bg_cv.notify()
+
+    def _bg_evictor_loop(self) -> None:
+        while not self._bg_stop:
+            try:
+                free = int(self._allocator.count_free_accurate())
+                if free < self._bg_low:
+                    self._stat_bg_rounds += 1
+                    # 分小 chunk 淘到 high; 每 chunk 一次 _evict_lockfree (短持
+                    # _evict_lock, 让 store preevict 能插队). index_only=True: 只淘
+                    # 本进程索引内 job, 不读对方进程 .slot, 不引入跨进程 double-decref.
+                    while not self._bg_stop:
+                        free = int(self._allocator.count_free_accurate())
+                        if free >= self._bg_high:
+                            break
+                        gained = self._evict_lockfree(
+                            min(self._bg_chunk, self._bg_high - free),
+                            exclude_job_id=None, deferred=None,
+                            index_only=True)
+                        self._stat_bg_freed += gained
+                        if gained == 0:
+                            break   # 本进程 job 淘不动了 (都共享/pinned) → 退避
+                # idle 等待 (被 _signal_bg_evictor 唤醒 or 超时巡检)
+                with self._bg_cv:
+                    self._bg_cv.wait(timeout=self._bg_interval)
+            except Exception as e:   # pragma: no cover
+                logger.warning("round-kv BG-EVICTOR error: %s", e)
+                with self._bg_cv:
+                    self._bg_cv.wait(timeout=1.0)
 
     def _evict_until_free_locked(self, need: int,
                                  exclude_job_id: Optional[str] = None,
