@@ -303,6 +303,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._arena_sink_failed: set[str] = set()
         self._arena_sink_deadline_s = float(
             _os.environ.get("LICHT_ARENA_SINK_DEADLINE_S", "30"))
+        # ★ 偏差2 修复: 到 deadline 时若 arena 数据【还在】, 按用户模型继续等 decode
+        # admit (arena 保管, 不重算); 只有数据【被淘没了】或 decode 堵到这个硬上限才
+        # 不得已放弃重算. 防永久挂. (LICHT_ARENA_SINK_ADMIT_CAP_S, 默认 180s)
+        self._arena_sink_admit_cap_s = float(
+            _os.environ.get("LICHT_ARENA_SINK_ADMIT_CAP_S", "180"))
         # Worker-side store-completion is tracked inside RoundKVStore
         # (drain_done) now that the write is async; get_finished reads it.
 
@@ -1130,39 +1135,38 @@ p2p_nccl_engine import get_fast_release_queue
                     ext = matched_tokens - num_computed_tokens
                     if ext > 0:
                         return ext, False
-            # ★ deadline 兜底: arena 还没就绪. 正常 D2H ~数秒就好; 若超过 deadline
-            # 仍 miss, 多半是 RPC 被 declined (bridge 已 RELEASE/竞态), arena 永远
-            # 不会有数据. 放弃 arena → 标 failed (防再 sink) → 退回 NCCL, 避免永久
-            # defer 挂到 600s 超时. 未超时则继续 defer 等 D2H.
+            # ★ 偏差2 修复 (按用户模型: arena 保管到 admit, 不重算).
+            # 到 deadline 时不再盲目放弃重算, 而是先查 arena 数据【还在不在】:
+            #   - 还在 (matched≈expected) → arena 保管着, 继续等 decode admit, 不重算
+            #     (只有等到硬上限 admit_cap, decode 真堵死, 才不得已放弃);
+            #   - 没了 (被淘) → 数据真没了, 重算不可避免; 打 EVICTED 日志 → 这正好
+            #     验证"我的后台 evictor 有没有误删 sink 数据".
             _t0 = self._arena_sink_ts.get(request.request_id)
             if _t0 is not None and (time.time() - _t0) > \
                     self._arena_sink_deadline_s:
-                self._arena_sinked.discard(request.request_id)
-                self._arena_sink_ts.pop(request.request_id, None)
-                self._arena_sink_failed.add(request.request_id)
-                # ★ P5 探针: 放弃前查一下 arena 里这个请求的前缀【还剩几块】.
-                #   matched 远小于 expected → 数据被淘了 (淘汰的锅, 可能我的后台
-                #   evictor 加剧); matched≈expected → 数据还在, 是 decode 太堵
-                #   admit 不进 (decode 瓶颈). 一锤定音区分 P5 vs 瓶颈.
+                _eblk = max(1, len(request.prompt_token_ids)
+                            // self._block_size)
+                _mblk = 0
                 try:
                     _dbg = self._round_store_obj.lookup_resolve(
                         str(job_id), request.prompt_token_ids)
                     _mblk = int(_dbg[1]) if _dbg else 0
-                    _eblk = len(request.prompt_token_ids) // self._block_size
-                    _verdict = ("EVICTED-数据被淘"
-                                if _mblk < max(1, _eblk) * 0.5
-                                else "PRESENT-数据在但admit不进(decode堵)")
-                    logger.warning(
-                        "ARENA-SINK-PROBE req=%s give-up: arena剩 %d/%d 块 "
-                        "num_computed=%d → %s",
-                        request.request_id, _mblk, _eblk,
-                        num_computed_tokens, _verdict)
-                except Exception as _e:  # pragma: no cover
-                    logger.warning("ARENA-SINK-PROBE failed: %s", _e)
+                except Exception:  # pragma: no cover
+                    pass
+                _present = _mblk >= _eblk * 0.5
+                _waited = time.time() - _t0
+                if _present and _waited < self._arena_sink_admit_cap_s:
+                    # 数据还在 arena → 按用户模型继续等 admit, 不重算
+                    return None, False
+                # 数据被淘 / decode 堵到硬上限 → 不得已放弃
+                self._arena_sinked.discard(request.request_id)
+                self._arena_sink_ts.pop(request.request_id, None)
+                self._arena_sink_failed.add(request.request_id)
                 logger.warning(
-                    "Phase2 arena-sink req=%s 超 %.0fs 未就绪 (RPC 多半被 declined)"
-                    " -> 放弃 arena, 退回 NCCL",
-                    request.request_id, self._arena_sink_deadline_s)
+                    "Phase2 arena-sink req=%s 放弃: arena剩 %d/%d 块 等了%.0fs "
+                    "→ %s", request.request_id, _mblk, _eblk, _waited,
+                    "EVICTED-数据被淘(淘汰的锅,验证我的evictor)" if not _present
+                    else "decode堵到硬上限admit不进")
                 return 0, False
             return None, False
 
