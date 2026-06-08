@@ -216,6 +216,11 @@ class LruArenaStore:
         self._bg_low = int(os.environ.get("LICHT_ARENA_BG_LOW", "4096"))
         self._bg_high = int(os.environ.get("LICHT_ARENA_BG_HIGH", "8192"))
         self._bg_chunk = int(os.environ.get("LICHT_ARENA_BG_CHUNK", "256"))
+        # ★ Phase 0.2: 单次同步淘汰时间预算 (ms). store 路径的 preevict/兜底淘汰封顶
+        # 这么久; 腾不够 → write_inc 返 False → 走现有"不推进进度,下轮重试"(零丢失,
+        # 非 bypass; 后台 evictor 会持续补货, 重试终将命中). 0=不限(回退旧无界行为).
+        self._store_evict_budget_ms = float(
+            os.environ.get("LICHT_ARENA_STORE_EVICT_BUDGET_MS", "50"))
         self._bg_interval = float(
             os.environ.get("LICHT_ARENA_BG_INTERVAL_S", "0.05"))
         self._bg_thread: Optional[threading.Thread] = None
@@ -663,11 +668,14 @@ class LruArenaStore:
                         return max(0, _m - int(
                             self._allocator.count_free_accurate()))
 
+                    _bud = (self._store_evict_budget_ms
+                            if self._store_evict_budget_ms > 0 else None)
                     self._evict_lockfree(_need + _margin,
                                          exclude_job_id=job_id,
                                          deferred=evict_deferred,
                                          prof=(_pp if _prof else None),
-                                         recheck_fn=_recheck_need)
+                                         recheck_fn=_recheck_need,
+                                         budget_ms=_bud)
         except Exception as _e:  # pragma: no cover
             logger.debug("pre-evict (lockfree) skipped: %s", _e)
         if _prof:
@@ -707,9 +715,13 @@ class LruArenaStore:
                 if slot_ids is None:
                     accurate_free = self._allocator.count_free_accurate()
                     need = n_miss - accurate_free
+                    _bud2 = (self._store_evict_budget_ms
+                             if self._store_evict_budget_ms > 0 else None)
                     if not self._evict_until_free_locked(
                             need, exclude_job_id=job_id,
-                            deferred=evict_deferred):
+                            deferred=evict_deferred, budget_ms=_bud2):
+                        # Phase 0.2: 锁内淘汰超预算/腾不够 → 返 False, 走 _do_store
+                        # "不推进进度,下轮重试"(零丢失; 后台 evictor 会补货, 重试命中).
                         for s in hit_inced:
                             _atomic.refcnt_dec(self._hdr.slot_refcnt_addr(s))
                         return False
@@ -810,13 +822,15 @@ class LruArenaStore:
             _nm = len(miss_pub)
             logger.info(
                 "WRITE-PROF job=%s nblk=%d miss=%d | preevict=%.0f"
-                "(lw=%.0f work=%.0f vic=%d idx=%d file=%d abort=%d) hash=%.0f "
+                "(lw=%.0f work=%.0f vic=%d idx=%d file=%d abort=%d lto=%d bud=%d) "
+                "hash=%.0f "
                 "lockwait=%.0f cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f "
                 "man=%.0f", str(job_id)[:24], n_blocks, _nm,
                 _seg.get('preevict', 0),
                 _pp.get('lockwait', 0), _pp.get('work', 0),
                 _pp.get('victims', 0), _pp.get('idx_incs', 0),
                 _pp.get('file_incs', 0), _pp.get('recheck_abort', 0),
+                _pp.get('lock_timeout', 0), _pp.get('budget_hit', 0),
                 _seg.get('hash', 0),
                 _seg.get('cs1_lockwait', 0), _seg.get('cs1_work', 0),
                 _seg.get('data', 0),
@@ -1189,7 +1203,8 @@ class LruArenaStore:
                         deferred: Optional[dict] = None,
                         prof: Optional[dict] = None,
                         recheck_fn=None,
-                        index_only: bool = False) -> int:
+                        index_only: bool = False,
+                        budget_ms: Optional[float] = None) -> int:
         """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 只有每个 inc 的原子
         释放走 _evict_inc_apply_locked 的短 alloc_mutex; 其余全锁外. 进程内用
         _evict_lock 串行 (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
@@ -1212,12 +1227,29 @@ class LruArenaStore:
         _idx_incs = 0
         _file_incs = 0
         _nvictim = 0
-        with self._evict_lock:
+        # ★ Phase 0.2: 拿 _evict_lock 带超时 (budget_ms 设了才超时; 后台 evictor
+        # budget_ms=None 走阻塞). 拿不到=有人在淘 → 不排队, 直接返回让 store 兜底/重试,
+        # 干掉 lw=86s 那种集体排队等锁.
+        _lock_timeout = (budget_ms / 1000.0) if budget_ms is not None else -1
+        if not self._evict_lock.acquire(timeout=_lock_timeout):
+            if prof is not None:
+                prof['lockwait'] = (time.time() - _t_lw) * 1000.0
+                prof['lock_timeout'] = 1
+            return 0
+        try:
             if prof is not None:
                 prof['lockwait'] = (time.time() - _t_lw) * 1000.0
             _t_work = time.time()
+            # ★ Phase 0.2: 单次淘汰时间预算 (封顶单条 store 占 _evict_lock 的时长 →
+            # 既限自己耗时, 也限别人 lw). 后台 evictor 不设预算 (它就是慢慢淘的).
+            _deadline = ((time.time() + budget_ms / 1000.0)
+                         if budget_ms is not None else None)
             for victim in list(self._job_lru):
                 if gained >= need:
+                    break
+                if _deadline is not None and time.time() > _deadline:
+                    if prof is not None:
+                        prof['budget_hit'] = 1
                     break
                 # ★ Phase 0.1: 实时重核实际需求. 并发 store 把同内容存进去后, 我已
                 # 不缺槽 (或 gained 已够当前真实缺口) → 立即停, 不做无效淘汰.
@@ -1306,6 +1338,8 @@ class LruArenaStore:
                 prof['victims'] = _nvictim
                 prof['idx_incs'] = _idx_incs
                 prof['file_incs'] = _file_incs
+        finally:
+            self._evict_lock.release()
         return gained
 
     # ============================================================
@@ -1374,23 +1408,31 @@ class LruArenaStore:
 
     def _evict_until_free_locked(self, need: int,
                                  exclude_job_id: Optional[str] = None,
-                                 deferred: Optional[dict] = None) -> bool:
+                                 deferred: Optional[dict] = None,
+                                 budget_ms: Optional[float] = None) -> bool:
         """在 alloc_mutex 内调用. 释放至少 need 个 slot.
 
         exclude_job_id: 写新 inc 的 job 自己不应被淘 (避免自淘)
         deferred: 非 None 时把 self-heal (job->min_s) 收集到此, 由调用方锁外批量
                   执行 (把全量 manifest 重写移出临界区). None 则锁内 inline (旧行为).
-        返回: True 成功 / False 失败 (即便挖光 LRU 也不够)
+        budget_ms: Phase 0.2. 非 None 时封顶锁内淘汰时长 (= 封顶 alloc_mutex 持有时长);
+                   超预算还没腾够 → 返回 False (调用方走 write_inc 返 False → 下轮重试,
+                   零丢失). 防一条 store 锁内淘汰几十秒堵死跨进程.
+        返回: True 成功 / False 失败 (即便挖光 LRU / 超预算也不够)
         """
         if need <= 0:
             return True
         gained = 0
+        _dl = ((time.time() + budget_ms / 1000.0)
+               if budget_ms is not None else None)
         # 单遍: 内存 LRU 快照 (最老在前) 逐 victim, O(jobs) (旧版每轮重扫 ~O(jobs²)).
         # 快照 list(): _evict_job_tail_first 可能 _drop_job_lru 改动 _job_lru.
         seen: set[str] = set()
         for victim in list(self._job_lru):
             if gained >= need:
                 break
+            if _dl is not None and time.time() > _dl:
+                return False        # 超预算 → 让 store 返 False 重试 (不丢)
             if exclude_job_id is not None and victim == exclude_job_id:
                 continue
             seen.add(victim)
@@ -1401,6 +1443,8 @@ class LruArenaStore:
         if exclude_job_id is not None:
             attempted.add(exclude_job_id)
         while gained < need:
+            if _dl is not None and time.time() > _dl:
+                return False
             victim = self._pick_lru_victim(exclude=attempted)
             if victim is None:
                 logger.warning("evict_until_free: no victim job found, "

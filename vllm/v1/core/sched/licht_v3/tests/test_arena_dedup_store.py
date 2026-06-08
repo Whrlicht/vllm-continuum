@@ -229,6 +229,25 @@ class TestDedupStore:
         freed2 = store._evict_lockfree(1, index_only=False)  # 回退文件淘 A
         assert freed2 == 2
 
+    def test_evict_lock_timeout(self, tmp_path, monkeypatch):
+        """Phase 0.2: _evict_lock 被占时, 设了 budget_ms 的淘汰超时返回 0 (不排队,
+        干掉 lw=86s 集体等锁); 锁释放后正常淘。budget_ms=None(后台) 仍阻塞。"""
+        import time as _t
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        store._evict_lock.acquire()                  # 占住锁
+        try:
+            t0 = _t.time()
+            freed = store._evict_lockfree(2, budget_ms=20)   # 拿不到 → 超时
+            assert freed == 0
+            assert _t.time() - t0 < 0.5
+        finally:
+            store._evict_lock.release()
+        freed2 = store._evict_lockfree(1, budget_ms=50)      # 锁空了正常淘
+        assert freed2 == 2
+
     def test_bg_evictor_frees(self, tmp_path, monkeypatch):
         """Phase 1a: 后台 evictor 启动后, free<low 时自动把池淘到 high 附近。"""
         import time as _t
