@@ -595,6 +595,7 @@ class LruArenaStore:
         # CS1 的 alloc 直接命中, 不必在长临界区内做淘汰的文件 I/O (那是 2-12s 锁
         # 残留的来源). est_miss 用锁外 ht_probe (lookup 同款无锁读), free 用廉价计数.
         # 估偏了也没关系: CS1 会重新 probe+alloc, 仍不够再走锁内 _evict 兜底 (罕见).
+        _pp: dict = {}   # preevict 分段探针 (lockwait/work/idx_incs/file_incs/victims)
         try:
             est_miss = 0
             for h in inc_hashes:
@@ -617,7 +618,8 @@ class LruArenaStore:
                         _margin = max(_margin, 64)   # 启用时给个固定下限
                     self._evict_lockfree(_need + _margin,
                                          exclude_job_id=job_id,
-                                         deferred=evict_deferred)
+                                         deferred=evict_deferred,
+                                         prof=(_pp if _prof else None))
         except Exception as _e:  # pragma: no cover
             logger.debug("pre-evict (lockfree) skipped: %s", _e)
         if _prof:
@@ -759,10 +761,15 @@ class LruArenaStore:
             _seg['manifest'] = (time.time() - _tp) * 1000.0
             _nm = len(miss_pub)
             logger.info(
-                "WRITE-PROF job=%s nblk=%d miss=%d | preevict=%.0f hash=%.0f "
+                "WRITE-PROF job=%s nblk=%d miss=%d | preevict=%.0f"
+                "(lw=%.0f work=%.0f vic=%d idx=%d file=%d) hash=%.0f "
                 "lockwait=%.0f cs1=%.0f data=%.0f(%.2fms/blk) slot=%.0f cs2=%.0f "
                 "man=%.0f", str(job_id)[:24], n_blocks, _nm,
-                _seg.get('preevict', 0), _seg.get('hash', 0),
+                _seg.get('preevict', 0),
+                _pp.get('lockwait', 0), _pp.get('work', 0),
+                _pp.get('victims', 0), _pp.get('idx_incs', 0),
+                _pp.get('file_incs', 0),
+                _seg.get('hash', 0),
                 _seg.get('cs1_lockwait', 0), _seg.get('cs1_work', 0),
                 _seg.get('data', 0),
                 (_seg.get('data', 0) / _nm) if _nm else 0.0,
@@ -1131,7 +1138,8 @@ class LruArenaStore:
 
     def _evict_lockfree(self, need: int,
                         exclude_job_id: Optional[str] = None,
-                        deferred: Optional[dict] = None) -> int:
+                        deferred: Optional[dict] = None,
+                        prof: Optional[dict] = None) -> int:
         """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 只有每个 inc 的原子
         释放走 _evict_inc_apply_locked 的短 alloc_mutex; 其余全锁外. 进程内用
         _evict_lock 串行 (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
@@ -1139,26 +1147,39 @@ class LruArenaStore:
         方案C: inc 的 (slot,gen,hash) 优先查进程内 _job_slot_index (免读 .slot 文件,
         消掉 preevict 里的文件 I/O); 索引缺失 (跨重启/跨进程 job) 时回退读 .slot.
         正确性: 短锁内逐块复核 (gen/is_free/can_evict/ht_probe) 是权威, 索引只是
-        加速提示 → 过时也安全 (最坏白读已淘 slot, gen 复核挡住)."""
+        加速提示 → 过时也安全 (最坏白读已淘 slot, gen 复核挡住).
+
+        prof: 非 None 时填分段诊断 (lockwait=等_evict_lock ms, work=锁内活 ms,
+        victims/idx_incs/file_incs=走索引 vs 回退读文件的 inc 数). 定位 preevict 尖刺."""
         if need <= 0 or not self._content_addr:
             return 0
         gained = 0
+        _t_lw = time.time()
+        _idx_incs = 0
+        _file_incs = 0
+        _nvictim = 0
         with self._evict_lock:
+            if prof is not None:
+                prof['lockwait'] = (time.time() - _t_lw) * 1000.0
+            _t_work = time.time()
             for victim in list(self._job_lru):
                 if gained >= need:
                     break
                 if exclude_job_id is not None and victim == exclude_job_id:
                     continue
+                _nvictim += 1
                 # inc 列表: 优先内存索引 [(s,e,records)], 缺则回退读 .slot 文件.
                 mem = self._job_slot_index.get(victim)
                 in_index = mem is not None
                 if in_index:
                     inc_list = list(mem)
+                    _idx_incs += len(inc_list)
                 else:
                     inc_list = []
                     for (s, e, p) in self._list_incs(victim):
                         sf = read_slot_file_v2(p)        # 锁外读 (回退路径)
                         inc_list.append((s, e, sf.records if sf else None))
+                    _file_incs += len(inc_list)
                 committed = self._last_stored.get(victim)
                 if committed is None:
                     m = self._read_manifest(victim)
@@ -1215,6 +1236,11 @@ class LruArenaStore:
                         os.rmdir(self._job_dir(victim))
                     except OSError:
                         pass
+            if prof is not None:
+                prof['work'] = (time.time() - _t_work) * 1000.0
+                prof['victims'] = _nvictim
+                prof['idx_incs'] = _idx_incs
+                prof['file_incs'] = _file_incs
         return gained
 
     def _evict_until_free_locked(self, need: int,
