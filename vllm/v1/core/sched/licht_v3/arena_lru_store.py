@@ -597,7 +597,10 @@ class LruArenaStore:
                 if ps < 0:
                     est_miss += 1
             if est_miss > 0:
-                free_est = int(self._allocator.free_count)
+                # ★ 用 count_free_accurate (扫共享 bitmap, 跨进程真实空闲数), 不用
+                # _allocator.free_count (进程内缓存, 看不到另一进程的 alloc → 偏高 →
+                # 预淘汰误跳过 → 淘汰掉回 CS1 锁内慢路径). 锁外读近似即可 (估算).
+                free_est = int(self._allocator.count_free_accurate())
                 if est_miss > free_est:
                     # ★ 留余量: 锁外预淘汰多腾一些, 给 "preevict→CS1 之间空 slot 被
                     # 别的线程/进程抢走" 留缓冲, 让 CS1 alloc 几乎必命中, 把锁内
