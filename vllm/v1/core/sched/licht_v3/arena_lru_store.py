@@ -164,6 +164,11 @@ class LruArenaStore:
         # 本进程 store 过的 job 都在这里; 跨进程对方写的 job 不在 (各 evict 各的,
         # bitmap 共享所以不会重分配, gen 失效保证 lookup 正确性).
         self._job_lru: "OrderedDict[str, None]" = OrderedDict()
+        # ★ 方案C: 进程内 block→slot 索引 job -> [(s, e, [(slot,gen,hash),...])].
+        # store 时同步加, 淘汰直接查 (免读 .slot 文件, 把 preevict 的文件 I/O 消掉).
+        # 只本进程本 session 的 store 在内; 缺失 (跨重启/跨进程 job) 时淘汰回退读文件.
+        # 仅作加速提示, 淘汰锁内逐块 gen 复核才是权威 → 过时也安全.
+        self._job_slot_index: dict = {}
 
         # 数据搬运钩子 (由调用者注入)
         # data_writer(slot_id, block_idx_in_gathered, gathered): 把 gathered[block_idx]
@@ -741,6 +746,12 @@ class LruArenaStore:
         if _prof:
             _seg['cs2'] = (time.time() - _tp) * 1000.0; _tp = time.time()
 
+        # ★ 方案C: 把本 inc 的 (slot,gen,hash) 记进进程内索引, 供淘汰直接查 (免读
+        # .slot 文件). records 的 gen 已是发布值 (上面 CS2 publish 完), 与磁盘 .slot
+        # 一致. 淘汰锁内仍逐块 gen 复核 → 索引过时也安全 (最坏白读已淘 slot).
+        self._job_slot_index.setdefault(job_id, []).append(
+            (start_block, end_block, list(records)))
+
         # ---- 锁外: 重写 manifest ----
         self._write_manifest(
             job_id, end_block, token_ids[:end_block * self._block_size])
@@ -1121,13 +1132,14 @@ class LruArenaStore:
     def _evict_lockfree(self, need: int,
                         exclude_job_id: Optional[str] = None,
                         deferred: Optional[dict] = None) -> int:
-        """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 文件 I/O 全锁外
-        (list_incs / read_slot_file / unlink / self-heal), 只有每个 inc 的原子
-        释放走 _evict_inc_apply_locked 的短 alloc_mutex. 进程内用 _evict_lock 串行
-        (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
+        """★ 锁外两阶段淘汰 (content_addr 专用, 预淘汰用). 只有每个 inc 的原子
+        释放走 _evict_inc_apply_locked 的短 alloc_mutex; 其余全锁外. 进程内用
+        _evict_lock 串行 (防多 store 线程并发改 _job_lru/_last_stored). 返回实际释放数.
 
-        正确性: 短锁内逐块复核 (is_free/can_evict/ht_probe) 与原 _evict_inc_content
-        一致, 跨进程并发淘汰/复用安全 (最坏白读已被淘的 job)."""
+        方案C: inc 的 (slot,gen,hash) 优先查进程内 _job_slot_index (免读 .slot 文件,
+        消掉 preevict 里的文件 I/O); 索引缺失 (跨重启/跨进程 job) 时回退读 .slot.
+        正确性: 短锁内逐块复核 (gen/is_free/can_evict/ht_probe) 是权威, 索引只是
+        加速提示 → 过时也安全 (最坏白读已淘 slot, gen 复核挡住)."""
         if need <= 0 or not self._content_addr:
             return 0
         gained = 0
@@ -1137,25 +1149,32 @@ class LruArenaStore:
                     break
                 if exclude_job_id is not None and victim == exclude_job_id:
                     continue
-                incs = self._list_incs(victim)          # 锁外 listdir
+                # inc 列表: 优先内存索引 [(s,e,records)], 缺则回退读 .slot 文件.
+                mem = self._job_slot_index.get(victim)
+                in_index = mem is not None
+                if in_index:
+                    inc_list = list(mem)
+                else:
+                    inc_list = []
+                    for (s, e, p) in self._list_incs(victim):
+                        sf = read_slot_file_v2(p)        # 锁外读 (回退路径)
+                        inc_list.append((s, e, sf.records if sf else None))
                 committed = self._last_stored.get(victim)
                 if committed is None:
                     m = self._read_manifest(victim)
                     committed = int(m.get("total_blocks", 0)) if m else 0
-                for (s, e, path) in reversed(incs):
-                    if gained >= need:
-                        break
-                    if e > committed:
+                evicted_keys: List[Tuple[int, int]] = []   # 已淘的 (s,e), 末尾从索引剔
+                for (s, e, records) in reversed(inc_list):   # tail-first
+                    if gained >= need or e > committed:
                         continue
-                    sf = read_slot_file_v2(path)        # 锁外读
-                    if sf is None:
+                    if records is None:                      # 损坏 .slot
                         try:
-                            os.unlink(path)
+                            os.unlink(self._slot_path(victim, s, e))
                         except OSError:
                             pass
                         continue
                     freed, left_pinned = self._evict_inc_apply_locked(
-                        sf.records)                     # 短锁原子释放
+                        records)                            # 短锁原子释放
                     gained += freed
                     if left_pinned == 0:
                         cur_last = self._last_stored.get(victim, e)
@@ -1168,10 +1187,24 @@ class LruArenaStore:
                             else:
                                 self._rewrite_manifest_for_self_heal(victim, s)
                         try:
-                            os.unlink(path)             # 锁外 unlink
+                            os.unlink(self._slot_path(victim, s, e))
                         except OSError:
                             pass
-                # victim 淘空 -> 锁外清理 (内存 + 文件)
+                        evicted_keys.append((s, e))
+                    # left_pinned>0: 还有 pinned, 不剔 (留在索引)
+                # 从【当前】索引列表剔除已淘的 inc (re-read + merge, 不整体覆盖 →
+                # 保留并发 store 线程刚 append 的新 inc, 避免 RMW 竞态丢条目).
+                if in_index and evicted_keys:
+                    ek = set(evicted_keys)
+                    cur = self._job_slot_index.get(victim)
+                    if cur is not None:
+                        remaining = [inc for inc in cur
+                                     if (inc[0], inc[1]) not in ek]
+                        if remaining:
+                            self._job_slot_index[victim] = remaining
+                        else:
+                            self._job_slot_index.pop(victim, None)
+                # victim 淘空 (.slot 文件全没了) -> 清理 (内存 + 文件)
                 if not self._list_incs(victim):
                     self._drop_job_lru(victim)
                     self._last_stored.pop(victim, None)
@@ -1261,6 +1294,7 @@ class LruArenaStore:
 
     def _drop_job_lru(self, job_id: str) -> None:
         self._job_lru.pop(job_id, None)
+        self._job_slot_index.pop(job_id, None)   # 方案C: 同步清索引
 
     def _evict_job_tail_first(self, job_id: str,
                               max_need: int,

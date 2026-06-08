@@ -158,6 +158,44 @@ class TestDedupStore:
         r = store.lookup("A", toks_a)                  # 前 2 块仍可查
         assert r is not None and r[0] == 2 * BS
 
+    def test_slot_index_populated(self, tmp_path, monkeypatch):
+        """方案C: store 后进程内 _job_slot_index 有正确 (s,e,records) 条目。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        assert store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        assert store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        idx = store._job_slot_index["A"]
+        assert len(idx) == 2
+        assert (idx[0][0], idx[0][1]) == (0, 2)
+        assert (idx[1][0], idx[1][1]) == (2, 4)
+        slot, gen, h = idx[0][2][0]                  # records = (slot,gen,hash)
+        assert slot == _slot_of(store, toks, 0)
+
+    def test_evict_via_index_updates_index(self, tmp_path, monkeypatch):
+        """方案C: 走索引淘汰尾 inc 后, 索引剔除该 inc (不读 .slot 文件)。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        assert len(store._job_slot_index["A"]) == 2
+        freed = store._evict_lockfree(1)             # 淘尾 inc [2,4)
+        assert freed == 2
+        assert len(store._job_slot_index["A"]) == 1  # 尾 inc 从索引剔除
+        assert store._job_slot_index["A"][0][1] == 2
+
+    def test_evict_fallback_no_index(self, tmp_path, monkeypatch):
+        """方案C: 内存索引缺失 (模拟跨重启/跨进程) → 回退读 .slot 文件仍能淘。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toks = list(range(64))
+        store.write_inc("A", 0, 2, toks, [b"a0", b"a1"])
+        store.write_inc("A", 2, 4, toks, [b"a2", b"a3"])
+        store._job_slot_index.clear()                # 内存索引没了
+        free_before = store._allocator.free_count
+        freed = store._evict_lockfree(1)             # 回退文件路径
+        assert freed == 2
+        assert store._allocator.free_count == free_before + 2
+        assert store._read_manifest("A")["total_blocks"] == 2
+
     def test_evict_gen_revalidation(self, tmp_path, monkeypatch):
         """两阶段 apply 的 gen 复核: 记录 gen 与 slot 当前 gen 不符 (模拟锁外读后被
         别进程 free/复用), 则跳过 — 不误减引用、不 free。gen 对则正常淘。"""
