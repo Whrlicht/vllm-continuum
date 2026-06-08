@@ -127,6 +127,8 @@ class TestDedupStore:
     def test_evict_deferred_self_heal(self, tmp_path, monkeypatch):
         """write_inc 内部淘汰走 deferred self-heal (锁外批量重写 manifest):
         淘汰 victim 尾 inc 后, 其 manifest total_blocks 正确回退, 新 job 存入."""
+        # 关预淘汰余量, 测精确尾淘 (余量是独立优化, 否则小 arena 会多淘)
+        monkeypatch.setenv("LICHT_ARENA_PREEVICT_MARGIN", "0")
         store, arena, _ = _make_store(tmp_path, monkeypatch, num_slots=4)
         toks_a = list(range(64))                      # A: 4 block, 两个 inc
         assert store.write_inc("A", 0, 2, toks_a, [b"a0", b"a1"])

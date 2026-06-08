@@ -184,6 +184,10 @@ class LruArenaStore:
         # 临时探针: dedup write_inc 分段计时 (hash/cs1/data/slot/cs2). 默认关.
         self._write_profile = (
             os.environ.get("LICHT_ROUND_KV_WRITE_PROFILE", "0") == "1")
+        # 锁外预淘汰留余量比例: 多腾 need*margin (下限 64) 个 slot, 减少 CS1 锁内
+        # fallback 淘汰触发 (残留 lockwait 来源). 默认 0.5.
+        self._preevict_margin = float(
+            os.environ.get("LICHT_ARENA_PREEVICT_MARGIN", "0.5"))
         # 埋点计数 (LICHT_ARENA_DEBUG): dedup 命中 / 新分配 block 数,
         # evict 真释放 (refcnt->0) vs 仅减引用 (refcnt>0 数据留给别 job)
         self._stat_hit_blocks = 0
@@ -595,7 +599,15 @@ class LruArenaStore:
             if est_miss > 0:
                 free_est = int(self._allocator.free_count)
                 if est_miss > free_est:
-                    self._evict_lockfree(est_miss - free_est,
+                    # ★ 留余量: 锁外预淘汰多腾一些, 给 "preevict→CS1 之间空 slot 被
+                    # 别的线程/进程抢走" 留缓冲, 让 CS1 alloc 几乎必命中, 把锁内
+                    # fallback 淘汰 (残留 2s lockwait 的来源) 压到极少触发. 余量 =
+                    # 缺口的一定比例 + 固定下限 (LICHT_ARENA_PREEVICT_MARGIN, 默认 0.5).
+                    _need = est_miss - free_est
+                    _margin = int(_need * self._preevict_margin)
+                    if self._preevict_margin > 0:
+                        _margin = max(_margin, 64)   # 启用时给个固定下限
+                    self._evict_lockfree(_need + _margin,
                                          exclude_job_id=job_id,
                                          deferred=evict_deferred)
         except Exception as _e:  # pragma: no cover
