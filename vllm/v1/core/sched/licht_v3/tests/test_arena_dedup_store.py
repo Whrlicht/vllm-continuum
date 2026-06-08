@@ -229,6 +229,21 @@ class TestDedupStore:
         freed2 = store._evict_lockfree(1, index_only=False)  # 回退文件淘 A
         assert freed2 == 2
 
+    def test_job_claim_flock_exclusive(self, tmp_path, monkeypatch):
+        """Phase 1b: job claim 用独立 fd 的 flock → 互斥 (同进程不同 fd 也互斥,
+        即跨进程/跨线程保证'同一 job 同时只一个淘汰者' → 防 double refcnt--)。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        store.write_inc("A", 0, 2, list(range(2 * BS)), [b"a0", b"a1"])
+        fd1 = store._claim_job("A")
+        assert fd1 is not None
+        fd2 = store._claim_job("A")          # 另一独立 fd → 抢不到
+        assert fd2 is None
+        store._release_claim(fd1)
+        fd3 = store._claim_job("A")          # 释放后可再抢
+        assert fd3 is not None
+        store._release_claim(fd3)
+        assert store._claim_job("NOPE") is None   # 不存在的 job → None
+
     def test_evict_lock_timeout(self, tmp_path, monkeypatch):
         """Phase 0.2: _evict_lock 被占时, 设了 budget_ms 的淘汰超时返回 0 (不排队,
         干掉 lw=86s 集体等锁); 锁释放后正常淘。budget_ms=None(后台) 仍阻塞。"""

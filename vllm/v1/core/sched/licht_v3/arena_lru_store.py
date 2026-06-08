@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import logging
 import os
 import struct
@@ -1198,6 +1199,42 @@ class LruArenaStore:
         self._stat_evict_freed += freed
         return freed, left_pinned
 
+    # ============================================================
+    # Phase 1b: job 级 claim (flock, 跨进程+跨线程互斥, 零格式变更)
+    # ============================================================
+    def _claim_job(self, job_id: str):
+        """对 job 目录 flock(LOCK_EX|LOCK_NB). 成功返 fd (调用方淘完 _release_claim),
+        失败 (别人正在淘这个 job / 目录不存在) 返 None → 调用方跳过.
+
+        独立 open 的 fd → flock 即便同进程不同线程/路径也互斥. 这保证【全局每个 job
+        同时只有一个淘汰者】→ 每份 refcnt 恰好减一次, 修跨进程 double refcnt-- (gen
+        拦不住的那个). LOCK_NB: 拿不到不等 (防与 alloc_mutex 锁序倒置死锁)."""
+        try:
+            fd = os.open(self._job_dir(job_id), os.O_RDONLY)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None
+
+    def _release_claim(self, fd) -> None:
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def _evict_lockfree(self, need: int,
                         exclude_job_id: Optional[str] = None,
                         deferred: Optional[dict] = None,
@@ -1227,6 +1264,8 @@ class LruArenaStore:
         _idx_incs = 0
         _file_incs = 0
         _nvictim = 0
+        _held = None   # Phase 1b: 当前持有的 job claim fd (每 victim 处理完即释放;
+        #                finally 兜底防异常泄漏). 同时只持 1 个, 不堆积 fd.
         # ★ Phase 0.2: 拿 _evict_lock 带超时 (budget_ms 设了才超时; 后台 evictor
         # budget_ms=None 走阻塞). 拿不到=有人在淘 → 不排队, 直接返回让 store 兜底/重试,
         # 干掉 lw=86s 那种集体排队等锁.
@@ -1267,6 +1306,12 @@ class LruArenaStore:
                 # 杜绝跨进程 double-decref. 这类 victim 交给 store 兜底 + Phase 1b claim.
                 if index_only and not in_index:
                     continue
+                # ★ Phase 1b: 抢 job claim. 抢不到 = 别的进程/线程正在淘它 → 跳过,
+                # 防同一 job 被并发淘汰造成 double refcnt--. 持有到本次淘汰结束统一释放.
+                _cfd = self._claim_job(victim)
+                if _cfd is None:
+                    continue
+                _held = _cfd
                 _nvictim += 1
                 if in_index:
                     inc_list = list(mem)
@@ -1333,12 +1378,16 @@ class LruArenaStore:
                         os.rmdir(self._job_dir(victim))
                     except OSError:
                         pass
+                # ★ Phase 1b: 本 victim 处理完即释放 claim (同时只持 1 个 fd, 不堆积)
+                self._release_claim(_held)
+                _held = None
             if prof is not None:
                 prof['work'] = (time.time() - _t_work) * 1000.0
                 prof['victims'] = _nvictim
                 prof['idx_incs'] = _idx_incs
                 prof['file_incs'] = _file_incs
         finally:
+            self._release_claim(_held)    # Phase 1b: 兜底释放残留 claim (异常时)
             self._evict_lock.release()
         return gained
 
@@ -1508,61 +1557,67 @@ class LruArenaStore:
         边界", 只 evict end <= committed 的 inc, 跳过未提交的 inc, 避免淘到正在
         写的 slot.
         """
-        incs = self._list_incs(job_id)
-        if not incs:
+        # ★ Phase 1b: 抢 job claim (锁内兜底路径也要, 这正是跨进程 file fallback
+        # double-decref 的高发处). 抢不到 = 别人在淘 → 跳过 (返 0, 调用方挑下一个).
+        # LOCK_NB 不阻塞 → 与背景 evictor 的 flock→alloc_mutex 无锁序倒置死锁.
+        _cfd = self._claim_job(job_id)
+        if _cfd is None:
             return 0
-        # 已提交边界: 本进程自己 store 的 job 用内存 _last_stored (O(1), 即 manifest
-        # total_blocks 的内存镜像, 二者由 write_inc/self-heal 同步更新), 避免在锁内
-        # _read_manifest 把全量 token_ids 也 parse 一遍 (O(token), ×victim = 淘汰慢源).
-        # 跨进程他人 job (内存无) 才回退读 manifest (罕见, 走文件系统 victim 那路).
-        committed = self._last_stored.get(job_id)
-        if committed is None:
-            manifest = self._read_manifest(job_id)
-            committed = int(manifest.get("total_blocks", 0)) if manifest else 0
-        released = 0
-        # 反向遍历 (tail first)
-        for (s, e, path) in reversed(incs):
-            if released >= max_need:
-                break
-            if e > committed:
-                # 未提交的 inc (正在被 writer 写), 跳过, 不能淘
-                continue
-            if self._content_addr:
-                # ---- ★ content-addr: refcnt--, 到 0 才真销毁 ----
-                released += self._evict_inc_content(job_id, s, e, path,
-                                                    deferred)
-            else:
-                # ---- 原始 plain 路径 (非 content-addr), 行为不变 ----
-                sf = read_slot_file_v1(path)
-                if sf is None:
-                    # 损坏的 .slot, 直接删
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        try:
+            incs = self._list_incs(job_id)
+            if not incs:
+                return 0
+            # 已提交边界: 本进程 store 的 job 用内存 _last_stored (O(1), manifest
+            # total_blocks 的内存镜像); 跨进程他人 job 才回退读 manifest (罕见).
+            committed = self._last_stored.get(job_id)
+            if committed is None:
+                manifest = self._read_manifest(job_id)
+                committed = (int(manifest.get("total_blocks", 0))
+                             if manifest else 0)
+            released = 0
+            # 反向遍历 (tail first)
+            for (s, e, path) in reversed(incs):
+                if released >= max_need:
+                    break
+                if e > committed:
+                    # 未提交的 inc (正在被 writer 写), 跳过, 不能淘
                     continue
-                slots_freed_here: List[int] = []
-                slots_left_pinned: List[int] = []
-                for (slot_id, _gen) in sf.records:
-                    # 已经 free 的 slot 跳过 (防止跨进程/stale LRU 重复 free 把
-                    # free_count 加错: 对方进程可能已 evict 过这个 job 的 slot).
-                    if self._allocator.is_free(slot_id):
+                if self._content_addr:
+                    # ---- ★ content-addr: refcnt--, 到 0 才真销毁 ----
+                    released += self._evict_inc_content(job_id, s, e, path,
+                                                        deferred)
+                else:
+                    # ---- 原始 plain 路径 (非 content-addr), 行为不变 ----
+                    sf = read_slot_file_v1(path)
+                    if sf is None:
+                        # 损坏的 .slot, 直接删
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
                         continue
-                    addr = self._hdr.slot_state_addr(slot_id)
-                    if _atomic.can_evict(addr):
-                        _atomic.evict_slot(addr)
-                        slots_freed_here.append(slot_id)
-                    else:
-                        slots_left_pinned.append(slot_id)
-                if slots_freed_here:
-                    self._allocator.free_n(slots_freed_here)
-                    released += len(slots_freed_here)
-                    # 同步回退 _last_stored (self-heal)
-                    cur_last = self._last_stored.get(job_id, e)
-                    if s < cur_last:
-                        self._last_stored[job_id] = s
-                        # 同步回退 manifest 的 total_blocks
-                        self._rewrite_manifest_for_self_heal(job_id, s)
+                    slots_freed_here: List[int] = []
+                    slots_left_pinned: List[int] = []
+                    for (slot_id, _gen) in sf.records:
+                        # 已经 free 的 slot 跳过 (防止跨进程/stale LRU 重复 free 把
+                        # free_count 加错: 对方进程可能已 evict 过这个 job 的 slot).
+                        if self._allocator.is_free(slot_id):
+                            continue
+                        addr = self._hdr.slot_state_addr(slot_id)
+                        if _atomic.can_evict(addr):
+                            _atomic.evict_slot(addr)
+                            slots_freed_here.append(slot_id)
+                        else:
+                            slots_left_pinned.append(slot_id)
+                    if slots_freed_here:
+                        self._allocator.free_n(slots_freed_here)
+                        released += len(slots_freed_here)
+                        # 同步回退 _last_stored (self-heal)
+                        cur_last = self._last_stored.get(job_id, e)
+                        if s < cur_last:
+                            self._last_stored[job_id] = s
+                            # 同步回退 manifest 的 total_blocks
+                            self._rewrite_manifest_for_self_heal(job_id, s)
                     # 如果 inc 内还有 pinned slot, 不删 .slot 文件
                     # (next lookup 校验 gen 时自然发现 gap)
                     if not slots_left_pinned:
@@ -1570,26 +1625,26 @@ class LruArenaStore:
                             os.unlink(path)
                         except OSError:
                             pass
-        # 如果该 job 已被淘空 (没有 .slot 文件了), 从内存 LRU + 文件系统清理.
-        # 关键: 无条件检查 (即使 released==0). 跨进程场景下对方可能已把这个
-        # job evict 空了, 本进程 _job_lru 仍有它 (空壳). 选到空壳时 released=0,
-        # 但仍必须清理, 否则空壳永远留在 _job_lru 最前 (最老), 每次 evict 又
-        # 选到它 -> _list_incs/_read_manifest 文件 IO 空转 -> O(空壳) 性能退化.
-        if not self._list_incs(job_id):
-            self._drop_job_lru(job_id)
-            self._last_stored.pop(job_id, None)
-            try:
-                mp = self._manifest_path(job_id)
-                if os.path.exists(mp):
-                    os.unlink(mp)
-                os.rmdir(self._job_dir(job_id))
-            except OSError:
-                pass
-        if self._debug and released > 0:
-            logger.info("LRU-DBG evict victim=%s freed=%d acc_free=%d",
-                        str(job_id)[:32], released,
-                        self._allocator.count_free_accurate())
-        return released
+            # 如果该 job 已被淘空 (没有 .slot 文件了), 从内存 LRU + 文件系统清理.
+            # 无条件检查 (即使 released==0): 跨进程对方可能已把它 evict 空, 本进程
+            # _job_lru 仍有空壳; 不清理则空壳永远在 LRU 最前, 每次 evict 又选到它.
+            if not self._list_incs(job_id):
+                self._drop_job_lru(job_id)
+                self._last_stored.pop(job_id, None)
+                try:
+                    mp = self._manifest_path(job_id)
+                    if os.path.exists(mp):
+                        os.unlink(mp)
+                    os.rmdir(self._job_dir(job_id))
+                except OSError:
+                    pass
+            if self._debug and released > 0:
+                logger.info("LRU-DBG evict victim=%s freed=%d acc_free=%d",
+                            str(job_id)[:32], released,
+                            self._allocator.count_free_accurate())
+            return released
+        finally:
+            self._release_claim(_cfd)
 
     def _evict_inc_content(self, job_id: str, s: int, e: int,
                            path: str, deferred: Optional[dict] = None) -> int:
