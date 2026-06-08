@@ -1069,6 +1069,12 @@ class LruArenaStore:
                 if not _atomic.can_evict(addr):
                     left_pinned += 1
                     continue
+                # ★ gen 复核 (两阶段安全命门): records 是锁外读的, 读→此处之间
+                # 另一进程可能把该 slot free 又重分配 (即便同 hash). 若 slot 当前
+                # gen != 记录的 gen, 说明它已不是我们当初存的那一份 → 跳过, 别误减
+                # 别人/in-flight 的引用. (锁内读的旧 fallback 无此窗口故不需要.)
+                if _atomic.get_gen(addr) != _gen:
+                    continue
                 ps, _g = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
                 if ps != slot_id:
                     continue

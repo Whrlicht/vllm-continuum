@@ -156,6 +156,26 @@ class TestDedupStore:
         r = store.lookup("A", toks_a)                  # 前 2 块仍可查
         assert r is not None and r[0] == 2 * BS
 
+    def test_evict_gen_revalidation(self, tmp_path, monkeypatch):
+        """两阶段 apply 的 gen 复核: 记录 gen 与 slot 当前 gen 不符 (模拟锁外读后被
+        别进程 free/复用), 则跳过 — 不误减引用、不 free。gen 对则正常淘。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=16)
+        toks = list(range(48))
+        assert store.write_inc("A", 0, 3, toks, [b"a0", b"a1", b"a2"])
+        slot0 = _slot_of(store, toks, 0)
+        h0 = block_hashes(toks, BS, 1)[0]
+        cur_gen = A.get_gen(store._hdr.slot_state_addr(slot0))
+        rc0 = _refcnt(store, slot0)
+        # 错 gen → 复核跳过
+        freed, _ = store._evict_inc_apply_locked([(slot0, cur_gen + 999, h0)])
+        assert freed == 0
+        assert _refcnt(store, slot0) == rc0
+        assert not store._allocator.is_free(slot0)
+        # 对 gen → 正常 free
+        freed2, _ = store._evict_inc_apply_locked([(slot0, cur_gen, h0)])
+        assert freed2 == 1
+        assert store._allocator.is_free(slot0)
+
     def test_slot_file_is_v2(self, tmp_path, monkeypatch):
         store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=32)
         store.write_inc("J", 0, 2, list(range(32)), [b"0", b"1"])
