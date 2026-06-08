@@ -1140,6 +1140,25 @@ p2p_nccl_engine import get_fast_release_queue
                 self._arena_sinked.discard(request.request_id)
                 self._arena_sink_ts.pop(request.request_id, None)
                 self._arena_sink_failed.add(request.request_id)
+                # ★ P5 探针: 放弃前查一下 arena 里这个请求的前缀【还剩几块】.
+                #   matched 远小于 expected → 数据被淘了 (淘汰的锅, 可能我的后台
+                #   evictor 加剧); matched≈expected → 数据还在, 是 decode 太堵
+                #   admit 不进 (decode 瓶颈). 一锤定音区分 P5 vs 瓶颈.
+                try:
+                    _dbg = self._round_store_obj.lookup_resolve(
+                        str(job_id), request.prompt_token_ids)
+                    _mblk = int(_dbg[1]) if _dbg else 0
+                    _eblk = len(request.prompt_token_ids) // self._block_size
+                    _verdict = ("EVICTED-数据被淘"
+                                if _mblk < max(1, _eblk) * 0.5
+                                else "PRESENT-数据在但admit不进(decode堵)")
+                    logger.warning(
+                        "ARENA-SINK-PROBE req=%s give-up: arena剩 %d/%d 块 "
+                        "num_computed=%d → %s",
+                        request.request_id, _mblk, _eblk,
+                        num_computed_tokens, _verdict)
+                except Exception as _e:  # pragma: no cover
+                    logger.warning("ARENA-SINK-PROBE failed: %s", _e)
                 logger.warning(
                     "Phase2 arena-sink req=%s 超 %.0fs 未就绪 (RPC 多半被 declined)"
                     " -> 放弃 arena, 退回 NCCL",
