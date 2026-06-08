@@ -1772,6 +1772,11 @@ class RoundKVStore:
         block-aligned prefix of `cur_token_ids` covered by the stored
         increments of `job_id`, else None.  Cheap: reads only the
         manifest JSON, not the KV blobs."""
+        # ★ scheduler 侧 lazy 开只读表 (同 lookup_resolve), 否则 _lru_store=None 会
+        # 落到读 manifest token_ids 的 fallback —— content_addr 下 token_ids 已不存
+        # (空) → 永远 None → ARENA_SINK/recovery admit 全 miss → 退回 NCCL (回归).
+        # ensure 后走 _lookup_lru → lru_store.lookup → content_addr 时哈希表 resolve.
+        self._ensure_lookup_store()
         # Stage 2 LRU dispatch
         if self._lru_store is not None:
             return self._lookup_lru(job_id, cur_token_ids)
