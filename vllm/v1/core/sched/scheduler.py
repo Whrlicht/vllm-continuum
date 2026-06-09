@@ -1419,25 +1419,24 @@ class Scheduler(SchedulerInterface):
         # the can_admit probes below; read by _v3_publish_step_event).
         self._v3_waiting_hit.clear()
 
+        # ★ 修1 (stale usage): 每步都 publish (usage, total_blocks) —— 含【有 preempt
+        # 的步】. 原来卡在 `if not preempted_reqs` 内, 抢占步不更新 → connector 的
+        # path-selector 用【旧的高 usage】→ 过度 sink (decode 其实有空间却把请求 sink
+        # 进 arena → 被淘 → 重算). 抢占恰好释放了块 → 这里读到的是 post-preempt 的
+        # 真实(更低)usage, 下一步 waiting 循环就用得上. No-op if 无 connector/门控关.
+        if self.connector is not None:
+            try:
+                self.connector.set_admission_kv_usage(
+                    self.kv_cache_manager.usage,
+                    self.kv_cache_manager.block_pool.num_gpu_blocks)
+            except AttributeError:
+                # Older connector implementations lack the method; skip.
+                pass
+
         # Next, schedule the WAITING requests.
         # TODO (Hanchen) need to add scheduling logic for returns from functions. It should not be FCFS
         if not preempted_reqs:
             self._ensure_licht_waiting_start_timestamps()
-            # Phase 2: publish (usage, total_blocks) so the connector's
-            # path-selector can project post-admit occupancy without an
-            # extra cross-module dep.  Sampled once per pass — the
-            # projection in get_num_new_matched_tokens does per-req
-            # incremental math on top.  No-op if the connector or the
-            # gate env is off.
-            if self.connector is not None:
-                try:
-                    self.connector.set_admission_kv_usage(
-                        self.kv_cache_manager.usage,
-                        self.kv_cache_manager.block_pool.num_gpu_blocks)
-                except AttributeError:
-                    # Older connector implementations lack the method;
-                    # silently skip (gate stays at 0.0 = disabled).
-                    pass
             # LICHTV2: timeline was already built before the running
             # loop.  Each successful admit below applies its events to
             # the same timeline so subsequent candidates see the impact
