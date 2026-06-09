@@ -1071,6 +1071,42 @@ p2p_nccl_engine import get_fast_release_queue
         self._rk_lk_cache[rid] = res
         return res
 
+    def mark_arena_sink(self, request) -> bool:
+        """★ 改动1/2: scheduler 在 waiting 循环【80% break】后, 对 break 那个 + 它后面
+        没扫到的【还没 sink 的】请求调这个 → 标记 sink + 排进 _pending_arena_sink
+        (build_connector_meta 会发 RPC 让 prefill 把这个请求的 KV 下沉 arena + 放掉
+        prefill GPU)。已 sink / preempt-saved / 已 pending / producer 的跳过。
+        返回是否【新】标记 (供日志统计)。"""
+        if self.is_producer:
+            return False
+        if not (self._phase2_admission_gate and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            return False
+        rid = request.request_id
+        if (rid in self._arena_sinked or rid in self._preempt_saved
+                or rid in self._pending_arena_sink):
+            return False
+        _remote = None
+        _kvp = getattr(request, "kv_transfer_params", None)
+        if isinstance(_kvp, dict):
+            _remote = _kvp.get("prefill_zmq_address")
+        if _remote is None:
+            try:
+                _ip, _port = self.parse_request_id(
+                    request.request_id, is_prefill=False)
+                _remote = f"{_ip}:{_port}"
+            except Exception:
+                _remote = None
+        _job = getattr(request, "job_id", None) or ""
+        self._pending_arena_sink[rid] = (
+            str(_job), list(request.prompt_token_ids), _remote or "")
+        self._arena_sinked.add(rid)
+        self._arena_sink_ts[rid] = time.time()
+        logger.info(
+            "Phase2 break->sink req=%s job=%s remote=%s ntoks=%d",
+            rid, _job, _remote or "<none>", len(request.prompt_token_ids))
+        return True
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -1136,53 +1172,10 @@ p2p_nccl_engine import get_fast_release_queue
             # 没齐 (这一轮的块还没 sink 完 / 被淘) → defer 等下轮, 永不重算.
             return None, False
 
-        # Phase 2 (PD path selector): first time we see this request
-        # in admission.  Project post-admit occupancy.  > threshold
-        # -> route through arena (mark, fire RPC via meta, defer);
-        # ≤ threshold -> NCCL direct (current behaviour).
-        if (self._phase2_admission_gate
-                and request.request_id not in self._preempt_saved
-                and request.request_id not in self._arena_sink_failed
-                and self._admission_kv_total_blocks > 0):
-            try:
-                _need_tokens = max(
-                    0, len(request.prompt_token_ids) - num_computed_tokens)
-                _need_blocks = (_need_tokens + self._block_size - 1) \
-                    // self._block_size
-                _predicted = (self._admission_kv_usage
-                              + _need_blocks
-                              / float(self._admission_kv_total_blocks))
-            except Exception:
-                _predicted = self._admission_kv_usage
-            if _predicted > self._phase2_gate_threshold:
-                # Route to arena.  Need a remote_prefill_address for
-                # the RPC; fall back to parse_request_id (the existing
-                # convention).
-                _remote = None
-                _kvp = getattr(request, "kv_transfer_params", None)
-                if isinstance(_kvp, dict):
-                    _remote = _kvp.get("prefill_zmq_address")
-                if _remote is None:
-                    try:
-                        _ip, _port = self.parse_request_id(
-                            request.request_id, is_prefill=False)
-                        _remote = f"{_ip}:{_port}"
-                    except Exception:
-                        _remote = None
-                _job = getattr(request, "job_id", None) or ""
-                self._pending_arena_sink[request.request_id] = (
-                    str(_job), list(request.prompt_token_ids),
-                    _remote or "")
-                self._arena_sinked.add(request.request_id)
-                self._arena_sink_ts[request.request_id] = time.time()
-                logger.info(
-                    "Phase2 sink->arena req=%s usage=%.3f pred=%.3f "
-                    "thr=%.2f need_blk=%d remote=%s",
-                    request.request_id, self._admission_kv_usage,
-                    _predicted, self._phase2_gate_threshold,
-                    _need_blocks, _remote or "<none>")
-                return None, False
-            # else: fall through to current NCCL path below
+        # ★ 改动1/2: 原来这里有个 "first-time 80% 投影门"(>80% 就标 sink+defer)。
+        # 已挪到 scheduler 的 waiting 循环 (改动2A: 对所有请求投影; 改动1: 第一个超
+        # 80% 就 break, break 后调 mark_arena_sink 把没扫到的请求 sink)。所以这里
+        # 不再做 sink 决策 —— 没 sink 过的请求直接落到下面 NCCL 路 (从 prefill 拉)。
 
         # Phase 1 (save-on-preempt): if this request was preempt-saved on
         # this decode instance, its KV lives in the arena — recover from

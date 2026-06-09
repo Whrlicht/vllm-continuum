@@ -1492,7 +1492,28 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_computed_blocks(
                             request)
 
-                    # NOTE (Hanchen) The logic here is that we will see if the connector can get the tokens. 
+                    # ★ 改动2A: 80% 投影门 —— 对【所有】waiting 请求(含已 sink)。
+                    # 加入它后 usage 会超 80% → break(★改动1:停止往下扫,没扫到的
+                    # 在循环外通知 prefill 下沉 arena)。usage 每次读实时值,累计本步
+                    # 前面已 admit 的影响;need_blk = 这个请求要新占的块(prompt −
+                    # 本地缓存命中)。门控关时(_phase2_admission_gate 假)整段跳过。
+                    if (self.connector is not None and getattr(
+                            self.connector, "_phase2_admission_gate", False)):
+                        _total = (self.kv_cache_manager.block_pool
+                                  .num_gpu_blocks)
+                        if _total > 0:
+                            _need_blk = (
+                                max(0, len(request.prompt_token_ids)
+                                    - num_new_local_computed_tokens)
+                                + self.block_size - 1) // self.block_size
+                            _proj = (self.kv_cache_manager.usage
+                                     + _need_blk / float(_total))
+                            _thr = getattr(self.connector,
+                                           "_phase2_gate_threshold", 0.80)
+                            if _proj > _thr:
+                                break   # ★改动1: 停扫; 没扫到的循环外 sink
+
+                    # NOTE (Hanchen) The logic here is that we will see if the connector can get the tokens.
                     # If it can, we will use them.
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -1871,6 +1892,23 @@ class Scheduler(SchedulerInterface):
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
+
+            # ★ 改动1/2B: 上面 80% break(或 running满/分配失败 break)后, self.waiting
+            # 里剩的是【没扫到】的请求(break 那个 + 它后面的)。把其中【还没 sink 的】
+            # 通知 prefill 下沉 arena(放掉 prefill GPU, 别一直占着)。已 sink 的留着等
+            # 下轮 room。skipped(本步已 defer/跳过的)在另一队列, 不在此 self.waiting。
+            # 在 `if not preempted_reqs` 块内 → 只非 preempt 步执行; 在 skipped 恢复前
+            # 迭代 → 只动没扫到的。
+            # 条件 `self.waiting and token_budget>0`: 只在循环【因 break 停下】(还有
+            # waiting 且 budget 没耗尽)时 sink —— 区分"正常扫完/budget耗尽"(不 sink)。
+            if (self.waiting and token_budget > 0
+                    and self.connector is not None
+                    and hasattr(self.connector, "mark_arena_sink")):
+                for _wreq in self.waiting:
+                    try:
+                        self.connector.mark_arena_sink(_wreq)
+                    except Exception:  # pragma: no cover
+                        pass
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
