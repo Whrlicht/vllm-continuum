@@ -282,6 +282,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             self._phase2_gate_threshold = 0.80
         self._admission_kv_usage: float = 0.0
         self._admission_kv_total_blocks: int = 0
+        # 修3: decode 调度 break 后, 对未扫到的 waiting 请求提前 sink (解偏差1).
+        self._sink_on_break = (
+            _os.environ.get("LICHT_ARENA_SINK_ON_BREAK", "1") == "1")
         # Scheduler-side: req_ids the connector has decided to route
         # through arena this pass — drained by build_connector_meta
         # into meta.arena_sink so the worker can fire the ARENA_SINK
@@ -1078,6 +1081,56 @@ p2p_nccl_engine import get_fast_release_queue
         self._sched_lk_n = getattr(self, "_sched_lk_n", 0) + 1
         self._rk_lk_cache[rid] = res
         return res
+
+    def try_mark_arena_sink(self, request) -> bool:
+        """★ 修3: decode 调度 waiting 循环 break 后, 对【没扫到的】waiting 请求提前做
+        arena-sink 决定 (不等 admission gate 一个个轮到它) → prefill 早 D2H + 放 GPU,
+        解偏差1. 复用 admission gate 的投影 (用修1 修好的实时 usage). 已 sink/failed/
+        preempt-saved/pending 的跳过. 返回是否新标记. LICHT_ARENA_SINK_ON_BREAK=0 关闭."""
+        if not getattr(self, "_sink_on_break", True):
+            return False
+        # ARENA_SINK 是 decode 驱动 (decode 满 → 让 prefill D2H). 只 decode 侧标记;
+        # prefill(producer) 不该 sink 自己的请求.
+        if self.is_producer:
+            return False
+        if not (self._phase2_admission_gate and self._round_kv_enabled
+                and self._round_store_obj is not None
+                and self._admission_kv_total_blocks > 0):
+            return False
+        rid = request.request_id
+        if (rid in self._arena_sinked or rid in self._arena_sink_failed
+                or rid in self._preempt_saved
+                or rid in self._pending_arena_sink):
+            return False
+        try:
+            _need_tokens = max(0, len(request.prompt_token_ids)
+                               - (getattr(request, "num_computed_tokens", 0)
+                                  or 0))
+            _need_blocks = (_need_tokens + self._block_size - 1) \
+                // self._block_size
+            _predicted = (self._admission_kv_usage + _need_blocks
+                          / float(self._admission_kv_total_blocks))
+        except Exception:
+            return False
+        if _predicted <= self._phase2_gate_threshold:
+            return False
+        _remote = None
+        _kvp = getattr(request, "kv_transfer_params", None)
+        if isinstance(_kvp, dict):
+            _remote = _kvp.get("prefill_zmq_address")
+        if _remote is None:
+            try:
+                _ip, _port = self.parse_request_id(
+                    request.request_id, is_prefill=False)
+                _remote = f"{_ip}:{_port}"
+            except Exception:
+                _remote = None
+        _job = getattr(request, "job_id", None) or ""
+        self._pending_arena_sink[request.request_id] = (
+            str(_job), list(request.prompt_token_ids), _remote or "")
+        self._arena_sinked.add(request.request_id)
+        self._arena_sink_ts[request.request_id] = time.time()
+        return True
 
     def get_num_new_matched_tokens(
         self,

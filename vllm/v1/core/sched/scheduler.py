@@ -1871,6 +1871,19 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
 
+        # ★ 修3: decode 调度 waiting 循环 break(running 满 / 分配不到块)后, self.waiting
+        # 里剩的是【没扫到的】请求. 对它们提前做 arena-sink 决定 → prefill 早 D2H + 放
+        # GPU (不必等 admission gate 一个个轮到它们, 解偏差1). 只 decode 侧 connector
+        # 有 try_mark_arena_sink; 它内部投影(用修1实时usage)只 sink 会超阈值的, 已 sink
+        # 的跳过. skipped(已 defer/sink 的)在另一队列, 不在此 self.waiting 里.
+        if (self.connector is not None
+                and hasattr(self.connector, "try_mark_arena_sink")):
+            for _wreq in self.waiting:
+                try:
+                    self.connector.try_mark_arena_sink(_wreq)
+                except Exception:  # pragma: no cover
+                    pass
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
