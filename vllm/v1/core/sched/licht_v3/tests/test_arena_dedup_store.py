@@ -229,6 +229,25 @@ class TestDedupStore:
         freed2 = store._evict_lockfree(1, index_only=False)  # 回退文件淘 A
         assert freed2 == 2
 
+    def test_protected_not_evicted(self, tmp_path, monkeypatch):
+        """修2: protected store 的 slot 被 pin 住 → 淘汰跳过(can_evict pin==0);
+        release_protected 后回到可淘。①②(ARENA_SINK/preempt)用它防被淘→重算。"""
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=8)
+        toksA = list(range(64))
+        toksB = list(range(1000, 1032))
+        # A = 在途(protected), B = 普通可淘
+        assert store.write_inc("A", 0, 2, toksA, [b"a0", b"a1"],
+                               protected=True, protect_key="reqA")
+        assert store.write_inc("B", 0, 2, toksB, [b"b0", b"b1"])
+        slotA0 = _slot_of(store, toksA, 0)
+        assert store._protect_pinned_n == 2
+        store._evict_lockfree(4)                 # 想腾4: A 被 pin 跳过, 只淘 B
+        assert not store._allocator.is_free(slotA0)   # A 被保护, 没淘
+        store.release_protected("reqA")          # 释放保护
+        assert store._protect_pinned_n == 0
+        store._evict_lockfree(2)                 # A 现在可淘
+        assert store._allocator.is_free(slotA0)
+
     def test_job_claim_flock_exclusive(self, tmp_path, monkeypatch):
         """Phase 1b: job claim 用独立 fd 的 flock → 互斥 (同进程不同 fd 也互斥,
         即跨进程/跨线程保证'同一 job 同时只一个淘汰者' → 防 double refcnt--)。"""

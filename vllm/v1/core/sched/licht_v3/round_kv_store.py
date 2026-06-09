@@ -886,9 +886,12 @@ class RoundKVStore:
             torch.cuda.current_stream().synchronize()
 
     def _store_direct_arena_lru(self, job_id, start, end, inc_block_ids,
-                                token_ids, ev, stream) -> bool:
+                                token_ids, ev, stream,
+                                protected: bool = False,
+                                protect_key=None) -> bool:
         """store-direct: 不 gather, 不 CPU memcpy. CS1 定 MISS slot → GPU 直写
-        (paged->arena) → CS2 publish. dedup 记账复用 write_inc (gpu_write_fn 钩子)."""
+        (paged->arena) → CS2 publish. dedup 记账复用 write_inc (gpu_write_fn 钩子).
+        protected: ARENA_SINK/preempt 的"在途"KV, pin 住不被淘 (修2)."""
         def _gpu_write(miss_slots, miss_pos):
             miss_paged = [int(inc_block_ids[p]) for p in miss_pos]
             self._gpu_write_miss(miss_slots, miss_paged, ev, stream)
@@ -898,7 +901,8 @@ class RoundKVStore:
             end_block=int(end),
             token_ids=list(token_ids) if token_ids is not None else [],
             source_obj=None,
-            gpu_write_fn=_gpu_write))
+            gpu_write_fn=_gpu_write,
+            protected=protected, protect_key=protect_key))
 
     def _load_batch_arena_lru(self, items: list) -> list:
         """LRU 版 batch load.
@@ -1306,7 +1310,8 @@ class RoundKVStore:
 
     def enqueue_store(self, job_id: str, full_block_ids: list,
                       full_token_ids: list,
-                      request_id: Optional[str] = None) -> None:
+                      request_id: Optional[str] = None,
+                      protected: bool = False) -> None:
         """Queue an incremental store for `job_id`.  Captures a CUDA event
         on the engine stream so the background gather waits for the
         finishing forward's writes to be visible, then returns
@@ -1328,12 +1333,22 @@ class RoundKVStore:
             # block=True => high-water back-pressure (rare); never drops.
             self._queue.put(
                 (job_id, list(full_block_ids), list(full_token_ids),
-                 request_id, ev),
+                 request_id, ev, protected),
                 block=True, timeout=None)
         except Exception as e:  # pragma: no cover
             logger.warning("RoundKVStore.enqueue_store failed job=%s: %s",
                            job_id, e)
             self._mark_done(request_id)
+
+    def release_protected(self, request_id) -> None:
+        """修2: 请求 admit/结束 → 释放它 ARENA_SINK/preempt 时 pin 的保护, 让数据回到
+        可被 LRU 淘的状态 (降 arena 容量压力). 超时兜底见 _expire_protected_pins."""
+        s = self._lru_store
+        if s is not None and hasattr(s, "release_protected"):
+            try:
+                s.release_protected(request_id)
+            except Exception:  # pragma: no cover
+                pass
 
     def _store_loop(self, idx: int) -> None:
         stream = None
@@ -1351,17 +1366,17 @@ class RoundKVStore:
                 continue
             if task is None:
                 break
-            job_id, block_ids, token_ids, request_id, ev = task
+            job_id, block_ids, token_ids, request_id, ev, protected = task
             try:
                 self._do_store(job_id, block_ids, token_ids, request_id,
-                               ev, stream)
+                               ev, stream, protected)
             except Exception as e:  # pragma: no cover
                 logger.warning("RoundKVStore store failed job=%s: %s",
                                job_id, e)
                 self._mark_done(request_id)
 
     def _do_store(self, job_id, block_ids, token_ids, request_id, ev,
-                  stream) -> None:
+                  stream, protected: bool = False) -> None:
         with self._job_lock(job_id):
             last = self._last_stored.get(job_id)
             if last is None:
@@ -1382,7 +1397,8 @@ class RoundKVStore:
             if self._store_direct_available():
                 _t1 = time.time()
                 ok = self._store_direct_arena_lru(
-                    job_id, last, end, inc_block_ids, token_ids, ev, stream)
+                    job_id, last, end, inc_block_ids, token_ids, ev, stream,
+                    protected=protected, protect_key=request_id)
                 # GPU 写已 sync 完成 -> paged 块可释放
                 self._mark_done(request_id)
                 if ok is False:
@@ -1726,7 +1742,10 @@ class RoundKVStore:
             # enqueue_store will be picked up by _store_loop, which does the
             # D2H gather (own CUDA stream) + write_inc_arena and finally
             # calls _mark_done(request_id) -> ev.set().
-            self.enqueue_store(job_id, block_ids, token_ids, request_id)
+            # ★ 修2: preempt-save 是"在途"KV (请求被抢占,等重新 admit 拉回),
+            # protected=True → pin 住不被淘. 同 ARENA_SINK.
+            self.enqueue_store(job_id, block_ids, token_ids, request_id,
+                               protected=True)
             ok = ev.wait(timeout=timeout_s)
             return ok
         except Exception:  # pragma: no cover

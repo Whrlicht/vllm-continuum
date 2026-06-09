@@ -205,6 +205,28 @@ class LruArenaStore:
         # 在本进程淘汰, 其余等 (淘汰是后台路径, 串行可接受).
         self._evict_lock = threading.Lock()
 
+        # ★ 修2: 保护"在途"KV 不被 LRU 淘汰. arena 里三种数据:
+        #   ① ARENA_SINK (prefill→arena, 等 decode 拉)  ② decode preempt 存的
+        #   → ①② 是请求正等着拉回去的, 【绝不能被淘】, 否则请求丢 KV → 重算;
+        #   ③ 一轮 decode 结束后存的跨轮复用缓存 → 只有③能被 LRU 淘.
+        # 机制: ①②的 store 把 slot try_pin 住 (can_evict 查 pin==0 → 淘汰自动跳过),
+        # 超时(或显式 release)再 unpin. 带数量上限防把 arena 全 pin 满死锁.
+        # _protected_pins: protect_key -> (slot_state_addr 列表, expire_ts)
+        self._protected_pins: dict = {}
+        self._protect_pinned_n = 0
+        self._protect_lock = threading.Lock()
+        # 超时须 ≥ 偏差2 的 admit 硬上限 (180s), 否则数据在 decode 还在等 admit 时就
+        # 被释放→淘汰→重算. 默认 200s.
+        self._protect_timeout_s = float(
+            os.environ.get("LICHT_ARENA_PROTECT_TIMEOUT_S", "200"))
+        # pin 住的 slot 总数上限 (默认 num_slots 的 60%); 超了不再 pin → 该请求退回
+        # NCCL/重算 (有日志), 防 in-flight 太多把 arena pin 死.
+        self._protect_max_frac = float(
+            os.environ.get("LICHT_ARENA_PROTECT_MAX_FRAC", "0.6"))
+        self._stat_protect_pinned = 0
+        self._stat_protect_overflow = 0
+        self._stat_protect_released = 0
+
         # ★ Phase 1a: 后台 evictor —— 一个后台线程按水位提前补满空闲池, 让 store
         # 进来时大多直接 alloc 命中、跳过自己的同步淘汰 (淘汰整体移到后台, 不卡 store).
         # 复用现有 _evict_lockfree (分小 chunk, 每 chunk 短持 _evict_lock, 让 store
@@ -449,7 +471,9 @@ class LruArenaStore:
                   end_block: int,
                   token_ids: List[int],
                   source_obj: object,
-                  gpu_write_fn=None) -> bool:
+                  gpu_write_fn=None,
+                  protected: bool = False,
+                  protect_key=None) -> bool:
         """把 [start_block, end_block) 这段 inc 写入 arena.
 
         参数:
@@ -482,7 +506,8 @@ class LruArenaStore:
         if self._content_addr:
             return self._write_inc_dedup(
                 job_id, start_block, end_block, token_ids, source_obj,
-                gpu_write_fn=gpu_write_fn)
+                gpu_write_fn=gpu_write_fn,
+                protected=protected, protect_key=protect_key)
 
         # ---- 临界区 1: alloc (+ evict if needed), 拿到 slot_ids ----
         rc = _atomic.mutex_lock(self._hdr.mutex_addr)
@@ -587,7 +612,9 @@ class LruArenaStore:
                          end_block: int,
                          token_ids: List[int],
                          source_obj: object,
-                         gpu_write_fn=None) -> bool:
+                         gpu_write_fn=None,
+                         protected: bool = False,
+                         protect_key=None) -> bool:
         """内容寻址版 write_inc.
 
         与非 dedup 版同样的三段式临界区, 但每块先 probe hash 表:
@@ -814,6 +841,12 @@ class LruArenaStore:
         # 一致. 淘汰锁内仍逐块 gen 复核 → 索引过时也安全 (最坏白读已淘 slot).
         self._job_slot_index.setdefault(job_id, []).append(
             (start_block, end_block, list(records)))
+
+        # ★ 修2: protected (ARENA_SINK / preempt-save) → pin 住本 inc 的 slot, 淘汰
+        # 跳过 (can_evict 查 pin==0). gen 已发布, try_pin(addr, gen) 必成 (除非刚被
+        # 别进程淘 → gen 变 → pin 失败, 那数据本也没了). 带数量上限防 pin 满 arena.
+        if protected and self._content_addr:
+            self._pin_protected(records, protect_key)
 
         # ---- 锁外: 重写 manifest ----
         self._write_manifest(
@@ -1200,6 +1233,75 @@ class LruArenaStore:
         return freed, left_pinned
 
     # ============================================================
+    # 修2: 保护"在途"KV (ARENA_SINK / preempt-save) 不被 LRU 淘汰
+    # ============================================================
+    def _pin_protected(self, records, protect_key) -> None:
+        """pin 住本 inc 的 slot (try_pin), 淘汰 can_evict 查 pin==0 自动跳过.
+        带数量上限: pin 满 max_frac*num_slots 就不再 pin (overflow 计数), 防把 arena
+        pin 死. 记进 _protected_pins 供超时/显式 release."""
+        try:
+            cap = int(self._allocator.num_slots * self._protect_max_frac)
+        except Exception:
+            cap = 0
+        with self._protect_lock:
+            if cap > 0 and self._protect_pinned_n >= cap:
+                self._stat_protect_overflow += 1
+                return
+            pinned = []
+            for (slot, gen, _h) in records:
+                addr = self._hdr.slot_state_addr(slot)
+                try:
+                    if _atomic.try_pin(addr, gen):
+                        pinned.append(addr)
+                except Exception:
+                    pass
+            if not pinned:
+                return
+            key = (protect_key if protect_key is not None
+                   else f"_anon:{id(records)}")
+            old = self._protected_pins.pop(key, None)   # 同 key 旧的先释放防泄漏
+            if old is not None:
+                self._unpin_addrs_locked(old[0])
+            self._protected_pins[key] = (
+                pinned, time.time() + self._protect_timeout_s)
+            self._protect_pinned_n += len(pinned)
+            self._stat_protect_pinned += len(pinned)
+
+    def _unpin_addrs_locked(self, addrs) -> None:
+        """持 _protect_lock 时调用. unpin 一批地址."""
+        if not addrs:
+            return
+        for addr in addrs:
+            try:
+                _atomic.unpin(addr)
+            except Exception:
+                pass
+        self._protect_pinned_n -= len(addrs)
+
+    def release_protected(self, protect_key) -> None:
+        """请求 admit / 结束 → 显式释放它的 protected pin (降容量压力, 让数据回到
+        可淘③). 超时兜底见 _expire_protected_pins."""
+        with self._protect_lock:
+            ent = self._protected_pins.pop(protect_key, None)
+            if ent is not None:
+                self._unpin_addrs_locked(ent[0])
+                self._stat_protect_released += 1
+
+    def _expire_protected_pins(self) -> None:
+        """周期调用 (后台 evictor 循环): unpin 超时未释放的 protected pin, 防泄漏
+        把 arena pin 死."""
+        if not self._protected_pins:
+            return
+        now = time.time()
+        with self._protect_lock:
+            expired = [k for k, (_a, exp) in self._protected_pins.items()
+                       if now > exp]
+            for k in expired:
+                ent = self._protected_pins.pop(k, None)
+                if ent is not None:
+                    self._unpin_addrs_locked(ent[0])
+
+    # ============================================================
     # Phase 1b: job 级 claim (flock, 跨进程+跨线程互斥, 零格式变更)
     # ============================================================
     def _claim_job(self, job_id: str):
@@ -1430,6 +1532,7 @@ class LruArenaStore:
     def _bg_evictor_loop(self) -> None:
         while not self._bg_stop:
             try:
+                self._expire_protected_pins()   # 修2: 兜底释放超时的 protected pin
                 free = int(self._allocator.count_free_accurate())
                 if free < self._bg_low:
                     self._stat_bg_rounds += 1

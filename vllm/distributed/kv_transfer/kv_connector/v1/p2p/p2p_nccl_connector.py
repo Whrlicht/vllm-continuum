@@ -838,9 +838,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
         try:
             self._arena_sink_pending.add(request_id)
             self._arena_sink_decode_addr[request_id] = decode_zmq_address
+            # ★ 修2: ARENA_SINK 是"在途"KV (decode 正等着拉回去), protected=True →
+            # pin 住不被 LRU 淘, 防 decode 来拉时已被淘 → 重算. decode admit / 请求
+            # 结束 / 超时 才释放.
             self._round_store_obj.enqueue_store(
                 str(job_id), list(block_ids),
-                list(prompt_token_ids), request_id)
+                list(prompt_token_ids), request_id, protected=True)
             logger.info(
                 "ARENA_SINK enqueued req=%s job=%s nblk=%d decode=%s",
                 request_id, job_id, len(block_ids), decode_zmq_address)
@@ -1647,6 +1650,15 @@ p2p_nccl_engine import get_fast_release_queue
 
         self.chunked_prefill.pop(request.request_id, None)
         self._requests_need_load.pop(request.request_id, None)
+        # ★ 修2: 请求结束 → 释放它在本进程 pin 的 protected KV (preempt-save 在 decode
+        # 侧, 此时安全释放, 让数据回到可淘③; 降 arena 容量压力). ARENA_SINK 在 prefill
+        # 侧 pin, prefill 的 request_finished 触发太早(decode 还没拉), 故只 decode 侧
+        # (非 producer) 释放; ARENA_SINK 走 200s 超时兜底.
+        if not self.is_producer and self._round_store_obj is not None:
+            try:
+                self._round_store_obj.release_protected(request.request_id)
+            except Exception:  # pragma: no cover
+                pass
         # Phase2 arena-sink markers 生命周期到此 (防 _arena_sink_failed 无界增长)
         self._arena_sink_failed.discard(request.request_id)
         self._arena_sink_ts.pop(request.request_id, None)
