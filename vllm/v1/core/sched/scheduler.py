@@ -775,6 +775,21 @@ class Scheduler(SchedulerInterface):
             key=lambda r: (_evict_score(r), -r.arrival_time, r.request_id),
         )
 
+    def _uncount_prefix_stats(self, request: Request,
+                              local_tokens: int) -> None:
+        """★ 修指标假象: 撤销 get_computed_blocks 给一个【最终没 admit 的请求】加的
+        prefix_cache_stats 计数。get_computed_blocks 在 connector 决定 defer / 80% break
+        之【前】就计了数 (queries += prompt, hits += 本地命中, requests += 1); 但 defer/
+        break 的请求不进 running, 不该算进 prefix hit rate —— 否则改动3 下大量"等整份
+        sink"的 defer 请求每步被重复计入, 按"只命中本地"把命中率狂拉低 (假象, 非真重算)。
+        与 kv_cache_manager.get_computed_blocks 的计数严格对称相减。"""
+        if (self.kv_cache_manager.log_stats
+                and self.kv_cache_manager.prefix_cache_stats is not None):
+            _pcs = self.kv_cache_manager.prefix_cache_stats
+            _pcs.requests -= 1
+            _pcs.queries -= request.num_tokens
+            _pcs.hits -= local_tokens
+
     def _pop_waiting_request(self, request: Request) -> None:
         # LICHT custom selection may not choose queue head, so remove by object.
         if self.licht_prefill_sched_enabled or self.licht_decode_fcfs_enabled:
@@ -1511,6 +1526,11 @@ class Scheduler(SchedulerInterface):
                             _thr = getattr(self.connector,
                                            "_phase2_gate_threshold", 0.80)
                             if _proj > _thr:
+                                # ★ 修指标假象: 这个请求不进 running, 撤销上面
+                                # get_computed_blocks 刚加的 prefix_cache_stats
+                                # (否则没 admit 的请求按"只命中本地"拉低命中率)。
+                                self._uncount_prefix_stats(
+                                    request, num_new_local_computed_tokens)
                                 break   # ★改动1: 停扫; 没扫到的循环外 sink
 
                     # NOTE (Hanchen) The logic here is that we will see if the connector can get the tokens.
@@ -1527,6 +1547,11 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            # ★ 修指标假象: defer 的请求不进 running, 撤销上面
+                            # get_computed_blocks 加的计数 (否则改动3 下 defer 等整份
+                            # sink 的请求每步被重复计入、按"只命中本地"狂拉低 prefix hit)。
+                            self._uncount_prefix_stats(
+                                request, num_new_local_computed_tokens)
                             self._pop_waiting_request(request)
                             skipped_waiting_requests.prepend_request(request)
                             continue
