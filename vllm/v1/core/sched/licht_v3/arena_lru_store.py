@@ -871,6 +871,17 @@ class LruArenaStore:
                 (_seg.get('data', 0) / _nm) if _nm else 0.0,
                 _seg.get('slot', 0), _seg.get('cs2', 0),
                 _seg.get('manifest', 0))
+            # ★ 修2 诊断: 保护池状态 (pinned=当前 pin 槽数, cap=上限,
+            # ovf=累计 overflow 次数, rel=累计释放). pinned 逼近 cap → 后续 sink
+            # 裸奔被淘. protected=本次 store 是否在途 KV.
+            try:
+                _pcap = int(self._allocator.num_slots * self._protect_max_frac)
+            except Exception:
+                _pcap = 0
+            logger.info(
+                "WRITE-PROF protect: this=%s pinned=%d/%d ovf=%d rel=%d",
+                "Y" if protected else "n", self._protect_pinned_n, _pcap,
+                self._stat_protect_overflow, self._stat_protect_released)
 
         n_hit = n_blocks - len(miss_pub)
         self._stat_hit_blocks += n_hit
@@ -1246,6 +1257,15 @@ class LruArenaStore:
         with self._protect_lock:
             if cap > 0 and self._protect_pinned_n >= cap:
                 self._stat_protect_overflow += 1
+                # 限速告警: 保护池已满 → 这个在途请求没 pin 上 → 会被淘 → 重算.
+                # 说明 in-flight sink 堆积超过 arena 保护容量 (decode 堵 + pin 压满
+                # 200s 不放). 每 20 次打一条.
+                if self._stat_protect_overflow % 20 == 1:
+                    logger.warning(
+                        "修2 protect OVERFLOW #%d: pinned=%d>=cap=%d, 本请求在途"
+                        "KV 未受保护→可能被淘重算. (in-flight 超 arena 保护容量, "
+                        "根: decode 堵 + pin 200s 未及时释放)",
+                        self._stat_protect_overflow, self._protect_pinned_n, cap)
                 return
             pinned = []
             for (slot, gen, _h) in records:
