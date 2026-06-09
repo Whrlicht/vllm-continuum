@@ -1113,10 +1113,10 @@ p2p_nccl_engine import get_fast_release_queue
         # Phase 2 (PD path selector): if this request was previously
         # routed through the arena (RPC fired in an earlier pass), the
         # connector waits here for the prefill side to finish D2H
-        # writing.  Once arena has the data, lookup succeeds and the
-        # admit proceeds via the arena-load path (matches Phase 1
-        # preempt-recovery: scheduler → update_state_after_alloc →
-        # round_load → worker load_batch).  Miss = still defer.
+        # writing.  ★ 改动3: 只有 arena 把它【这一轮的完整 KV】都写齐了才 admit;
+        # 部分命中【不】admit (否则缺的块在 decode 上重算、吃满 256 token budget,
+        # 拖死生成). 没齐就一直 defer 等下轮; 删除原 30s deadline → 重算兜底:
+        # decode 永不重算, 等不到就让客户端 300s 超时把请求挂掉 (用户决定).
         if (self._phase2_admission_gate
                 and request.request_id in self._arena_sinked
                 and self._round_kv_enabled
@@ -1126,25 +1126,14 @@ p2p_nccl_engine import get_fast_release_queue
                 res = self._round_store_obj.lookup(
                     str(job_id), request.prompt_token_ids)
                 if res is not None:
-                    matched_tokens, _ = res
-                    ext = matched_tokens - num_computed_tokens
-                    if ext > 0:
-                        return ext, False
-            # ★ deadline 兜底: arena 还没就绪. 正常 D2H ~数秒就好; 若超过 deadline
-            # 仍 miss, 多半是 RPC 被 declined (bridge 已 RELEASE/竞态), arena 永远
-            # 不会有数据. 放弃 arena → 标 failed (防再 sink) → 退回 NCCL, 避免永久
-            # defer 挂到 600s 超时. 未超时则继续 defer 等 D2H.
-            _t0 = self._arena_sink_ts.get(request.request_id)
-            if _t0 is not None and (time.time() - _t0) > \
-                    self._arena_sink_deadline_s:
-                self._arena_sinked.discard(request.request_id)
-                self._arena_sink_ts.pop(request.request_id, None)
-                self._arena_sink_failed.add(request.request_id)
-                logger.warning(
-                    "Phase2 arena-sink req=%s 超 %.0fs 未就绪 (RPC 多半被 declined)"
-                    " -> 放弃 arena, 退回 NCCL",
-                    request.request_id, self._arena_sink_deadline_s)
-                return 0, False
+                    matched_tokens, matched_blocks = res
+                    # 整份齐 = arena 命中块覆盖整个 prompt 的完整块数.
+                    _need_blk = (len(request.prompt_token_ids)
+                                 // self._block_size)
+                    if matched_blocks >= _need_blk:
+                        ext = matched_tokens - num_computed_tokens
+                        return max(0, ext), False   # 齐 → admit-from-arena
+            # 没齐 (这一轮的块还没 sink 完 / 被淘) → defer 等下轮, 永不重算.
             return None, False
 
         # Phase 2 (PD path selector): first time we see this request
