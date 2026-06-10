@@ -367,41 +367,6 @@ class LruArenaStore:
     def _slot_path(self, job_id: str, start: int, end: int) -> str:
         return os.path.join(self._job_dir(job_id), slot_filename(start, end))
 
-    # ─── 在途保护 (in-flight pin): per-job 二元标记, 淘汰跳过整个 job ──────
-    # sink / preempt-save 时 mark, admit 拉走 / 请求挂掉时 clear。
-    # 二元(文件存在与否), 幂等, 不碰 pin 字段(那是 load 的计数), 跨进程可见。
-    _INFLIGHT = ".inflight"
-
-    def _inflight_path(self, job_id: str) -> str:
-        return os.path.join(self._job_dir(job_id), self._INFLIGHT)
-
-    def mark_inflight(self, job_id: str) -> None:
-        """打在途标记: 淘汰将跳过整个 job。幂等(已存在无害)。"""
-        try:
-            d = self._job_dir(job_id)
-            os.makedirs(d, exist_ok=True)
-            fd = os.open(self._inflight_path(job_id),
-                         os.O_CREAT | os.O_WRONLY, 0o644)
-            os.close(fd)
-        except Exception:
-            pass
-
-    def clear_inflight(self, job_id: str) -> None:
-        """清在途标记: job 重新可淘。幂等(不存在无害)。绝不按超时强制清。"""
-        try:
-            os.unlink(self._inflight_path(job_id))
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
-    def is_inflight(self, job_id: str) -> bool:
-        """淘汰选 victim 时查: 在途的 job 不淘。"""
-        try:
-            return os.path.exists(self._inflight_path(job_id))
-        except Exception:
-            return False
-
     def _list_jobs(self) -> List[str]:
         """扫 storage_path 下所有 job 子目录."""
         try:
@@ -1552,17 +1517,13 @@ class LruArenaStore:
         """
         exclude_set = set(exclude)
         # 热路径: 内存 LRU, 最老在前
-        # ★ 在途保护: 跳过有 .inflight 标记的 job(在途请求的 KV 整 job 不淘)。
-        #   在途 job 通常是刚 sink 的(MRU, 在末尾), LRU 前端基本都非在途,
-        #   多数情况首个候选就过 → 一次 stat; 久 defer 的在途 job 漂到前端时
-        #   才多 stat 几个, 仍是 O(在途数) µs 级。
         for jid in self._job_lru:
-            if jid not in exclude_set and not self.is_inflight(jid):
+            if jid not in exclude_set:
                 return jid
         # 兜底: 文件系统扫描 (罕见 — 本进程内存 LRU 为空但仍需 evict)
         candidates: List[Tuple[float, str]] = []
         for job in self._list_jobs():
-            if job in exclude_set or self.is_inflight(job):
+            if job in exclude_set:
                 continue
             try:
                 mtime = os.stat(self._manifest_path(job)).st_mtime
@@ -1596,9 +1557,6 @@ class LruArenaStore:
         边界", 只 evict end <= committed 的 inc, 跳过未提交的 inc, 避免淘到正在
         写的 slot.
         """
-        # ★ 在途保护(兜底): 万一 victim 选择漏过, 这里再挡一道 —— 在途 job 一份不淘。
-        if self.is_inflight(job_id):
-            return 0
         # ★ Phase 1b: 抢 job claim (锁内兜底路径也要, 这正是跨进程 file fallback
         # double-decref 的高发处). 抢不到 = 别人在淘 → 跳过 (返 0, 调用方挑下一个).
         # LOCK_NB 不阻塞 → 与背景 evictor 的 flock→alloc_mutex 无锁序倒置死锁.

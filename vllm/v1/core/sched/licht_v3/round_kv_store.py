@@ -1744,28 +1744,6 @@ class RoundKVStore:
             return d
 
     # ------------------------------------------------------------------
-    # 在途保护 (in-flight pin): 委托给 LruArenaStore 的 per-job .inflight 标记。
-    # sink/preempt-save 时 mark, admit 拉走/请求挂掉时 clear, 淘汰跳过在途 job。
-    # 二元/幂等/跨进程, 不碰 pin 字段。scheduler 侧需先 ensure 只读表拿到 _lru_store。
-    # ------------------------------------------------------------------
-
-    def mark_inflight(self, job_id) -> None:
-        self._ensure_lookup_store()
-        if self._lru_store is not None:
-            self._lru_store.mark_inflight(str(job_id))
-
-    def clear_inflight(self, job_id) -> None:
-        self._ensure_lookup_store()
-        if self._lru_store is not None:
-            self._lru_store.clear_inflight(str(job_id))
-
-    def is_inflight(self, job_id) -> bool:
-        self._ensure_lookup_store()
-        if self._lru_store is not None:
-            return self._lru_store.is_inflight(str(job_id))
-        return False
-
-    # ------------------------------------------------------------------
     # LOOKUP (prefill, scheduler thread, filesystem-only)
     # ------------------------------------------------------------------
 
