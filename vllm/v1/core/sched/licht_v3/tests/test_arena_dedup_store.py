@@ -546,3 +546,41 @@ class TestCrossJobLookup:
         assert ok
         # C 的 3 块都在
         assert store.lookup("C", toks_c) == (3 * BS, 3)
+
+
+# ============================================================
+# 在途保护 (in-flight pin): per-job .inflight 标记 + 淘汰跳过
+# ============================================================
+
+class TestInflightPin:
+    def test_mark_clear_idempotent(self, tmp_path, monkeypatch):
+        store, _a, _w = _make_store(tmp_path, monkeypatch, num_slots=64)
+        store.write_inc("J", 0, 3, list(range(48)), [b"j0", b"j1", b"j2"])
+        assert store.is_inflight("J") is False
+        store.mark_inflight("J")
+        store.mark_inflight("J")          # 幂等
+        assert store.is_inflight("J") is True
+        store.clear_inflight("J")
+        store.clear_inflight("J")         # 幂等 (不存在无害)
+        assert store.is_inflight("J") is False
+
+    def test_evict_skips_inflight_job(self, tmp_path, monkeypatch):
+        store, _a, _w = _make_store(tmp_path, monkeypatch, num_slots=64)
+        store.write_inc("J", 0, 3, list(range(48)), [b"j0", b"j1", b"j2"])
+        store.mark_inflight("J")
+        # 在途 → 一份不淘
+        assert _evict_job(store, "J") == 0
+        assert len(store._list_incs("J")) == 1   # inc 还在 (一个文件覆盖 3 块)
+        # 清掉 → 可淘
+        store.clear_inflight("J")
+        assert _evict_job(store, "J") > 0
+
+    def test_pick_lru_victim_skips_inflight(self, tmp_path, monkeypatch):
+        store, _a, _w = _make_store(tmp_path, monkeypatch, num_slots=64)
+        store.write_inc("OLD", 0, 1, list(range(16)), [b"o0"])
+        store.write_inc("NEW", 0, 1, list(range(100, 116)), [b"n0"])
+        # OLD 最老; 标在途 → victim 跳过它选 NEW
+        store.mark_inflight("OLD")
+        assert store._pick_lru_victim(exclude=set()) == "NEW"
+        store.clear_inflight("OLD")
+        assert store._pick_lru_victim(exclude=set()) == "OLD"
