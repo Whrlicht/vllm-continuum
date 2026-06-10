@@ -836,6 +836,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
             self._round_store_obj.enqueue_store(
                 str(job_id), list(block_ids),
                 list(prompt_token_ids), request_id)
+            # ★ 在途保护: sink 即给整个 job 打 .inflight 标记 → 淘汰跳过整 job,
+            #   这一轮的 KV(及前缀)在 decode admit 拉走前不会被淘。admit /
+            #   request_finished 时 clear。幂等/跨进程/不碰 pin 字段。
+            self._round_store_obj.mark_inflight(str(job_id))
             logger.info(
                 "ARENA_SINK enqueued req=%s job=%s nblk=%d decode=%s",
                 request_id, job_id, len(block_ids), decode_zmq_address)
@@ -1034,6 +1038,11 @@ p2p_nccl_engine import get_fast_release_queue
             self._pending_preempt_store[request.request_id] = (
                 str(job_id), list(block_ids), list(all_token_ids))
             self._preempt_saved[request.request_id] = str(job_id)
+            # ★ 在途保护: preempt 存档即给整个 job 打 .inflight → 淘汰跳过整 job,
+            #   存档(prompt+已生成 output)在下次 admit 拉走前不被淘。re-admit /
+            #   request_finished 时 clear。和 ARENA_SINK 共用一套标记。
+            if self._round_store_obj is not None:
+                self._round_store_obj.mark_inflight(str(job_id))
         except Exception as e:  # pragma: no cover
             logger.warning("Phase1 save_preempt record failed req=%s: %s",
                            request.request_id, e)
@@ -1195,16 +1204,20 @@ p2p_nccl_engine import get_fast_release_queue
             if job_id:
                 res = self._round_store_obj.lookup(str(job_id), all_tids)
                 if res is not None:
-                    matched_tokens, _ = res
-                    ext = matched_tokens - num_computed_tokens
-                    if ext > 0:
+                    matched_tokens, matched_blocks = res
+                    # ★ 改动3(preempt-save 分支, 与 arena-sink 分支一致):
+                    # 只有存档【整份齐】(prompt+已生成 output 的完整块都在 arena)
+                    # 才 admit; 没齐就 defer 等下轮, 永不 fall-through 重算。pin
+                    # (.inflight) 保证存档不被淘 → 终会凑齐。存档还没落完 / 跨步
+                    # 被淘时, 这一步就先等。
+                    _need_blk = len(all_tids) // self._block_size
+                    if matched_blocks >= _need_blk:
+                        ext = matched_tokens - num_computed_tokens
                         # Sync arena load on resume (small increment;
                         # avoids parking in WAITING_FOR_REMOTE_KVS).
-                        return ext, False
-            # Arena lookup failed → fall through to the normal NCCL path
-            # (which will return 0 since producer no longer has the KV,
-            # leading to recompute — same as today's behaviour).
-            self._preempt_saved.pop(request.request_id, None)
+                        return max(0, ext), False   # 齐 → admit-from-arena
+            # 没齐 (存档没落完 / 被淘) → defer 等下轮, 不重算。
+            return None, False
 
         num_external_tokens = (len(request.prompt_token_ids) - 1 -
                                num_computed_tokens)
@@ -1257,6 +1270,8 @@ p2p_nccl_engine import get_fast_release_queue
                                 request.request_id)
                             self._arena_sink_ts.pop(
                                 request.request_id, None)
+                            # ★ 在途保护: 已拉走 → 清 .inflight, job 重新可淘。
+                            self._round_store_obj.clear_inflight(str(job_id))
                             logger.info(
                                 "Phase2 admit-from-arena req=%s job=%s "
                                 "matched_blocks=%d num_blocks=%d "
@@ -1302,6 +1317,8 @@ p2p_nccl_engine import get_fast_release_queue
                             # One-shot: arena → GPU, drop the marker.
                             self._preempt_saved.pop(
                                 request.request_id, None)
+                            # ★ 在途保护: 已拉走 → 清 .inflight, job 重新可淘。
+                            self._round_store_obj.clear_inflight(str(job_id))
                             return
                 # Arena recovery failed → fall through to NCCL path
                 # (which will see 0 tokens on producer = recompute).
@@ -1606,6 +1623,20 @@ p2p_nccl_engine import get_fast_release_queue
 
         self.chunked_prefill.pop(request.request_id, None)
         self._requests_need_load.pop(request.request_id, None)
+        # ★ 在途保护(挂掉兜底): 若这个请求是在途的 arena-sink / preempt-save 且
+        # 【没 admit 就结束】(还在标记集合里 = 排队 300s 超时挂掉等), 清它的
+        # .inflight, 否则这个 job 被永久保护(泄漏)。admit 拉走的已在
+        # update_state_after_alloc 清过 + 移出集合 → 这里命不中, 不重复清。
+        # 不会误清下一轮: 多轮顺序执行, 下一轮的 mark 发生在本轮 finished 之后。
+        if (not self.is_producer and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            if (request.request_id in self._arena_sinked
+                    or request.request_id in self._preempt_saved):
+                _jid = (getattr(request, "job_id", None)
+                        or self._preempt_saved.get(request.request_id))
+                if _jid:
+                    self._round_store_obj.clear_inflight(str(_jid))
+        self._preempt_saved.pop(request.request_id, None)
         # Phase2 arena-sink markers 生命周期到此 (防 _arena_sink_failed 无界增长)
         self._arena_sink_failed.discard(request.request_id)
         self._arena_sink_ts.pop(request.request_id, None)
