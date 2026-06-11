@@ -351,6 +351,66 @@ uint64_t arena_lookup_resolve(
 }
 
 // ============================================================
+// find_gaps: 找出 [0, n_full) 里所有【缺失块】的连续区间。
+// 与 lookup_resolve 同一套逐块链式 hash + 校验, 区别在: lookup 遇第一个缺口
+// 就停、只返连续前缀; find_gaps 走完整条、把所有缺口段收集回来。
+// 缺失 = probe miss / egen==0(未发布) / gen 不匹配(被淘复用) / refcnt==0。
+// 注意: 链式 hash 必须【逐块都算】(即使该块 present), 因为后面块的 hash 依赖前
+//       面块的 hash —— 这点和 lookup_resolve 完全一致, 保证 hash 口径不漂。
+// 输出: out_ranges[2k]=第 k 段起始, out_ranges[2k+1]=第 k 段结束(开区间)。
+// 返回: 缺口段数 (最坏每块一段, 调用方给 n_full 对空间)。
+// ============================================================
+uint64_t arena_find_gaps(
+    void* table_base, uint64_t cap,
+    uint64_t slot_state_base, uint64_t refcnt_base, uint64_t num_slots,
+    const void* tokens, uint64_t n_tokens, uint64_t block_size, uint64_t seed,
+    uint64_t* out_ranges, uint64_t out_cap_pairs) {
+    if (block_size == 0) return 0;
+    uint64_t n_full = n_tokens / block_size;
+    const uint32_t* tok = reinterpret_cast<const uint32_t*>(tokens);
+    uint64_t prev = seed;
+    uint64_t n_ranges = 0;
+    bool in_gap = false;
+    uint64_t gap_start = 0;
+    for (uint64_t i = 0; i < n_full; i++) {
+        const void* chunk = tok + i * block_size;
+        uint64_t h = (uint64_t)XXH3_64bits_withSeed(
+            chunk, (size_t)(block_size * 4), prev);
+        prev = h;   // 链式: 无论 present 与否都要推进
+        bool present = false;
+        int64_t slot = -1;
+        uint64_t egen = 0;
+        if (arena_ht_probe(table_base, cap, h, &slot, &egen)
+            && egen != 0 && slot >= 0 && (uint64_t)slot < num_slots) {
+            uint64_t cur_gen = __atomic_load_n(
+                reinterpret_cast<uint64_t*>(
+                    slot_state_base + (uint64_t)slot * 8),
+                __ATOMIC_ACQUIRE) & ARENA_GEN_MASK;
+            uint16_t rc = __atomic_load_n(
+                reinterpret_cast<uint16_t*>(refcnt_base + (uint64_t)slot * 2),
+                __ATOMIC_ACQUIRE);
+            if (cur_gen == egen && rc > 0) present = true;
+        }
+        if (!present) {
+            if (!in_gap) { in_gap = true; gap_start = i; }
+        } else if (in_gap) {
+            if (n_ranges < out_cap_pairs) {
+                out_ranges[2 * n_ranges] = gap_start;
+                out_ranges[2 * n_ranges + 1] = i;
+                n_ranges++;
+            }
+            in_gap = false;
+        }
+    }
+    if (in_gap && n_ranges < out_cap_pairs) {
+        out_ranges[2 * n_ranges] = gap_start;
+        out_ranges[2 * n_ranges + 1] = n_full;
+        n_ranges++;
+    }
+    return n_ranges;
+}
+
+// ============================================================
 // Python binding
 // ============================================================
 //
@@ -507,6 +567,31 @@ static py::tuple py_lookup_resolve(
     return py::make_tuple(matched, slots, gens);
 }
 
+// ---- find_gaps: 返回 (n_full, [(start,end), ...]) 所有缺口段 ----
+static py::tuple py_find_gaps(
+    uint64_t table_base, uint64_t cap,
+    uint64_t slot_state_base, uint64_t refcnt_base, uint64_t num_slots,
+    py::bytes tokens, uint64_t block_size, uint64_t seed) {
+    std::string s = tokens;
+    uint64_t n_tokens = (uint64_t)s.size() / 4;
+    uint64_t n_full = (block_size > 0) ? (n_tokens / block_size) : 0;
+    std::vector<uint64_t> ranges(2 * (n_full ? n_full : 1));  // 最坏每块一段
+    uint64_t n_ranges;
+    {
+        py::gil_scoped_release release;   // 纯 C 计算, 放掉 GIL
+        n_ranges = arena_find_gaps(
+            reinterpret_cast<void*>(table_base), cap,
+            slot_state_base, refcnt_base, num_slots,
+            s.data(), n_tokens, block_size, seed,
+            ranges.data(), n_full);
+    }
+    py::list out;
+    for (uint64_t k = 0; k < n_ranges; k++) {
+        out.append(py::make_tuple(ranges[2 * k], ranges[2 * k + 1]));
+    }
+    return py::make_tuple(n_full, out);
+}
+
 // ---- 常量查询 (Python 端避免 hardcode) ----
 static uint64_t py_arena_ht_entry_bytes() {
     return (uint64_t)ARENA_HT_ENTRY_BYTES;
@@ -574,6 +659,12 @@ PYBIND11_MODULE(licht_arena_atomic, m) {
 
     // Stage 6: 链式 block hash
     m.def("block_hash", &py_block_hash, py::arg("prev"), py::arg("data"));
+    // 补洞修复: 找所有缺失块区间 (store 时缺哪补哪, 不信增量边界)
+    m.def("find_gaps", &py_find_gaps,
+          py::arg("table_base"), py::arg("cap"),
+          py::arg("slot_state_base"), py::arg("refcnt_base"),
+          py::arg("num_slots"), py::arg("tokens"),
+          py::arg("block_size"), py::arg("seed"));
     // Stage 6 perf: 整条 lookup_resolve 下沉 C
     m.def("lookup_resolve", &py_lookup_resolve,
           py::arg("table_base"), py::arg("cap"),

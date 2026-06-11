@@ -1363,71 +1363,70 @@ class RoundKVStore:
     def _do_store(self, job_id, block_ids, token_ids, request_id, ev,
                   stream) -> None:
         with self._job_lock(job_id):
-            last = self._last_stored.get(job_id)
-            if last is None:
-                last = self._read_total_blocks(job_id)   # cross-restart
             end = align_blocks(len(token_ids), self.block_size)
-            # ★ block_ids 可能短于累积 token 推出的块数 (多轮: token_ids 累积, 但
-            # 本轮 block_ids 不含全部复用前缀块). 切片 block_ids[last:end] 会静默
-            # 截断 → inc 实际块数 < end-last, 而 write_inc 按 end-start 当块数会越界
-            # (index out of bounds). 用实际 block_ids 长度夹住 end, 保证 [last,end)
-            # 与 gather 出的块数一致, manifest 也不会过度声明.
+            # block_ids 可能短于累积 token 推出的块数 (多轮复用前缀块不在本轮
+            # block_ids 里). 用实际长度夹住 end, 切片不越界 / manifest 不过度声明.
             end = min(end, len(block_ids))
-            if end <= last:
-                # No new COMPLETE block this round (e.g., output < 1 block).
+            if end <= 0:
                 self._mark_done(request_id)
                 return
-            inc_block_ids = list(block_ids[last:end])
-            # ---- store-direct: GPU kernel 直写 paged->arena, 省 gather+memcpy ----
-            if self._store_direct_available():
-                _t1 = time.time()
-                ok = self._store_direct_arena_lru(
-                    job_id, last, end, inc_block_ids, token_ids, ev, stream)
-                # GPU 写已 sync 完成 -> paged 块可释放
+            is_lru = bool(self._arena and self._arena_mapped
+                          and self._lru_store is not None)
+            # ★ 缺哪补哪: content-addr 下 find_gaps 探真实哈希表, 返回 [0,end) 内
+            #   所有【缺失块】区间 (含尾巴增量). 不再信增量边界 _last_stored —— 中间
+            #   块被淘了也能精确补回, 修"增量 sink 不补被淘中间块 → lookup 断"。
+            #   非 LRU/content-addr 退回旧增量单段逻辑。
+            gaps_info = self._lru_store.find_gaps(token_ids) if is_lru else None
+            if gaps_info is not None:
+                _, _gaps = gaps_info
+                ranges = [(gs, min(ge, end)) for (gs, ge) in _gaps
+                          if gs < end and min(ge, end) > gs]
+            else:
+                last = self._last_stored.get(job_id)
+                if last is None:
+                    last = self._read_total_blocks(job_id)   # cross-restart
+                ranges = [(last, end)] if end > last else []
+            if not ranges:
+                # 全部已在 arena (或本轮无新整块) → 无需写
                 self._mark_done(request_id)
-                if ok is False:
-                    logger.warning(
-                        "round-kv STORE-DIRECT inc write failed job=%s [%d,%d)"
-                        " — 进度不推进", str(job_id)[:32], last, end)
-                    return
-                # manifest 已由 LruArenaStore.write_inc 写过同一文件同内容
-                # (store-direct 必走 LRU), 不重复写 (省 O(token) JSON).
                 self._last_stored[job_id] = end
-                logger.info(
-                    "round-kv STORE-DIRECT: job=%s inc_blocks=%d write_ms=%.0f",
-                    str(job_id)[:32], end - last, (time.time() - _t1) * 1000.0)
                 return
-            # ---- gather the increment (own stream; never touches engine) ----
-            _t0 = time.time()
-            tensors = self._gather(inc_block_ids, ev, stream)
-            gather_ms = (time.time() - _t0) * 1000.0
-            # Gather done -> the GPU blocks are now safe to free.
-            self._mark_done(request_id)
-            if tensors is None:
-                return
-            # ---- write increment file + update manifest (off critical path) ----
+            # ---- 逐段补写 (store-direct GPU 直写 / 否则 gather+write_inc) ----
+            use_direct = self._store_direct_available()
             _t1 = time.time()
-            ok = self._write_inc(job_id, last, end, tensors, token_ids)
-            if ok is False:
-                # 存失败 (块数不符已被上面夹住; 这里兜其余: alloc/evict 失败等).
-                # 不推进 _last_stored / 不写 manifest → 下轮 (多轮同 job) 重试这段,
-                # 避免 manifest 过度声明 (声称存了实际没存) + 永久丢复用.
-                logger.warning(
-                    "round-kv STORE inc write failed job=%s [%d,%d) — 进度不推进",
-                    str(job_id)[:32], last, end)
+            ok_all = True
+            tot = 0
+            for (gs, ge) in ranges:
+                inc_block_ids = list(block_ids[gs:ge])
+                if use_direct:
+                    ok = self._store_direct_arena_lru(
+                        job_id, gs, ge, inc_block_ids, token_ids, ev, stream)
+                else:
+                    tensors = self._gather(inc_block_ids, ev, stream)
+                    ok = (False if tensors is None
+                          else self._write_inc(job_id, gs, ge, tensors,
+                                               token_ids))
+                if ok is False:
+                    # 某段失败: 不推进 _last_stored. 下轮 find_gaps 重探剩余洞重试.
+                    ok_all = False
+                    logger.warning(
+                        "round-kv STORE gap write failed job=%s [%d,%d)"
+                        " — 进度不推进", str(job_id)[:32], gs, ge)
+                    break
+                tot += ge - gs
+            # 所有段写完 (GPU 直写已 sync / gather 已完成) → paged 块可释放
+            self._mark_done(request_id)
+            if not ok_all:
                 return
-            # LRU arena 路径下 manifest 已由 LruArenaStore.write_inc 写过 (同一
-            # 文件同内容), 不重复写; 仅非 LRU fallback (raw/safetensors) 才写.
-            if not (self._arena and self._arena_mapped
-                    and self._lru_store is not None):
+            # LRU 路径 manifest 已由 write_inc 写过; 仅非 LRU fallback 才补写
+            if not is_lru:
                 self._write_manifest(
                     job_id, end, token_ids[:end * self.block_size])
-            write_ms = (time.time() - _t1) * 1000.0
             self._last_stored[job_id] = end
             logger.info(
-                "round-kv STORE: job=%s inc_blocks=%d gather_ms=%.0f "
-                "write_ms=%.0f", str(job_id)[:32], end - last,
-                gather_ms, write_ms)
+                "round-kv STORE%s: job=%s segs=%d blocks=%d write_ms=%.0f",
+                "-DIRECT" if use_direct else "", str(job_id)[:32],
+                len(ranges), tot, (time.time() - _t1) * 1000.0)
             # ---- coalesce many small increments into one (bg, off engine) ----
             # (safetensors-only; raw .bin / arena don't accumulate DATA files,
             # only tiny .slot indices, so no coalesce needed there)

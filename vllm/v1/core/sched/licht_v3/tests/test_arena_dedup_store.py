@@ -584,3 +584,76 @@ class TestInflightPin:
         assert store._pick_lru_victim(exclude=set()) == "NEW"
         store.clear_inflight("OLD")
         assert store._pick_lru_victim(exclude=set()) == "OLD"
+
+
+# ============================================================
+# find_gaps: 补洞修复的核心 — 探真实哈希表, 返回所有缺失块区间
+# ============================================================
+def _toks(n):
+    """n 个整块的 token (每块 BS 个, 内容逐位不同 → 链式 hash 各异)."""
+    return list(range(n * BS))
+
+
+class TestFindGaps:
+    def test_no_gap_when_full(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(6)
+        store.write_inc("j", 0, 6, toks, [f"b{i}" for i in range(6)])
+        n_full, gaps = store.find_gaps(toks)
+        assert n_full == 6
+        assert gaps == []          # 全在 → 无洞
+
+    def test_tail_gap_is_increment(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(6)
+        store.write_inc("j", 0, 4, toks, [f"b{i}" for i in range(4)])
+        # 只存了 [0,4), 查 6 块 → 尾巴增量 [4,6) 是"洞"
+        assert store.find_gaps(toks) == (6, [(4, 6)])
+
+    def test_middle_gap_detected(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(6)
+        store.write_inc("j", 0, 2, toks, ["b0", "b1"])
+        store.write_inc("j", 4, 6, toks, ["b4", "b5"])   # 跳过 [2,4)
+        # 中间洞 [2,4) 必须被发现 (这正是死亡 job 的形态)
+        assert store.find_gaps(toks) == (6, [(2, 4)])
+
+    def test_multiple_gaps(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(8)
+        store.write_inc("j", 1, 2, toks, ["b1"])          # 0 缺, 1 在
+        store.write_inc("j", 4, 6, toks, ["b4", "b5"])    # 2,3 缺; 4,5 在; 6,7 缺
+        assert store.find_gaps(toks) == (8, [(0, 1), (2, 4), (6, 8)])
+
+    def test_evicted_blocks_reappear_as_gap(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(6)
+        store.write_inc("j", 0, 6, toks, [f"b{i}" for i in range(6)])
+        assert store.find_gaps(toks)[1] == []
+        _evict_job(store, "j")        # 淘空 → 全释放
+        assert store.find_gaps(toks) == (6, [(0, 6)])
+
+    def test_shared_prefix_present_via_other_job(self, tmp_path, monkeypatch):
+        # job B 与 A 共享前缀 [0,3): A 存过 → B 查时前缀 present, 只缺自己尾巴
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        shared = _toks(3)
+        store.write_inc("A", 0, 3, shared, ["a0", "a1", "a2"])
+        toksB = shared + list(range(9000, 9000 + 3 * BS))   # 前缀同, 后缀异
+        # B 一块没存 → 前 3 块靠 A 命中, 后 3 块是洞
+        assert store.find_gaps(toksB) == (6, [(3, 6)])
+
+    def test_python_fallback_matches_c(self, tmp_path, monkeypatch):
+        import vllm.v1.core.sched.licht_v3.arena_lru_store as M
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100)
+        toks = _toks(8)
+        store.write_inc("j", 0, 2, toks, ["b0", "b1"])
+        store.write_inc("j", 5, 8, toks, ["b5", "b6", "b7"])  # 洞 [2,5)
+        c_res = store.find_gaps(toks)
+        monkeypatch.setattr(M, "_HAS_C_FINDGAPS", False)       # 强制 Python 路径
+        py_res = store.find_gaps(toks)
+        assert c_res == py_res == (8, [(2, 5)])
+
+    def test_non_content_addr_returns_none(self, tmp_path, monkeypatch):
+        store, _, _ = _make_store(tmp_path, monkeypatch, num_slots=100,
+                                  content=False)
+        assert store.find_gaps(_toks(4)) is None      # 退回旧增量逻辑

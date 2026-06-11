@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 # Stage 6 perf: 整条 lookup_resolve 是否有 C 实现 (旧 .so 没有则回退 Python).
 _HAS_C_LOOKUP = hasattr(_atomic, "lookup_resolve")
+_HAS_C_FINDGAPS = hasattr(_atomic, "find_gaps")
 
 _MANIFEST = "manifest.json"
 _RESERVED_DIR_PREFIXES = ("_", ".")  # 不当作 job 处理的目录前缀
@@ -603,7 +604,10 @@ class LruArenaStore:
             # in-memory LRU 状态在临界区内更新 (alloc_mutex 保护): 同进程多
             # store 线程争同一 mutex, 保证 _last_stored / _job_lru 不竞争.
             # (evict 的 self-heal 也在 alloc_mutex 内改这俩, 顺序一致.)
-            self._last_stored[job_id] = end_block
+            # 高水位 max: 补洞会写中间段 (end_block < 当前), 写只增不减; 仅淘汰
+            # self-heal 才回退. 旧逻辑只写连续尾段 (end_block>=last), 赋值即 max.
+            self._last_stored[job_id] = max(
+                self._last_stored.get(job_id, 0), end_block)
             self._touch_job_lru(job_id)   # 移到 LRU 末尾 (最新)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
@@ -846,7 +850,10 @@ class LruArenaStore:
                 _atomic.publish_slot(self._hdr.slot_state_addr(slot), new_gen)
                 # ★ 把发布 gen 写进 hash entry, 供跨 job load 的 try_pin 校验
                 _atomic.ht_set_gen(ht_base, ht_cap, h, new_gen)
-            self._last_stored[job_id] = end_block
+            # 高水位 max: 补洞会写中间段 (end_block < 当前), 写只增不减; 仅淘汰
+            # self-heal 才回退. 旧逻辑只写连续尾段 (end_block>=last), 赋值即 max.
+            self._last_stored[job_id] = max(
+                self._last_stored.get(job_id, 0), end_block)
             self._touch_job_lru(job_id)
         finally:
             _atomic.mutex_unlock(self._hdr.mutex_addr)
@@ -1162,6 +1169,54 @@ class LruArenaStore:
             return None
         return nb * bs, nb, slot_gen
 
+    def find_gaps(self, prompt_token_ids: List[int]
+                  ) -> Optional[Tuple[int, List[Tuple[int, int]]]]:
+        """找 [0, n_full) 里所有【缺失块】的连续区间 (content_addr 专用)。
+
+        与 lookup_resolve 同套链式 hash + gen/refcnt 校验, 但走完整条、收集
+        所有缺口段 (lookup 只返第一段连续前缀)。store 用它"缺哪补哪", 不再信
+        增量边界 _last_stored —— 这样无论中间块怎么被淘, 都能精确补回。
+
+        返回 (n_full, [(start, end), ...]); 非 content_addr 返回 None (调用方
+        退回旧增量逻辑)。
+        """
+        if not self._content_addr:
+            return None
+        bs = self._block_size
+        n_full = len(prompt_token_ids) // bs
+        if n_full <= 0:
+            return (0, [])
+        if _HAS_C_FINDGAPS:
+            n_tok = n_full * bs
+            tok_bytes = struct.pack("<%dI" % n_tok, *prompt_token_ids[:n_tok])
+            nf, ranges = _atomic.find_gaps(
+                self._ht_base, self._ht_cap,
+                self._hdr.slot_state_addr(0),
+                self._hdr.slot_refcnt_addr(0),
+                self._num_slots, tok_bytes, bs, SEED0)
+            return (int(nf), [(int(s), int(e)) for (s, e) in ranges])
+        # Python fallback (旧 .so / 无 C find_gaps)
+        hashes = block_hashes(prompt_token_ids, bs, n_full)
+        gaps: List[Tuple[int, int]] = []
+        gap_start = -1
+        for i in range(n_full):
+            slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap,
+                                          hashes[i])
+            present = (slot >= 0 and egen != 0
+                       and _atomic.get_gen(self._hdr.slot_state_addr(slot))
+                       == egen
+                       and _atomic.refcnt_get(
+                           self._hdr.slot_refcnt_addr(slot)) > 0)
+            if not present:
+                if gap_start < 0:
+                    gap_start = i
+            elif gap_start >= 0:
+                gaps.append((gap_start, i))
+                gap_start = -1
+        if gap_start >= 0:
+            gaps.append((gap_start, n_full))
+        return (n_full, gaps)
+
     def load_pin_explicit(self, slot_gen_list: List[Tuple[int, int]],
                           dst_block_ids: List[int]) -> Optional[LoadHandle]:
         """按显式 (slot, gen) 列表 pin (跨 job load).
@@ -1372,8 +1427,14 @@ class LruArenaStore:
                     committed = int(m.get("total_blocks", 0)) if m else 0
                 evicted_keys: List[Tuple[int, int]] = []   # 已淘的 (s,e), 末尾从索引剔
                 for (s, e, records) in reversed(inc_list):   # tail-first
-                    if gained >= need or e > committed:
+                    if gained >= need:
                         continue
+                    if e > committed:
+                        # ★ 尾段在 committed 边界之上 (未提交/半写). tail-first 下
+                        # 不能跳过它去淘【下方已提交的段】—— 那会在保留的尾段下面
+                        # 留一个洞, lookup 链式匹配走到洞就断 (= SHORT 死因之一).
+                        # 到此为止, 这个 victim 不再往下淘 (换下个 victim).
+                        break
                     if records is None:                      # 损坏 .slot
                         try:
                             os.unlink(self._slot_path(victim, s, e))
