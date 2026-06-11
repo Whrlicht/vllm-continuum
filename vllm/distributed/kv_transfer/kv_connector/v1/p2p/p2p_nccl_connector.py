@@ -301,6 +301,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # 超时未就绪就放弃 arena、退回 NCCL, 并标 failed 防再次 sink.
         self._arena_sink_ts: dict[str, float] = {}
         self._arena_sink_failed: set[str] = set()
+        # ★ 诊断(节流): 记每个 sink 请求上次打 arena-probe 日志的时刻, 用于区分
+        #   "数据被淘(matched<need)" vs "数据在却没 admit(matched>=need)"。
+        self._arena_probe_log_ts: dict[str, float] = {}
         self._arena_sink_deadline_s = float(
             _os.environ.get("LICHT_ARENA_SINK_DEADLINE_S", "30"))
         # Worker-side store-completion is tracked inside RoundKVStore
@@ -1170,11 +1173,25 @@ p2p_nccl_engine import get_fast_release_queue
             if job_id:
                 res = self._round_store_obj.lookup(
                     str(job_id), request.prompt_token_ids)
+                # 整份齐 = arena 命中块覆盖整个 prompt 的完整块数.
+                _need_blk = (len(request.prompt_token_ids)
+                             // self._block_size)
+                _mb = res[1] if res is not None else -1
+                # ★ 诊断(每请求每 5s 一条): 区分 sink 请求死法 —
+                #   一直 matched<need → 数据缺(被淘/没写齐) = pin/淘汰问题;
+                #   一直 matched>=need 却没 admit → 数据在却 admit 不上 = 调度问题。
+                _now = time.time()
+                if _now - self._arena_probe_log_ts.get(
+                        request.request_id, 0.0) > 5.0:
+                    self._arena_probe_log_ts[request.request_id] = _now
+                    logger.info(
+                        "Phase2 arena-probe req=%s job=%s matched_blk=%d "
+                        "need=%d verdict=%s", request.request_id,
+                        str(job_id)[:40], _mb, _need_blk,
+                        ("MISS" if res is None else
+                         ("FULL" if _mb >= _need_blk else "SHORT")))
                 if res is not None:
                     matched_tokens, matched_blocks = res
-                    # 整份齐 = arena 命中块覆盖整个 prompt 的完整块数.
-                    _need_blk = (len(request.prompt_token_ids)
-                                 // self._block_size)
                     if matched_blocks >= _need_blk:
                         ext = matched_tokens - num_computed_tokens
                         return max(0, ext), False   # 齐 → admit-from-arena

@@ -1930,6 +1930,12 @@ class Scheduler(SchedulerInterface):
                     and self.connector is not None
                     and hasattr(self.connector, "mark_arena_sink")):
                 for _wreq in self.waiting:
+                    # ★ 跳过 KV 已就绪的请求(num_computed_tokens>0 = post-NCCL,
+                    #   KV 已搬进 decode 显存、bridge 已被消费)。再标 sink 只会
+                    #   发个扑空的 ARENA_SINK RPC(declined 噪声)且毫无意义 ——
+                    #   它马上就能从本地 admit, 不需要 prefill 下沉。
+                    if _wreq.num_computed_tokens > 0:
+                        continue
                     try:
                         self.connector.mark_arena_sink(_wreq)
                     except Exception:  # pragma: no cover

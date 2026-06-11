@@ -383,13 +383,16 @@ class LruArenaStore:
             fd = os.open(self._inflight_path(job_id),
                          os.O_CREAT | os.O_WRONLY, 0o644)
             os.close(fd)
-        except Exception:
-            pass
+            logger.info("MARK-INFLIGHT job=%s path=%s",  # ★诊断
+                        job_id, self._inflight_path(job_id))
+        except Exception as _e:
+            logger.warning("MARK-INFLIGHT FAILED job=%s: %s", job_id, _e)  # ★诊断
 
     def clear_inflight(self, job_id: str) -> None:
         """清在途标记: job 重新可淘。幂等(不存在无害)。绝不按超时强制清。"""
         try:
             os.unlink(self._inflight_path(job_id))
+            logger.info("CLEAR-INFLIGHT job=%s", job_id)  # ★诊断(只有真删掉才记)
         except FileNotFoundError:
             pass
         except Exception:
@@ -511,6 +514,12 @@ class LruArenaStore:
         if self._data_writer is None:
             logger.warning("write_inc: data_writer not bound, skipping")
             return False
+        # ★诊断: 记每次 write 的范围 + 之前的 committed 边界 (查"重复写覆盖"假设:
+        #   死亡轮 D2H 写 [0,N) 后, 有没有一次更小范围的 write 把 committed 压回去)
+        logger.info("WRITE-INC job=%s range=[%d,%d) last_before=%s inflight=%s",
+                    str(job_id)[:40], start_block, end_block,
+                    self._last_stored.get(job_id),
+                    os.path.exists(self._inflight_path(job_id)))
         self._ensure_bg_evictor()   # Phase 1a: 写端惰性启动后台 evictor
 
         # ★ Stage 6: 内容寻址 dedup 路径 (probe hash 表, 命中复用不新分配)
@@ -1597,7 +1606,17 @@ class LruArenaStore:
         写的 slot.
         """
         # ★ 在途保护(兜底): 万一 victim 选择漏过, 这里再挡一道 —— 在途 job 一份不淘。
-        if self.is_inflight(job_id):
+        # ★诊断(节流, 每 job 每 3s): 看淘汰这一刻本进程到底看没看到 .inflight、路径是啥
+        _ipath = self._inflight_path(job_id)
+        _inf = os.path.exists(_ipath)
+        _elog = getattr(self, "_evict_log_ts", None)
+        if _elog is None:
+            _elog = self._evict_log_ts = {}
+        if time.time() - _elog.get(job_id, 0.0) > 3.0:
+            _elog[job_id] = time.time()
+            logger.info("EVICT-PROBE job=%s inflight=%s path=%s",
+                        job_id, _inf, _ipath)
+        if _inf:
             return 0
         # ★ Phase 1b: 抢 job claim (锁内兜底路径也要, 这正是跨进程 file fallback
         # double-decref 的高发处). 抢不到 = 别人在淘 → 跳过 (返 0, 调用方挑下一个).
@@ -1737,6 +1756,12 @@ class LruArenaStore:
                 "(cum freed=%d decref=%d)",
                 str(job_id)[:32], s, e, freed, left_pinned,
                 self._stat_evict_freed, self._stat_evict_decref)
+        # ★诊断(无条件): 真正释放/跳过 slot 时记一条 —— 定位 SHORT 死的数据
+        #   被谁/何时淘的。能走到这说明 _evict_job_tail_first 的 is_inflight 已放行
+        #   (=本进程没看到 .inflight), 所以这里就是"在途保护失效"的现场。
+        if freed or left_pinned:
+            logger.info("FREED job=%s inc=[%d,%d) freed=%d pinned=%d",
+                        str(job_id)[:40], s, e, freed, left_pinned)
         if left_pinned == 0:
             cur_last = self._last_stored.get(job_id, e)
             if s < cur_last:
