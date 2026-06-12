@@ -1184,12 +1184,26 @@ p2p_nccl_engine import get_fast_release_queue
                 if _now - self._arena_probe_log_ts.get(
                         request.request_id, 0.0) > 5.0:
                     self._arena_probe_log_ts[request.request_id] = _now
+                    _verdict = ("MISS" if res is None else
+                                ("FULL" if _mb >= _need_blk else "SHORT"))
                     logger.info(
                         "Phase2 arena-probe req=%s job=%s matched_blk=%d "
                         "need=%d verdict=%s", request.request_id,
-                        str(job_id)[:40], _mb, _need_blk,
-                        ("MISS" if res is None else
-                         ("FULL" if _mb >= _need_blk else "SHORT")))
+                        str(job_id)[:40], _mb, _need_blk, _verdict)
+                    # ★ 诊断: SHORT 时查清 block[matched] 到底为啥 miss
+                    #   (ht_miss/unpublished/gen_mismatch/refcnt0/PRESENT + 这个 job
+                    #    自己覆盖没覆盖这块) → 一眼锁定真因, 不再猜。
+                    if _verdict == "SHORT" and _mb >= 0:
+                        try:
+                            _why = self._round_store_obj.probe_block_reason(
+                                str(job_id), request.prompt_token_ids, _mb)
+                            logger.info(
+                                "Phase2 SHORT-WHY req=%s job=%s break_block=%d "
+                                "%s", request.request_id, str(job_id)[:40],
+                                _mb, _why)
+                        except Exception as _pe:
+                            logger.info("Phase2 SHORT-WHY probe failed req=%s: "
+                                        "%s", request.request_id, _pe)
                 if res is not None:
                     matched_tokens, matched_blocks = res
                     if matched_blocks >= _need_blk:

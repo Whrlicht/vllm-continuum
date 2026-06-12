@@ -655,6 +655,14 @@ class LruArenaStore:
         all_hashes = block_hashes(token_ids, self._block_size, end_block)
         if _prof:
             _seg['hash'] = (time.time() - _tp) * 1000.0; _tp = time.time()
+        # ★ 诊断: 记这段写入的【起/止块链式 hash】, 供和 lookup 的 hash 对账
+        #   (SHORT 断在 block N → 找 start_block=N 的 WROTE-H, 比 hS 与 SHORT-WHY 的
+        #   lookup hash: 一样=写过又没了(淘汰); 不一样=两端 token 口径不一致)。
+        if end_block > start_block and len(all_hashes) >= end_block:
+            logger.info("WROTE-H job=%s [%d,%d) hS=%08x hE=%08x",
+                        str(job_id)[:40], start_block, end_block,
+                        all_hashes[start_block] & 0xffffffff,
+                        all_hashes[end_block - 1] & 0xffffffff)
         if len(all_hashes) < end_block:
             logger.warning(
                 "dedup write_inc: token_ids 不足 job=%s end=%d have=%d",
@@ -1161,6 +1169,53 @@ class LruArenaStore:
         if nb <= 0:
             return None
         return nb * bs, nb, slot_gen
+
+    def probe_block_reason(self, job_id: str, prompt_token_ids: List[int],
+                           block_idx: int) -> Optional[dict]:
+        """★ 诊断: lookup 在 block_idx 断了, 查清到底为啥 (只读, 不改状态)。
+
+        返回 dict 含:
+          ht_reason: ht_miss / unpublished / gen_mismatch / refcnt0 / PRESENT
+                     (PRESENT = 这块明明在! 那 lookup_resolve 停这里是 bug / token 不一致)
+          hash/slot/egen/cur_gen/refcnt: block_idx 那块在哈希表里的实际状态
+          job_covers: 这个 job 自己的 inc 列表覆盖 block_idx 吗 (它以为自己存过?)
+            → ht_miss + job_covers=True  ⇒ 存过但表里没了 = 静默淘汰/复用
+            → ht_miss + job_covers=False ⇒ 这块这个 job 压根没存 = 写没写到这
+        """
+        if not self._content_addr or block_idx < 0:
+            return None
+        bs = self._block_size
+        hashes = block_hashes(prompt_token_ids, bs, block_idx + 1)
+        if len(hashes) <= block_idx:
+            return {"ht_reason": "no_hash", "block": block_idx}
+        h = hashes[block_idx]
+        slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+        cur_gen = rc = -1
+        if slot < 0:
+            reason = "ht_miss"
+        else:
+            cur_gen = _atomic.get_gen(self._hdr.slot_state_addr(slot))
+            rc = _atomic.refcnt_get(self._hdr.slot_refcnt_addr(slot))
+            if egen == 0:
+                reason = "unpublished"
+            elif cur_gen != egen:
+                reason = "gen_mismatch"
+            elif rc == 0:
+                reason = "refcnt0"
+            else:
+                reason = "PRESENT"
+        covers = False
+        try:
+            for (s, e, _p) in self._list_incs(str(job_id)):
+                if s <= block_idx < e:
+                    covers = True
+                    break
+        except Exception:
+            covers = None
+        return {"block": block_idx, "ht_reason": reason,
+                "hash": h & 0xffffffff, "slot": slot, "egen": egen,
+                "cur_gen": (cur_gen & 0xffff) if cur_gen >= 0 else -1,
+                "refcnt": rc, "job_covers": covers}
 
     def load_pin_explicit(self, slot_gen_list: List[Tuple[int, int]],
                           dst_block_ids: List[int]) -> Optional[LoadHandle]:

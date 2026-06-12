@@ -1831,6 +1831,18 @@ class RoundKVStore:
                 return None
         return matched_blocks * self.block_size, matched_blocks
 
+    def probe_block_reason(self, job_id: str, prompt_token_ids: list,
+                           block_idx: int):
+        """★ 诊断: 委托 LruArenaStore.probe_block_reason (lookup 断因)。"""
+        self._ensure_lookup_store()
+        if self._lru_store is None:
+            return None
+        try:
+            return self._lru_store.probe_block_reason(
+                str(job_id), list(prompt_token_ids), int(block_idx))
+        except Exception as e:  # pragma: no cover
+            return {"ht_reason": "probe_error", "err": str(e)[:60]}
+
     def _arena_valid_prefix_blocks(self, job_id: str) -> int:
         """Longest contiguous-from-0 block prefix of `job_id` whose backing
         slots are still valid in the ring (bump_base >= next_slot - num_slots).
