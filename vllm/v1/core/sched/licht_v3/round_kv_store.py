@@ -1366,6 +1366,15 @@ class RoundKVStore:
             last = self._last_stored.get(job_id)
             if last is None:
                 last = self._read_total_blocks(job_id)   # cross-restart
+            else:
+                # ★ 诊断 (Bug5 跨进程 _last_stored 相干): 内存 last 比共享 manifest
+                #   高 = 另一进程淘汰回退了 manifest, 但本进程内存没回退 → store 信
+                #   虚高 last → 跳过重补 [manifest, last) 这段被淘的块 → 永远缺。
+                _man = self._read_total_blocks(job_id)
+                if _man < last:
+                    logger.info(
+                        "STALE-LAST job=%s inmem=%d manifest=%d 会漏补[%d,%d)",
+                        str(job_id)[:40], last, _man, _man, last)
             end = align_blocks(len(token_ids), self.block_size)
             # ★ block_ids 可能短于累积 token 推出的块数 (多轮: token_ids 累积, 但
             # 本轮 block_ids 不含全部复用前缀块). 切片 block_ids[last:end] 会静默

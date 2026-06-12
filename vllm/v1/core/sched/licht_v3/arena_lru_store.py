@@ -1397,6 +1397,11 @@ class LruArenaStore:
                     break
                 if exclude_job_id is not None and victim == exclude_job_id:
                     continue
+                # ★ 修 (核心 bug): lock-free 预淘汰原来【漏了在途检查】, 直接遍历
+                #   _job_lru 淘 → pin (.inflight) 被绕过、在途 job 的块照淘 → SHORT。
+                #   补上 is_inflight 跳过 (与 _evict_job_tail_first/_pick_lru_victim 一致)。
+                if self.is_inflight(victim):
+                    continue
                 # inc 列表: 优先内存索引 [(s,e,records)], 缺则回退读 .slot 文件.
                 mem = self._job_slot_index.get(victim)
                 in_index = mem is not None
@@ -1438,6 +1443,17 @@ class LruArenaStore:
                     freed, left_pinned = self._evict_inc_apply_locked(
                         records)                            # 短锁原子释放
                     gained += freed
+                    # ★ 诊断: lock-free 路径原来没 FREED 日志(=之前 FREED=0 的盲区)。
+                    #   补一条, 并记淘的瞬间 in-flight 状态:
+                    #   - inflight=True → 修没生效/有 race (在途仍被淘);
+                    #   - inflight=False 但这 job 后来 SHORT → 内容在【非在途间隙】被淘
+                    #     (Bug6 时机问题: 跑动期写的块没保护)。
+                    if freed or left_pinned:
+                        logger.info(
+                            "FREED-LF job=%s inc=[%d,%d) freed=%d pinned=%d "
+                            "inflight=%s", str(victim)[:40], s, e, freed,
+                            left_pinned,
+                            os.path.exists(self._inflight_path(victim)))
                     if left_pinned == 0:
                         cur_last = self._last_stored.get(victim, e)
                         if s < cur_last:
