@@ -229,3 +229,8 @@ ep_kernels_workspace/
 
 /examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/continuum_exp
 /trace_data/
+# prefill scheduling / dynamic-chunk experiment (harness + results, not tracked)
+dynamic_chunk/
+!dynamic_chunk/calibrate_brb.py/
+!dynamic_chunk/brb_cache/
+idea/
