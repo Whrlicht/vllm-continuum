@@ -836,13 +836,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
         try:
             self._arena_sink_pending.add(request_id)
             self._arena_sink_decode_addr[request_id] = decode_zmq_address
-            self._round_store_obj.enqueue_store(
-                str(job_id), list(block_ids),
-                list(prompt_token_ids), request_id)
             # ★ 在途保护: sink 即给整个 job 打 .inflight 标记 → 淘汰跳过整 job,
             #   这一轮的 KV(及前缀)在 decode admit 拉走前不会被淘。admit /
             #   request_finished 时 clear。幂等/跨进程/不碰 pin 字段。
+            #   必须在 enqueue_store 之【前】mark: 写线程一开工 job 就已在途,
+            #   不给淘汰留 "已开始写但还没 mark" 的窗口。(decode 在 break->sink
+            #   时也已本地 mark 过 — 这里是幂等加固。)
             self._round_store_obj.mark_inflight(str(job_id))
+            # sink=True: 写失败/复核有洞 → 保留 GPU 块带退避重试, 直到整份
+            # 可见才 fast-release; 请求挂掉 (.inflight 被 decode 清) 才放弃。
+            self._round_store_obj.enqueue_store(
+                str(job_id), list(block_ids),
+                list(prompt_token_ids), request_id, sink=True)
             logger.info(
                 "ARENA_SINK enqueued req=%s job=%s nblk=%d decode=%s",
                 request_id, job_id, len(block_ids), decode_zmq_address)
@@ -1114,6 +1119,17 @@ p2p_nccl_engine import get_fast_release_queue
             str(_job), list(request.prompt_token_ids), _remote or "")
         self._arena_sinked.add(rid)
         self._arena_sink_ts[rid] = time.time()
+        # ★ 竞态修复 (moto8386 死法): 在 decode【决定 sink 的当下】就本地打
+        #   .inflight (共享 /dev/shm, 两侧 evictor 都看得到), 不等 ARENA_SINK
+        #   RPC 到 prefill 再 mark —— 原来这段空窗里 decode 自己的 evictor 可
+        #   把该 job 已存的前缀淘掉, 而 prefill 按 manifest 只补尾段 → 永久洞。
+        #   清除路径不变 (admit 拉走 / 请求挂掉时 clear), 幂等。
+        if (_job and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            try:
+                self._round_store_obj.mark_inflight(str(_job))
+            except Exception:  # pragma: no cover
+                pass
         logger.info(
             "Phase2 break->sink req=%s job=%s remote=%s ntoks=%d",
             rid, _job, _remote or "<none>", len(request.prompt_token_ids))

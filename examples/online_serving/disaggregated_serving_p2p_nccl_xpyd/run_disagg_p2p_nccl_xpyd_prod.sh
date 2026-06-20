@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="4"
-DECODE_GPUS="5"
+PREFILL_GPUS="6"
+DECODE_GPUS="7"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -71,7 +71,7 @@ ROUND_KV_RAW=true
 # --round-kv-arena-gb N sizes the arena (default 24; ring-evicts oldest when
 # full; prefill pays a one-time ~N/2 s cudaHostRegister at startup).
 ROUND_KV_ARENA=true
-ROUND_KV_ARENA_GB="256"
+ROUND_KV_ARENA_GB="400"
 # DIAGNOSTIC: drain the GPU before each round-kv load + time it, to tell
 # contention-with-prior-forward apart from op-inefficiency.  --round-kv-sync-first.
 ROUND_KV_SYNC_FIRST=false
@@ -79,6 +79,29 @@ ROUND_KV_SYNC_FIRST=false
 # ONE kernel launch (cuts CPU dispatch that starves the GPU in serving).
 # --round-kv-fused to enable (opt-in until serving-validated).
 ROUND_KV_FUSED=false
+# Stage 2 LRU arena (slot-paged bitmap alloc + per-job LRU + tail-first evict +
+# self-heal, cross-process mutex + reader pin). Replaces the FIFO ring arena.
+# --round-kv-lru to enable (opt-in until serving-validated).
+# 注意: 必须小写 "true" — 下面 export 的判断是 [[ ... == "true" ]], 大写 True
+# 不匹配会静默退回 FIFO arena (内容寻址 dedup 只在 LRU 路径生效, 会失效).
+ROUND_KV_LRU=true
+# Stage 6 内容寻址 dedup (LICHT_ARENA_CONTENT_ADDR): 全局 hash 表 + per-slot
+# refcnt, 跨 job 共享 prefix 只存一份 (store 命中 refcnt++ 不重复分配 slot, 不
+# 重复 D2H).  需 ROUND_KV_LRU=true.  prefill/decode 两端由同一 export 继承,
+# 取值自动一致 (两端必须相同, 否则 .slot v1/v2 不匹配会毁数据).  默认关;
+# --arena-content-addr 开启.  调试看 dedup 命中率: 额外 export LICHT_ARENA_DEBUG=1.
+ARENA_CONTENT_ADDR=false
+NO_ARENA_CONTENT_ADDR=false   # --no-arena-content-addr: opt out even under --licht-v3
+# decode(consumer)也 cudaHostRegister arena → 走直读 kernel(无 GPU staging).
+# 默认开. 关掉则 consumer 复用 load 走逐请求 staging, 把整段前缀一次性搬上 GPU,
+# 长前缀(SWE-bench 等)在 gpu-mem-util~0.95 下 OOM(load_request CUDA OOM 刷屏).
+# 代价: decode 启动多付一次 cudaHostRegister(256GB arena ~分钟级) + 双向 pin.
+# --no-arena-consumer-direct 退回旧 consumer-mmap-only.
+ARENA_CONSUMER_DIRECT=true
+# P2 提带宽: mbind(MPOL_INTERLEAVE) 把 256GB arena 摊到所有 NUMA 节点, 缓解单节点
+# 内存控制器饱和 (大复用 load 读 + store 写争用). 默认关 (拓扑相关, 单 GPU DMA 可能
+# 跨 socket 反略降, 建议 A/B). --arena-numa-interleave 开.
+ARENA_NUMA_INTERLEAVE=false
 # Bind each worker to its GPU's local NUMA node (numactl) so pinned buffers
 # and H2D transfers are node-local (~2x H2D on multi-socket boxes).  Defaults
 # ON under --licht-v3; disable with --no-numa-bind, or force on standalone
@@ -98,6 +121,23 @@ SEED=1024
 LICHT=false
 LICHT_V2=false
 LICHT_V3=false
+# --prefill-opt: FINAL optimal prefill stack (all env-gated, prefill-only):
+#   shorts-first longcap_fcfs : shorts get priority + are UNcapped; longs capped
+#       to <= theta footprint (LICHT_LONGCAP_ORDER=short + LICHT_LONG_THETA).
+#   C=5120 boundary           : short/long split (LICHT_LONG_C; also drives the
+#       dynamic_chunk cstar).
+#   reservation               : oldest waiting long gets a reserved slot so a
+#       short flood can't starve it (LICHT_LONG_RESV=1).
+#   FCFS-break                : a long that can't be admitted STOPS the long lane
+#       (strict FCFS among longs; younger longs can't jump it) -> fixes the
+#       big-prefix-long starvation (max 230->148) (LICHT_LONGCAP_FCFS_BREAK=1).
+#   dynamic_chunk (dynC)      : per-step chunk size from the calibrated beta_r/b
+#       (LICHT_DYN_CHUNK=C + LICHT_DYN_BRB_FILE).
+# vs fcfs: p50 47->3s (15x), p99/max higher (longs wait). Requires the LICHT-V2
+# timeline scheduler (auto-enabled below). Off = no change to scheduling.
+PREFILL_OPT=false
+PREFILL_OPT_THETA=0.3        # long-lane KV ceiling (head-of-line safe; sweep best)
+PREFILL_OPT_LONGC=5120       # short/long boundary C (sweep best for break stack)
 
 WAIT_TIMEOUT_SECONDS=1200
 SHUTDOWN_GRACE_SECONDS=20
@@ -151,6 +191,15 @@ Options:
                                pure-H2D (DMA) vs H2D+scatter (SM) bandwidth
                                available during the real forward.  Look for
                                'round-kv HBM-PROBE:' in the log.  Turn off after.
+  --arena-content-addr         Stage 6 内容寻址 dedup: 跨 job 共享 prefix 只存一
+                               份 (hash 表 + refcnt).  需 --round-kv-lru.  两端
+                               自动一致 (同一 export 继承).  默认关.
+  --no-arena-consumer-direct   decode 不 register arena (退回逐请求 staging).
+                               默认 decode 也 register 走直读 (无 staging, 避免
+                               长前缀复用 load 把整段搬 GPU 导致 CUDA OOM).
+  --arena-numa-interleave      mbind arena 跨 NUMA 节点摊内存带宽 (缓解大复用
+                               load 读 + store 写 争用单节点). 默认关, 拓扑相关,
+                               建议 A/B 实测.
   --numa-bind                  Bind each worker to its GPU's local NUMA node
                                (numactl) for faster pinned H2D.  Defaults ON
                                under --licht-v3.
@@ -274,6 +323,27 @@ while [[ $# -gt 0 ]]; do
       ROUND_KV_FUSED=true
       shift
       ;;
+    --round-kv-lru)
+      ROUND_KV_LRU=true
+      shift
+      ;;
+    --arena-content-addr)
+      ARENA_CONTENT_ADDR=true
+      shift
+      ;;
+    --no-arena-content-addr)
+      NO_ARENA_CONTENT_ADDR=true
+      ARENA_CONTENT_ADDR=false
+      shift
+      ;;
+    --no-arena-consumer-direct)
+      ARENA_CONSUMER_DIRECT=false
+      shift
+      ;;
+    --arena-numa-interleave)
+      ARENA_NUMA_INTERLEAVE=true
+      shift
+      ;;
     --numa-bind)
       NUMA_BIND=true
       shift
@@ -314,6 +384,14 @@ while [[ $# -gt 0 ]]; do
     --licht-v3)
       LICHT_V3=true
       shift
+      ;;
+    --prefill-opt)
+      PREFILL_OPT=true
+      shift
+      ;;
+    --prefill-opt-theta)
+      PREFILL_OPT_THETA="$2"
+      shift 2
       ;;
     --tool-predictor-dir)
       TOOL_PREDICTOR_DIR="$2"
@@ -416,7 +494,7 @@ export LICHT_PHASE1_SAVE_ON_PREEMPT=1
 # RELEASE-timeout/force-free pathology (prefill GPU blocked when decode
 # is full).  Default threshold 0.80.
 export LICHT_PHASE2_ADMISSION_GATE=1
-# export LICHT_PHASE2_GATE_THRESHOLD=0.80
+export LICHT_PHASE2_GATE_THRESHOLD=0.90
 if [[ "${ROUND_KV_RAW}" != "true" ]]; then
   export LICHT_ROUND_KV_RAW=0
 fi
@@ -431,6 +509,35 @@ if [[ "${ROUND_KV_SYNC_FIRST}" == "true" ]]; then
 fi
 if [[ "${ROUND_KV_FUSED}" == "true" ]]; then
   export LICHT_ROUND_KV_FUSED=1
+fi
+if [[ "${ROUND_KV_LRU}" == "true" ]]; then
+  export LICHT_ROUND_KV_LRU=1
+fi
+# --licht-v3 implies Stage-6 content-addr dedup ON by default (opt out with
+# --no-arena-content-addr).  Both ends inherit the same export -> stays
+# consistent (the hard requirement).
+if [[ "${LICHT_V3}" == "true" && "${NO_ARENA_CONTENT_ADDR}" != "true" \
+      && "${ARENA_CONTENT_ADDR}" != "true" ]]; then
+  ARENA_CONTENT_ADDR=true
+  echo "  (auto) --licht-v3 -> ARENA_CONTENT_ADDR=true"
+fi
+# Stage 6 内容寻址 dedup.  ★ 一次 export, prefill+decode 两个 setsid 子进程都
+# 继承同一值 (两端一致是硬要求).  仅在 LRU arena 路径生效.
+if [[ "${ARENA_CONTENT_ADDR}" == "true" ]]; then
+  if [[ "${ROUND_KV_LRU}" != "true" ]]; then
+    echo "WARN: --arena-content-addr 需要 --round-kv-lru (LRU arena), 当前 LRU 未开 → 内容寻址不会生效"
+  fi
+  export LICHT_ARENA_CONTENT_ADDR=1
+fi
+# decode 也 register arena 走直读 (默认开). 关掉 -> consumer 逐请求 staging.
+if [[ "${ARENA_CONSUMER_DIRECT}" == "true" ]]; then
+  export LICHT_ARENA_CONSUMER_DIRECT=1
+else
+  export LICHT_ARENA_CONSUMER_DIRECT=0
+fi
+# arena NUMA interleave (默认关, A/B 用). 两端同一 export 继承.
+if [[ "${ARENA_NUMA_INTERLEAVE}" == "true" ]]; then
+  export LICHT_ARENA_NUMA_INTERLEAVE=1
 fi
 
 if [[ ! -f "${PROXY_SCRIPT}" ]]; then
@@ -694,6 +801,10 @@ echo "  ROUND_KV_PROFILE=${ROUND_KV_PROFILE} (diagnostic load timing)"
 echo "  HBM_PROBE=${HBM_PROBE} (diagnostic HBM headroom probe)"
 echo "  ROUND_KV_ASYNC=${ROUND_KV_ASYNC} (async load, engine non-blocking)"
 echo "  ROUND_KV_RAW=${ROUND_KV_RAW} (contiguous .bin, no strided read)"
+echo "  ROUND_KV_LRU=${ROUND_KV_LRU} (stage2 slot-paged LRU arena)"
+echo "  ARENA_CONTENT_ADDR=${ARENA_CONTENT_ADDR} (stage6 跨 job dedup: hash表+refcnt)"
+echo "  ARENA_CONSUMER_DIRECT=${ARENA_CONSUMER_DIRECT} (decode 也 register arena 走直读, 防长前缀 staging OOM)"
+echo "  ARENA_NUMA_INTERLEAVE=${ARENA_NUMA_INTERLEAVE} (arena 跨 NUMA 摊带宽, A/B 用)"
 echo "  REQUEST_COMPLETION_TIMEOUT_S=${REQUEST_COMPLETION_TIMEOUT_S}"
 echo "  GET_RETRY_TIMEOUT_S=${GET_RETRY_TIMEOUT_S}"
 echo "  GET_RETRY_INTERVAL_S=${GET_RETRY_INTERVAL_S}"
@@ -781,6 +892,35 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
 
   NUMA_WRAP="$(numa_wrap_for_gpu "${gpu_id}")"
   [[ -n "${NUMA_WRAP}" ]] && echo "  prefill[$i]: numa-bind gpu ${gpu_id} via '${NUMA_WRAP}'"
+
+  # --prefill-opt: optimal prefill stack (longcap_fcfs + theta + dynamic_chunk).
+  # env-gated; needs the LICHT-V2 timeline (already on under --licht-v2/--licht-v3).
+  # export (NOT inline) so the backgrounded setsid vllm serve child inherits it.
+  if [[ "${PREFILL_OPT}" == "true" ]]; then
+    _brb_dir="${SCRIPT_DIR}/../../../dynamic_chunk/brb_cache"
+    # one-time fingerprint-cached beta_r/b calibration on this gpu (cache hit
+    # is instant; same-model gpus reuse the same json).
+    # pass the SERVED config so the fingerprint + calibration match the engine.
+    # LICHT_CAL_TP must match --tensor-parallel-size below (here: 1, one GPU per
+    # prefill worker). For TP>1 pass a comma list as the gpu arg + set TP.
+    _brb_file="$(LICHT_CAL_MODEL="${MODEL_PATH}" LICHT_CAL_DTYPE="${DTYPE}" \
+                 LICHT_CAL_MAXLEN="${MAX_MODEL_LEN}" \
+                 LICHT_CAL_GMU="${PREFILL_GPU_MEMORY_UTILIZATION}" \
+                 LICHT_CAL_TP=1 \
+                 python "${SCRIPT_DIR}/../../../dynamic_chunk/calibrate_brb.py" \
+                  "${gpu_id}" "${_brb_dir}" 2>/dev/null \
+                  | grep -oE 'BRB_RESULT_PATH=[^ ]+' | tail -1 | cut -d= -f2)"
+    export LICHT_SCHED_SCHEME=longcap_fcfs
+    export LICHT_LONGCAP_ORDER=short
+    export LICHT_LONG_THETA="${PREFILL_OPT_THETA}"
+    export LICHT_LONG_C="${PREFILL_OPT_LONGC}"
+    export LICHT_LONG_RESV=1
+    export LICHT_LONGCAP_FCFS_BREAK=1
+    export LICHT_DYN_CHUNK=C
+    [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
+    echo "  prefill[$i]: PREFILL_OPT on (shorts-first longcap_fcfs + theta=${PREFILL_OPT_THETA}"\
+         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + dynamic_chunk; brb=${_brb_file:-default216})"
+  fi
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
     --host 0.0.0.0 \
@@ -797,6 +937,12 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     > "prefill_prod_$((i + 1)).log" 2>&1 &
   PIDS+=("$!")
 done
+
+# prefill-opt env is prefill-only: clear before launching decode workers so
+# decode scheduling is untouched.
+if [[ "${PREFILL_OPT}" == "true" ]]; then
+  unset LICHT_SCHED_SCHEME LICHT_LONGCAP_ORDER LICHT_LONG_THETA LICHT_LONG_C LICHT_LONG_RESV LICHT_LONGCAP_FCFS_BREAK LICHT_DYN_CHUNK LICHT_DYN_BRB_FILE
+fi
 
 echo "Starting decode workers..."
 DECODE_PORTS=()

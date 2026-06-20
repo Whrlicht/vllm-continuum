@@ -140,15 +140,15 @@ def parse_args() -> ClientConfig:
                         help="Task dispatch strategy")
     parser.add_argument("--concurrency",
                         type=int,
-                        default=64,
+                        default=32,
                         help="Used in fixed mode")
     parser.add_argument("--jps",
                         type=float,
-                        default=1.0,
+                        default=3.0,
                         help="Poisson jobs per second")
     parser.add_argument("--poisson-max-concurrency",
                         type=int,
-                        default=64,
+                        default=48,
                         help="Concurrency cap in poisson mode")
 
     parser.add_argument("--temperature", type=float, default=0.0)

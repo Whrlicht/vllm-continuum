@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import bisect
 import math
 import os
 import queue as queue_mod
@@ -640,6 +641,72 @@ class Scheduler(SchedulerInterface):
         # because wait_start is stored as request.arrival_time which is
         # also wall-clock.  Mixing in time.monotonic() here would yield
         # garbage T_wait values.
+        # Experiment (env-gated by LICHT_SCHED_SCHEME): four admission/priority
+        # strategies for the chunk-scheduling study.  Default (unset) keeps the
+        # original round-based score below — no effect on normal runs.
+        _scheme = os.environ.get("LICHT_SCHED_SCHEME")
+        if _scheme:
+            C = max(request.num_tokens - request.num_computed_tokens, 1)
+            L = max(request.num_computed_tokens, 0)
+            base = math.log(L * C + C * C + 1.0)        # log(L*C + C^2)
+            if _scheme == "sjf":
+                return -base                            # shortest-job first
+            if _scheme == "fcfs":
+                return -request.arrival_time            # first-come first-serve
+            if _scheme == "hunger":                     # big-first + anti-starve
+                ws = self.licht_waiting_round_start_ts.get(
+                    request.request_id, request.arrival_time)
+                tmax = float(os.environ.get("LICHT_HUNGER_TMAX_S", "5"))
+                return base + max(now - ws - tmax, 0.0)
+            if _scheme == "sjf_hunger":                 # SJF + aging floor for big
+                ws = self.licht_waiting_round_start_ts.get(
+                    request.request_id, request.arrival_time)
+                tmax = float(os.environ.get("LICHT_HUNGER_TMAX_S", "5"))
+                return -base + max(now - ws - tmax, 0.0)
+            if _scheme == "fsp":                        # Fair Sojourn Protocol approx:
+                # serve earliest fair-share (PS) completion first = arrival +
+                # beta * work.  Near-SRPT mean + no job worse than fair-share
+                # (no starvation), and does NOT degenerate to FCFS.
+                W = C * request.num_tokens              # work ~ C*(L+C)
+                beta = float(os.environ.get("LICHT_FSP_BETA", "1e-7"))
+                return -(request.arrival_time + beta * W)
+            if _scheme == "sjf_deadline":               # SJF + slowdown-deadline
+                W = C * request.num_tokens
+                ws = self.licht_waiting_round_start_ts.get(
+                    request.request_id, request.arrival_time)
+                theta = float(os.environ.get("LICHT_DEADLINE_THETA", "1e-6"))
+                if (now - ws) >= theta * W:              # slowdown cap hit -> boost
+                    return 1e12 + (now - ws)             # most-overdue first
+                return -base                             # else SJF
+            if _scheme == "wsjf":                        # HRRN response ratio
+                W = C * request.num_tokens
+                ws = self.licht_waiting_round_start_ts.get(
+                    request.request_id, request.arrival_time)
+                gamma = float(os.environ.get("LICHT_WSJF_GAMMA", "1e-7"))
+                S = max(gamma * W, 1e-6)
+                return (now - ws + S) / S                # (wait+service)/service
+            if _scheme in ("longcap_sjf", "longcap_fcfs"):
+                thr = int(os.environ.get("LICHT_LONG_C", "5120"))
+                # LICHT_LONGCAP_ORDER: "long" (default) = longs-first (longs FCFS
+                # admitted first up to theta, shorts fill rest); "short" = the old
+                # shorts-first (shorts top band, longs below). Diagnostic toggle.
+                _order = os.environ.get("LICHT_LONGCAP_ORDER", "long")
+                if _order == "short":
+                    if C > thr:                          # long: below shorts
+                        return -request.arrival_time
+                    if _scheme == "longcap_sjf":         # short: SJF, top band
+                        return 1e9 - base
+                    return 1e9 - request.arrival_time    # short: FCFS, top band
+                if C > thr:                              # LONG: FCFS, scheduled
+                    return 2e9 - request.arrival_time    #   FIRST up to theta cap
+                if _scheme == "longcap_sjf":             # short: SJF, fills rest
+                    return -base
+                return -request.arrival_time             # short: FCFS, fills rest
+            if _scheme == "sjf_reservation":             # SJF + reserve head big job
+                if request.request_id == getattr(self, "_resv_head_id", None):
+                    return 1e12                          # reserved head big -> top
+                return -base
+            return base                                 # "guard"/default: big-first
         ki = max(request.agent_round, 0)
         wait_start = self.licht_waiting_round_start_ts.get(
             request.request_id,
@@ -658,6 +725,92 @@ class Scheduler(SchedulerInterface):
         round_decay = (1.0 + ki) ** (-self.LICHT_PREFILL_ROUND_DECAY_ALPHA)
         return (self.LICHT_PREFILL_SCORE_A * math.log1p(ki)
                 + self.LICHT_PREFILL_SCORE_B * round_decay * wait_term)
+
+    # ---- Dynamic chunk (env-gated LICHT_DYN_CHUNK in {A,B,C,D}) -------------
+    # Picks each long request's per-step chunk by balancing future KV re-read
+    # (∝ 1/c) against the drag a longer step puts on shorter/waiting requests.
+    #   A: c_i = sqrt(brb * C_i / (N_total-2))          (per-req, lumped victims)
+    #   B: c_i = sqrt(brb * C_i / N_short(i))           (per-req, SRPT victims)
+    #   C: S   = sqrt(brb * Σ D_iC_i / (W_t * Σ D_i))   (batch S, lumped W_t)
+    #   D: S   = sqrt(brb * Σ D_iC_i / Σ N_short(i)D_i)  (batch S, SRPT victims)
+    # brb = beta_r/b (tokens).  Short reqs (rem<=C*) never chunked.
+    def _licht_dyn_precompute(self) -> None:
+        self._dyn_mode = os.environ.get("LICHT_DYN_CHUNK")
+        if self._dyn_mode not in ("A", "B", "C", "D"):
+            return
+        # brb = beta_r/b (tokens). Prefer a startup-calibrated value from a
+        # json file (LICHT_DYN_BRB_FILE, written by the boot calibration
+        # microbench) -> else env LICHT_DYN_BRB -> else default. Cached once.
+        _cb = getattr(self, "_dyn_brb_cached", None)
+        if _cb is None:
+            _cb = float(os.environ.get("LICHT_DYN_BRB", "216"))  # A800 calib fallback
+            _bf = os.environ.get("LICHT_DYN_BRB_FILE")
+            if _bf and os.path.exists(_bf):
+                try:
+                    _cb = float(json.load(open(_bf))["brb"])
+                    logger.info("dynamic_chunk: loaded calibrated brb=%.1f "
+                                "from %s", _cb, _bf)
+                except Exception as _e:
+                    logger.warning("brb file load failed (%s); using %.1f",
+                                   _e, _cb)
+            self._dyn_brb_cached = _cb
+        self._dyn_brb = _cb
+        # cstar (dynamic short/long boundary) IS the same concept as the longcap
+        # LICHT_LONG_C boundary -> default to it so one knob moves both; an
+        # explicit LICHT_DYN_CSTAR still overrides if you want them to differ.
+        self._dyn_cstar = int(os.environ.get(
+            "LICHT_DYN_CSTAR", os.environ.get("LICHT_LONG_C", "5120")))
+        self._dyn_floor = int(os.environ.get("LICHT_DYN_FLOOR", "256"))
+        cstar = self._dyn_cstar
+        rema = []                 # remaining new-prefill tokens, all in-system
+        longs = []                # (C_i, D_i) for long reqs (rem > cstar)
+        for r in list(self.running) + list(self.waiting):
+            rem = r.num_tokens - r.num_computed_tokens
+            if rem > 0:
+                rema.append(rem)
+                if rem > cstar:
+                    longs.append((rem, r.num_computed_tokens))
+        self._dyn_ntotal = len(rema)
+        self._dyn_wt = sum(1 for x in rema if x <= cstar)   # short victims
+        self._dyn_sorted = sorted(rema)
+        self._dyn_S = 0
+        if self._dyn_mode in ("C", "D") and longs:
+            sum_DC = sum(D * C for C, D in longs)
+            if self._dyn_mode == "C":
+                denom = max(self._dyn_wt, 1) * max(sum(D for C, D in longs), 1)
+            else:
+                denom = max(sum(self._dyn_nshort(C) * D for C, D in longs), 1)
+            self._dyn_S = self._dyn_clamp(
+                math.sqrt(self._dyn_brb * sum_DC / denom), None)
+
+    def _dyn_nshort(self, remaining: int) -> int:
+        return bisect.bisect_left(self._dyn_sorted, remaining)
+
+    def _dyn_clamp(self, c: float, remaining) -> int:
+        c = int(c) // 16 * 16                  # align to 16-token KV block
+        c = max(c, self._dyn_floor)
+        if remaining is not None:
+            c = min(c, remaining)
+        return c
+
+    def _licht_dyn_cap(self, request: Request, remaining: int) -> int:
+        # 0 = no cap (run whole).  When disabled, fall back to the static
+        # global threshold so existing behaviour is byte-for-byte unchanged.
+        mode = getattr(self, "_dyn_mode", None)
+        if mode not in ("A", "B", "C", "D"):
+            return self.scheduler_config.long_prefill_token_threshold
+        if remaining <= self._dyn_cstar:       # short request: never chunk
+            return 0
+        if mode == "A":
+            denom = max(self._dyn_ntotal - 2, 1)
+            return self._dyn_clamp(
+                math.sqrt(self._dyn_brb * remaining / denom), remaining)
+        if mode == "B":
+            denom = max(self._dyn_nshort(remaining), 1)
+            return self._dyn_clamp(
+                math.sqrt(self._dyn_brb * remaining / denom), remaining)
+        # C / D: one batch-shared S
+        return min(self._dyn_S, remaining) if self._dyn_S > 0 else 0
 
     def _peek_waiting_request(self) -> Request:
         if self.licht_prefill_sched_enabled:
@@ -982,6 +1135,84 @@ class Scheduler(SchedulerInterface):
         self._licht_v2_future_free = future_free
         self._licht_v2_future_alloc = future_alloc
 
+        # guard scheme: when small (1-step, C<=chunk) requests are waiting,
+        # reserve KV for their footprint so big (multi-step) requests can't fill
+        # all blocks and starve them.  Reserve = K * largest waiting-small
+        # footprint (block) — small reqs free their KV after 1 step so the
+        # reserve recycles.  Computed once per step.
+        self._licht_guard_reserve = 0
+        if os.environ.get("LICHT_SCHED_SCHEME") == "guard":
+            # "small" is a FIXED token threshold (decoupled from chunk_size, so
+            # the guard works with coarse chunks too).  Reserve = K * largest
+            # waiting-small footprint; smalls free their KV fast so it recycles.
+            small_c = int(os.environ.get("LICHT_GUARD_SMALL_C", "1024"))
+            K = int(os.environ.get("LICHT_GUARD_K", "2"))
+            bs = self.block_size
+            mx = 0
+            for w in self.waiting:
+                rem = w.num_tokens - w.num_computed_tokens
+                if 0 < rem <= small_c:                  # small = new tokens <= SMALL_C
+                    fb = (w.num_tokens + bs - 1) // bs   # footprint L+C in blocks
+                    if fb > mx:
+                        mx = fb
+            self._licht_guard_reserve = K * mx
+
+        # sjf_reservation: find the oldest waiting big (C>thr) job; reserve its
+        # KV footprint against other admits so it isn't starved (SLURM backfill).
+        self._resv_head_id = None
+        self._resv_head_blk = 0
+        if os.environ.get("LICHT_SCHED_SCHEME") == "sjf_reservation":
+            thr = int(os.environ.get("LICHT_LONG_C", "5120"))
+            bs = self.block_size
+            best = None
+            for w in self.waiting:
+                if (w.num_tokens - w.num_computed_tokens) > thr:
+                    if best is None or w.arrival_time < best.arrival_time:
+                        best = w
+            if best is not None:
+                self._resv_head_id = best.request_id
+                self._resv_head_blk = (best.num_tokens + bs - 1) // bs
+
+        # longcap reservation-backfill (LICHT_LONG_RESV=1): give the oldest
+        # waiting BIG request (C>thr) a future slot T* (earliest step where the
+        # timeline frees enough blocks), so small backfill can't endlessly
+        # steal its space.  Only when it's blocked by CAPACITY (timeline) and
+        # NOT by theta (theta-block is intentional throttling -> let it wait).
+        self._resv2_id = None
+        self._resv2_blk = 0
+        self._resv2_T = 0
+        _sch2 = os.environ.get("LICHT_SCHED_SCHEME")
+        if (_sch2 in ("longcap_sjf", "longcap_fcfs")
+                and os.environ.get("LICHT_LONG_RESV") == "1"):
+            thr = int(os.environ.get("LICHT_LONG_C", "5120"))
+            bs = self.block_size
+            ff = self._licht_v2_future_free
+            best = None
+            for w in self.waiting:
+                if (w.num_tokens - w.num_computed_tokens) > thr:
+                    if best is None or w.arrival_time < best.arrival_time:
+                        best = w
+            if best is not None:
+                F_big = (best.num_tokens + bs - 1) // bs
+                # theta-block? (long lane already full) -> no reservation.
+                _theta = os.environ.get("LICHT_LONG_THETA")
+                theta_blocked = False
+                if _theta is not None:
+                    cur_long = sum(
+                        (r.num_tokens + bs - 1) // bs for r in self.running
+                        if (r.num_tokens - r.num_computed_tokens) > thr)
+                    theta_blocked = (cur_long > 0 and
+                                     cur_long + F_big >
+                                     float(_theta) * self._total_kv_blocks)
+                # only reserve if it can't fit NOW but CAN within the horizon.
+                if not theta_blocked and ff and ff[0] < F_big:
+                    for t in range(len(ff)):
+                        if ff[t] >= F_big:
+                            self._resv2_id = best.request_id
+                            self._resv2_blk = F_big
+                            self._resv2_T = t
+                            break
+
     def _licht_v2_count_long_running(self) -> int:
         """Count running prefill requests with R(i) > N (long-tail).
 
@@ -1041,6 +1272,88 @@ class Scheduler(SchedulerInterface):
         threshold = (int(self.LICHTV2_LONG_TAIL_HEADROOM_RATIO
                          * self._total_kv_blocks)
                      if long_tail else 0)
+        # guard scheme: a big candidate (new tokens > SMALL_C) must leave the
+        # small-request reserve free so waiting small requests don't starve.
+        if os.environ.get("LICHT_SCHED_SCHEME") == "guard":
+            small_c = int(os.environ.get("LICHT_GUARD_SMALL_C", "1024"))
+            if request.num_tokens - num_computed_at_admit > small_c:
+                threshold = max(threshold, getattr(self, "_licht_guard_reserve", 0))
+        _sch = os.environ.get("LICHT_SCHED_SCHEME")
+        if _sch in ("longcap_sjf", "longcap_fcfs"):
+            # Cap the LONG (C>thr) lane.  Only long candidates are checked here;
+            # short reqs are never blocked by this (they use whatever the
+            # feasibility guards below allow -> no (1-theta) floor reservation).
+            thr = int(os.environ.get("LICHT_LONG_C", "5120"))
+            _is_long = request.num_tokens - num_computed_at_admit > thr
+            _short_cap = os.environ.get("LICHT_SHORT_CAP") == "1"
+            if _is_long and not _short_cap:
+                # DEFAULT mode: cap the LONG lane (theta/N); shorts uncapped.
+                # aging (LICHT_LONG_AGE_S): a long that has waited longer than
+                # T_age bypasses the theta cap -> bounds the worst-case long
+                # wait (pulls p99 down) while theta stays tight for the common
+                # case (keeps p50 low).  off when env unset.
+                _age = os.environ.get("LICHT_LONG_AGE_S")
+                _aged = False
+                if _age is not None:
+                    ws = self.licht_waiting_round_start_ts.get(
+                        request.request_id, request.arrival_time)
+                    if (time.time() - ws) >= float(_age):
+                        _aged = True
+                _theta = os.environ.get("LICHT_LONG_THETA")
+                if _aged:
+                    pass                                 # aged -> skip theta cap
+                elif _theta is not None:
+                    # theta: long reqs may collectively hold <= theta * total KV.
+                    bs = self.block_size
+                    cur = sum((r.num_tokens + bs - 1) // bs for r in self.running
+                              if (r.num_tokens - r.num_computed_tokens) > thr)
+                    cand = (request.num_tokens + bs - 1) // bs
+                    # theta gates STACKING extra longs, but never blocks the
+                    # head-of-line long when the lane is empty (cur==0) -> a
+                    # request bigger than theta*total still runs (alone), so no
+                    # permanent starvation; feasibility guard below keeps safety.
+                    if cur > 0 and cur + cand > float(_theta) * self._total_kv_blocks:
+                        return False
+                else:
+                    Nlong = int(os.environ.get("LICHT_LONG_N", "2"))
+                    nbig = sum(1 for r in self.running
+                               if (r.num_tokens - r.num_computed_tokens) > thr)
+                    if nbig >= Nlong:
+                        return False
+            elif (not _is_long) and _short_cap:
+                # SHORT-CAP mode (mirror of longs-first): shorts get priority but
+                # collectively hold <= (1-theta) * total KV.  Longs are UNCAPPED
+                # (theta not applied to them) and take whatever shorts leave
+                # (>= theta), so a short flood can never starve longs.  head-of-
+                # line safe: when no short is running (cur_s==0) admit anyway.
+                _theta_s = os.environ.get("LICHT_LONG_THETA")
+                if _theta_s is not None:
+                    bs = self.block_size
+                    cur_s = sum((r.num_tokens + bs - 1) // bs for r in self.running
+                                if (r.num_tokens - r.num_computed_tokens) <= thr)
+                    cand_s = (request.num_tokens + bs - 1) // bs
+                    cap_s = (1.0 - float(_theta_s)) * self._total_kv_blocks
+                    if cur_s > 0 and cur_s + cand_s > cap_s:
+                        return False
+            # reservation-backfill: protect the head big's slot T* (set in
+            # build_timeline). Other bigs head-of-line behind it; smalls may
+            # backfill only if they don't delay the big's start T*.
+            if (getattr(self, "_resv2_id", None) is not None
+                    and request.request_id != self._resv2_id):
+                if request.num_tokens - num_computed_at_admit > thr:
+                    return False           # no other big past the reserved head
+                T = min(self._resv2_T, len(self._licht_v2_future_free) - 1)
+                free_at_T = self._licht_v2_future_free[T]
+                bs = self.block_size
+                F_small = (request.num_tokens + bs - 1) // bs
+                # Rj = candidate's steps-to-finish (releases its KV at t=Rj).
+                # If it still holds blocks at T*, it must leave slack >= F_big.
+                if Rj > T and free_at_T - F_small < self._resv2_blk:
+                    return False
+        if _sch == "sjf_reservation":
+            # reserve the head big job's footprint against all other candidates.
+            if request.request_id != getattr(self, "_resv_head_id", None):
+                threshold = max(threshold, getattr(self, "_resv_head_blk", 0))
         max_alloc_per_step = (
             self.scheduler_config.max_num_batched_tokens // self.block_size)
 
@@ -1122,6 +1435,22 @@ class Scheduler(SchedulerInterface):
         if self._v3_kqueue_log_enabled:
             self._v3_sched_step += 1
 
+        # beta_r/b probe (env LICHT_BRB_PROBE=path): dt since last schedule()
+        # ~= previous step's forward time (prefill-heavy). Pair it with the
+        # prev step's (Σc, ΣD, Σ c·D) features stored at the end of schedule.
+        _brb_path = os.environ.get("LICHT_BRB_PROBE")
+        if _brb_path:
+            _bnow = time.perf_counter()
+            _pf = getattr(self, "_brb_prev_feat", None)
+            if _pf is not None and getattr(self, "_brb_prev_ts", None):
+                _pf["dt"] = _bnow - self._brb_prev_ts
+                try:
+                    with open(_brb_path, "a") as _bf:
+                        _bf.write(json.dumps(_pf) + "\n")
+                except Exception:
+                    pass
+            self._brb_prev_ts = _bnow
+
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1194,6 +1523,9 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.block_pool.get_num_free_blocks())
             self._licht_v2_build_timeline(_lv2_current_free)
 
+        # Dynamic chunk: per-step chunk-size precompute (env-gated, no-op off).
+        self._licht_dyn_precompute()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1204,10 +1536,9 @@ class Scheduler(SchedulerInterface):
                               request.num_computed_tokens)
 
 
-            if (0 < self.scheduler_config.long_prefill_token_threshold <
-                    num_new_tokens):
-                num_new_tokens = (
-                    self.scheduler_config.long_prefill_token_threshold)
+            _dyn_cap = self._licht_dyn_cap(request, num_new_tokens)
+            if (0 < _dyn_cap < num_new_tokens):
+                num_new_tokens = _dyn_cap
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -1304,6 +1635,14 @@ class Scheduler(SchedulerInterface):
                             # Only `request` is in running; fall through
                             # to the self-preempt path below.
                             preempted_req = request
+                        _pb = os.environ.get("LICHT_DYN_PROBE")
+                        if _pb and preempted_req.num_prompt_tokens >= int(_pb):
+                            logger.info("PROBE PREEMPT t=%.3f rid=%s prompt=%d "
+                                        "computed=%d (by rid=%s prompt=%d)",
+                                        time.time(), preempted_req.request_id,
+                                        preempted_req.num_prompt_tokens,
+                                        preempted_req.num_computed_tokens,
+                                        request.request_id, request.num_prompt_tokens)
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             scheduled_running_reqs.remove(preempted_req)
@@ -1396,6 +1735,17 @@ class Scheduler(SchedulerInterface):
             
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            if os.environ.get("LICHT_DYN_LOG_CHUNKS") == "1":
+                logger.info("DYNCHUNK rid=%s prompt=%d computed=%d chunk=%d",
+                            request.request_id, request.num_prompt_tokens,
+                            request.num_computed_tokens, num_new_tokens)
+            _pb = os.environ.get("LICHT_DYN_PROBE")
+            if _pb and request.num_prompt_tokens >= int(_pb):
+                logger.info("PROBE RUN t=%.3f rid=%s prompt=%d computed=%d "
+                            "chunk=%d nrun=%d nwait=%d",
+                            time.time(), request.request_id,
+                            request.num_prompt_tokens, request.num_computed_tokens,
+                            num_new_tokens, len(self.running), len(self.waiting))
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -1611,10 +1961,9 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if (0 < self.scheduler_config.long_prefill_token_threshold
-                            < num_new_tokens):
-                        num_new_tokens = (
-                            self.scheduler_config.long_prefill_token_threshold)
+                    _dyn_cap = self._licht_dyn_cap(request, num_new_tokens)
+                    if (0 < _dyn_cap < num_new_tokens):
+                        num_new_tokens = _dyn_cap
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1738,6 +2087,21 @@ class Scheduler(SchedulerInterface):
                     if not can_admit_lv2:
                         self._pop_waiting_request(request)
                         skipped_waiting_requests.prepend_request(request)
+                        # change 3 (LICHT_LONGCAP_FCFS_BREAK=1): a LONG that
+                        # can't be admitted STOPS the waiting loop — younger
+                        # longs must not jump ahead of it (strict FCFS among
+                        # longs).  Shorts were already peeked first (higher
+                        # score) so they keep backfilling; only the long lane
+                        # is gated.  Prevents big-prefix longs from being
+                        # starved by small-footprint longs grabbing the space
+                        # they are waiting to accumulate.
+                        if (os.environ.get("LICHT_LONGCAP_FCFS_BREAK") == "1"
+                                and os.environ.get("LICHT_SCHED_SCHEME")
+                                in ("longcap_sjf", "longcap_fcfs")):
+                            _thr_b = int(os.environ.get("LICHT_LONG_C", "5120"))
+                            if (request.num_tokens
+                                    - request.num_computed_tokens) > _thr_b:
+                                break
                         continue
 
                 # NOTE (Hanchen) This is allocating new slots. We have already decided to schedule this request
@@ -1902,6 +2266,19 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
+                if os.environ.get("LICHT_DYN_LOG_CHUNKS") == "1":
+                    logger.info("DYNCHUNK rid=%s prompt=%d computed=%d chunk=%d",
+                                request.request_id, request.num_prompt_tokens,
+                                request.num_computed_tokens, num_new_tokens)
+                _pb = os.environ.get("LICHT_DYN_PROBE")
+                if _pb and request.num_prompt_tokens >= int(_pb):
+                    logger.info("PROBE ADMIT t=%.3f rid=%s prompt=%d arr=%.3f "
+                                "queue_wait=%.2f computed=%d chunk=%d nrun=%d nwait=%d",
+                                time.time(), request.request_id,
+                                request.num_prompt_tokens, request.arrival_time,
+                                time.time() - request.arrival_time,
+                                request.num_computed_tokens, num_new_tokens,
+                                len(self.running), len(self.waiting))
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1947,6 +2324,23 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        # beta_r/b probe: store THIS step's compute features (context D_i is
+        # pre-step here -> the attention the forward will do). Paired with dt
+        # at the top of the NEXT schedule call.
+        if os.environ.get("LICHT_BRB_PROBE"):
+            _sc = _sctx = _scd = 0
+            for _r in self.running:
+                _c = num_scheduled_tokens.get(_r.request_id, 0)
+                if _c > 0:
+                    _d = _r.num_computed_tokens
+                    _sc += _c
+                    _sctx += _d
+                    _scd += _c * _d
+            self._brb_prev_feat = {"sum_c": int(_sc), "sum_ctx": int(_sctx),
+                                   "sum_c_ctx": int(_scd),
+                                   "n_run": len(self.running),
+                                   "n_sched": len(num_scheduled_tokens)}
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -2723,6 +3117,19 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        # Synthetic-history perf benchmark (gated by request_id prefix "exp_"):
+        # mark the first L prompt tokens as already-computed history so the
+        # engine allocates L+C blocks (first L never written = garbage KV) and
+        # only forwards the last C tokens, attending to all L+C.  Same code
+        # path as a KV-transfer-resumed request.  No effect on other requests.
+        if (request.request_id.startswith("exp_")
+                and request.num_computed_tokens == 0):
+            try:
+                _L = int(request.request_id.split("_L", 1)[1].split("_", 1)[0])
+                request.num_computed_tokens = max(0, min(_L,
+                                                         request.num_tokens - 1))
+            except (IndexError, ValueError):
+                pass
         self.tool_call_estimator.request_arrives(request)
         self.continuum_recorder.request_arrives(request)
 

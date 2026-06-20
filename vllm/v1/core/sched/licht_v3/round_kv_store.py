@@ -1306,12 +1306,20 @@ class RoundKVStore:
 
     def enqueue_store(self, job_id: str, full_block_ids: list,
                       full_token_ids: list,
-                      request_id: Optional[str] = None) -> None:
+                      request_id: Optional[str] = None,
+                      sink: bool = False) -> None:
         """Queue an incremental store for `job_id`.  Captures a CUDA event
         on the engine stream so the background gather waits for the
         finishing forward's writes to be visible, then returns
         immediately.  The request's blocks must stay retained (delay-free)
-        until `drain_done` reports `request_id` (= gather complete)."""
+        until `drain_done` reports `request_id` (= gather complete).
+
+        sink=True (ARENA_SINK 路径): GPU 块是这份 KV 的唯一来源, decode 端
+        请求已被 park 等"整份齐"。此时写失败不再是"下轮重试"——必须在【写
+        成功且 lookup 复核整份可见】后才 `_mark_done` 放块; 失败/复核有洞时
+        只要 job 还在途 (.inflight 在 = decode 请求还活着) 就带退避重试,
+        在途消失才放弃。活性由客户端请求超时兜底 (请求挂掉 → decode 清
+        .inflight → 这里下一次重试看到即放块退出)。"""
         if not self.ready or not full_block_ids:
             self._mark_done(request_id)
             return
@@ -1328,7 +1336,7 @@ class RoundKVStore:
             # block=True => high-water back-pressure (rare); never drops.
             self._queue.put(
                 (job_id, list(full_block_ids), list(full_token_ids),
-                 request_id, ev),
+                 request_id, ev, bool(sink), 0, 0.0),
                 block=True, timeout=None)
         except Exception as e:  # pragma: no cover
             logger.warning("RoundKVStore.enqueue_store failed job=%s: %s",
@@ -1351,17 +1359,83 @@ class RoundKVStore:
                 continue
             if task is None:
                 break
-            job_id, block_ids, token_ids, request_id, ev = task
+            (job_id, block_ids, token_ids, request_id, ev,
+             sink, attempt, not_before) = task
+            # sink 重试任务带 not_before (退避): 还没到点 → 放回队尾, 小睡防
+            # "队列只剩这一个任务"时的忙转 (50ms 粒度, 对退避精度无影响)。
+            if not_before > time.time():
+                try:
+                    self._queue.put(task)
+                except Exception:  # pragma: no cover
+                    self._mark_done(request_id)
+                time.sleep(0.05)
+                continue
             try:
                 self._do_store(job_id, block_ids, token_ids, request_id,
-                               ev, stream)
+                               ev, stream, sink=sink, attempt=attempt)
             except Exception as e:  # pragma: no cover
                 logger.warning("RoundKVStore store failed job=%s: %s",
                                job_id, e)
                 self._mark_done(request_id)
 
+    # ------------------------------------------------------------------
+    # ★ sink 写的"成功"判据 + 重试 (零丢失: GPU 块保留到复核通过)
+    # ------------------------------------------------------------------
+
+    def _sink_verify_short(self, job_id, token_ids) -> Optional[int]:
+        """sink 写完后的复核: 用与 decode admission gate 完全相同的口径
+        (lookup 的 matched_blocks vs prompt 完整块数) 查整份是否可见。
+
+        返回 None = 整份齐 (decode 一定能 admit); 否则返回 matched 块数
+        (-1 = lookup miss)。写成功但复核有洞 = 写期间/写后被并发淘汰挖了
+        前缀 (manifest TOCTOU 残余) → 调用方按失败重试, STALE-LAST 会从
+        回退后的 manifest 重补缺段。"""
+        need_blk = align_blocks(len(token_ids), self.block_size)
+        if need_blk <= 0:
+            return None
+        try:
+            res = self.lookup(str(job_id), list(token_ids))
+        except Exception:  # pragma: no cover
+            return -1
+        if res is not None and res[1] >= need_blk:
+            return None
+        return res[1] if res is not None else -1
+
+    def _requeue_sink(self, job_id, block_ids, token_ids, request_id, ev,
+                      attempt: int, reason: str) -> None:
+        """sink 写失败/复核有洞且 job 仍在途 → 带退避重新入队 (不
+        `_mark_done`, GPU 块继续保留)。无限重试: 终止条件只有两个 ——
+        写成功+复核齐 (成功路), 或 .inflight 消失 (decode 请求挂掉/拉走,
+        调用方走 give-up 路放块)。"""
+        _now = time.time()
+        _ts = getattr(self, "_sink_retry_log_ts", None)
+        if _ts is None:
+            _ts = self._sink_retry_log_ts = {}
+        if _now - _ts.get(job_id, 0.0) > 5.0:   # 每 job 5s 一条, 防刷屏
+            _ts[job_id] = _now
+            logger.warning(
+                "round-kv SINK-RETRY job=%s attempt=%d reason=%s "
+                "(GPU 块保留, %.1fs 后重试)", str(job_id)[:40],
+                attempt + 1, reason, self._sink_retry_interval_s)
+        try:
+            self._queue.put(
+                (job_id, block_ids, token_ids, request_id, ev,
+                 True, attempt + 1, _now + self._sink_retry_interval_s))
+        except Exception as e:  # pragma: no cover
+            logger.warning("SINK-RETRY requeue failed job=%s: %s — 放块放弃",
+                           job_id, e)
+            self._mark_done(request_id)
+
+    @property
+    def _sink_retry_interval_s(self) -> float:
+        v = getattr(self, "_sink_retry_iv", None)
+        if v is None:
+            v = self._sink_retry_iv = float(
+                os.environ.get("LICHT_SINK_RETRY_S", "0.5"))
+        return v
+
     def _do_store(self, job_id, block_ids, token_ids, request_id, ev,
-                  stream) -> None:
+                  stream, sink: bool = False, attempt: int = 0) -> None:
         with self._job_lock(job_id):
             last = self._last_stored.get(job_id)
             if last is None:
@@ -1388,6 +1462,21 @@ class RoundKVStore:
             end = min(end, len(block_ids))
             if end <= last:
                 # No new COMPLETE block this round (e.g., output < 1 block).
+                # ★ sink: manifest 声称已全覆盖也要复核 (淘汰 self-heal 与读
+                # manifest 之间有 µs 级竞态窗口); 有洞按失败路重试。
+                if sink:
+                    short = self._sink_verify_short(job_id, token_ids)
+                    if short is not None:
+                        if self.is_inflight(job_id):
+                            self._requeue_sink(
+                                job_id, block_ids, token_ids, request_id,
+                                ev, attempt,
+                                "covered-but-short(matched=%s)" % short)
+                            return
+                        logger.warning(
+                            "round-kv SINK-GIVEUP job=%s attempt=%d "
+                            "matched=%s — 请求已不在途, 放块退出",
+                            str(job_id)[:40], attempt, short)
                 self._mark_done(request_id)
                 return
             inc_block_ids = list(block_ids[last:end])
@@ -1396,27 +1485,73 @@ class RoundKVStore:
                 _t1 = time.time()
                 ok = self._store_direct_arena_lru(
                     job_id, last, end, inc_block_ids, token_ids, ev, stream)
-                # GPU 写已 sync 完成 -> paged 块可释放
-                self._mark_done(request_id)
-                if ok is False:
-                    logger.warning(
-                        "round-kv STORE-DIRECT inc write failed job=%s [%d,%d)"
-                        " — 进度不推进", str(job_id)[:32], last, end)
+                if not sink:
+                    # 非 sink (decode round-persist): GPU 写已 sync -> paged 块
+                    # 即可释放; 失败 = 进度不推进, 同 job 下一轮重补, 零丢失。
+                    self._mark_done(request_id)
+                    if ok is False:
+                        logger.warning(
+                            "round-kv STORE-DIRECT inc write failed job=%s "
+                            "[%d,%d) — 进度不推进", str(job_id)[:32], last, end)
+                        return
+                    # manifest 已由 LruArenaStore.write_inc 写过同一文件同内容
+                    # (store-direct 必走 LRU), 不重复写 (省 O(token) JSON).
+                    self._last_stored[job_id] = end
+                    logger.info(
+                        "round-kv STORE-DIRECT: job=%s inc_blocks=%d "
+                        "write_ms=%.0f", str(job_id)[:32], end - last,
+                        (time.time() - _t1) * 1000.0)
                     return
-                # manifest 已由 LruArenaStore.write_inc 写过同一文件同内容
-                # (store-direct 必走 LRU), 不重复写 (省 O(token) JSON).
-                self._last_stored[job_id] = end
-                logger.info(
-                    "round-kv STORE-DIRECT: job=%s inc_blocks=%d write_ms=%.0f",
-                    str(job_id)[:32], end - last, (time.time() - _t1) * 1000.0)
+                # ---- ★ sink (ARENA_SINK): GPU 块是唯一数据源 —— 只有【写成功
+                # 且 lookup 复核整份可见】才 _mark_done 放块。失败/复核有洞:
+                # 在途 (.inflight 在) 就带退避重试 (块保留, 下次 STALE-LAST 从
+                # 回退后的 manifest 续补); 在途消失 (decode 请求挂掉) 才放弃。
+                # 不设 deadline — 活性由客户端请求超时兜底 (请求挂 → decode
+                # 清 .inflight → 下一次重试看到即放块退出)。----
+                if ok is not False:
+                    self._last_stored[job_id] = end
+                    short = self._sink_verify_short(job_id, token_ids)
+                    if short is None:
+                        self._mark_done(request_id)
+                        logger.info(
+                            "round-kv SINK-STORE ok: job=%s [%d,%d) attempt=%d "
+                            "write_ms=%.0f verify=FULL", str(job_id)[:40],
+                            last, end, attempt, (time.time() - _t1) * 1000.0)
+                        return
+                    reason = "verify_short(matched=%s)" % short
+                else:
+                    reason = "write_failed"
+                if self.is_inflight(job_id):
+                    self._requeue_sink(job_id, block_ids, token_ids,
+                                       request_id, ev, attempt, reason)
+                    return
+                self._mark_done(request_id)
+                logger.warning(
+                    "round-kv SINK-GIVEUP job=%s [%d,%d) attempt=%d reason=%s "
+                    "— 请求已不在途, 放块退出", str(job_id)[:40], last, end,
+                    attempt, reason)
                 return
             # ---- gather the increment (own stream; never touches engine) ----
             _t0 = time.time()
             tensors = self._gather(inc_block_ids, ev, stream)
             gather_ms = (time.time() - _t0) * 1000.0
-            # Gather done -> the GPU blocks are now safe to free.
-            self._mark_done(request_id)
+            if not sink:
+                # Gather done -> the GPU blocks are now safe to free.
+                self._mark_done(request_id)
             if tensors is None:
+                if sink:
+                    # gather 失败但 GPU 块还保留着 → 可整任务重试 (与 store-
+                    # direct 的失败语义一致)。
+                    if self.is_inflight(job_id):
+                        self._requeue_sink(job_id, block_ids, token_ids,
+                                           request_id, ev, attempt,
+                                           "gather_failed")
+                    else:
+                        self._mark_done(request_id)
+                        logger.warning(
+                            "round-kv SINK-GIVEUP job=%s [%d,%d) attempt=%d "
+                            "reason=gather_failed — 请求已不在途, 放块退出",
+                            str(job_id)[:40], last, end, attempt)
                 return
             # ---- write increment file + update manifest (off critical path) ----
             _t1 = time.time()
@@ -1425,6 +1560,18 @@ class RoundKVStore:
                 # 存失败 (块数不符已被上面夹住; 这里兜其余: alloc/evict 失败等).
                 # 不推进 _last_stored / 不写 manifest → 下轮 (多轮同 job) 重试这段,
                 # 避免 manifest 过度声明 (声称存了实际没存) + 永久丢复用.
+                if sink:
+                    if self.is_inflight(job_id):
+                        self._requeue_sink(job_id, block_ids, token_ids,
+                                           request_id, ev, attempt,
+                                           "write_failed")
+                    else:
+                        self._mark_done(request_id)
+                        logger.warning(
+                            "round-kv SINK-GIVEUP job=%s [%d,%d) attempt=%d "
+                            "reason=write_failed — 请求已不在途, 放块退出",
+                            str(job_id)[:40], last, end, attempt)
+                    return
                 logger.warning(
                     "round-kv STORE inc write failed job=%s [%d,%d) — 进度不推进",
                     str(job_id)[:32], last, end)
@@ -1441,6 +1588,25 @@ class RoundKVStore:
                 "round-kv STORE: job=%s inc_blocks=%d gather_ms=%.0f "
                 "write_ms=%.0f", str(job_id)[:32], end - last,
                 gather_ms, write_ms)
+            if sink:
+                # ★ sink: 写成功仍要复核整份可见, 齐才放 GPU 块。
+                short = self._sink_verify_short(job_id, token_ids)
+                if short is not None:
+                    if self.is_inflight(job_id):
+                        self._requeue_sink(job_id, block_ids, token_ids,
+                                           request_id, ev, attempt,
+                                           "verify_short(matched=%s)" % short)
+                        return
+                    self._mark_done(request_id)
+                    logger.warning(
+                        "round-kv SINK-GIVEUP job=%s [%d,%d) attempt=%d "
+                        "reason=verify_short(matched=%s) — 请求已不在途, "
+                        "放块退出", str(job_id)[:40], last, end, attempt, short)
+                    return
+                self._mark_done(request_id)
+                logger.info(
+                    "round-kv SINK-STORE ok: job=%s [%d,%d) attempt=%d "
+                    "verify=FULL", str(job_id)[:40], last, end, attempt)
             # ---- coalesce many small increments into one (bg, off engine) ----
             # (safetensors-only; raw .bin / arena don't accumulate DATA files,
             # only tiny .slot indices, so no coalesce needed there)

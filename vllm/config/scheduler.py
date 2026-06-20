@@ -264,6 +264,12 @@ class SchedulerConfig:
                 self.max_num_batched_tokens)
 
         self.chunked_prefill_enabled = self.enable_chunked_prefill
+        # No-chunk (chunked prefill disabled): concurrent partial prefills are
+        # meaningless and would trip the validation below; force them to 1 here
+        # (the user cannot set max_num_partial_prefills explicitly under V1).
+        if not self.chunked_prefill_enabled:
+            self.max_num_partial_prefills = 1
+            self.max_long_partial_prefills = 1
         if self.max_num_partial_prefills > 1:
             if self.long_prefill_token_threshold == 0:
                 self.long_prefill_token_threshold = int(self.max_model_len *

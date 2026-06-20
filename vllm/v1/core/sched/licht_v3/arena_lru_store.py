@@ -376,15 +376,32 @@ class LruArenaStore:
         return os.path.join(self._job_dir(job_id), self._INFLIGHT)
 
     def mark_inflight(self, job_id: str) -> None:
-        """打在途标记: 淘汰将跳过整个 job。幂等(已存在无害)。"""
+        """打在途标记: 淘汰将跳过整个 job。幂等(已存在无害)。
+
+        ★ 竞态修复 (sunpy 死法): mark 与淘汰经同一个 per-job claim (flock)
+        互斥 —— evictor 处理一个 victim 期间持有 claim, 这里先抢到 claim 再落
+        flag, 保证 mark 不会落在 evictor "已查过 inflight、还没 free 完" 的
+        中间。evictor 每 victim 持锁通常 ms 级, 等待上限 0.2s; 超时仍落 flag
+        (evictor 侧另有 claim 后复查 + 每 inc 复查兜底, sink 写还有 lookup
+        复核重试, 多层防御)。"""
         try:
             d = self._job_dir(job_id)
             os.makedirs(d, exist_ok=True)
-            fd = os.open(self._inflight_path(job_id),
-                         os.O_CREAT | os.O_WRONLY, 0o644)
-            os.close(fd)
-            logger.info("MARK-INFLIGHT job=%s path=%s",  # ★诊断
-                        job_id, self._inflight_path(job_id))
+            _cfd = None
+            _deadline = time.time() + 0.2
+            while _cfd is None and time.time() < _deadline:
+                _cfd = self._claim_job(job_id)
+                if _cfd is None:
+                    time.sleep(0.001)   # evictor 正处理该 job, 等它放 claim
+            try:
+                fd = os.open(self._inflight_path(job_id),
+                             os.O_CREAT | os.O_WRONLY, 0o644)
+                os.close(fd)
+            finally:
+                self._release_claim(_cfd)
+            logger.info("MARK-INFLIGHT job=%s path=%s%s",  # ★诊断
+                        job_id, self._inflight_path(job_id),
+                        "" if _cfd is not None else " (claim-timeout)")
         except Exception as _e:
             logger.warning("MARK-INFLIGHT FAILED job=%s: %s", job_id, _e)  # ★诊断
 
@@ -1416,6 +1433,14 @@ class LruArenaStore:
                 if _cfd is None:
                     continue
                 _held = _cfd
+                # ★ 竞态修复 (sunpy 死法): claim 到手后【复查】inflight。
+                #   mark_inflight 走同一 claim 互斥 → 此刻读到的标记是权威的;
+                #   上面选 victim 时那次检查 (1403) 可能已过时 (mark 在两次
+                #   检查之间落下)。
+                if self.is_inflight(victim):
+                    self._release_claim(_held)
+                    _held = None
+                    continue
                 _nvictim += 1
                 if in_index:
                     inc_list = list(mem)
@@ -1432,6 +1457,11 @@ class LruArenaStore:
                     committed = int(m.get("total_blocks", 0)) if m else 0
                 evicted_keys: List[Tuple[int, int]] = []   # 已淘的 (s,e), 末尾从索引剔
                 for (s, e, records) in reversed(inc_list):   # tail-first
+                    # ★ 每 inc 复查 inflight (µs 级 exists): 兜 mark_inflight
+                    #   claim 等待超时仍落 flag 的残余路 — flag 一出现立即停手,
+                    #   不再淘这个 job 的后续 inc。
+                    if self.is_inflight(victim):
+                        break
                     if gained >= need or e > committed:
                         continue
                     if records is None:                      # 损坏 .slot
@@ -1696,6 +1726,10 @@ class LruArenaStore:
         if _cfd is None:
             return 0
         try:
+            # ★ 竞态修复: claim 到手后复查 inflight (mark 走同一 claim 互斥,
+            #   此刻读到的是权威值; 函数开头那次检查可能已过时)。
+            if os.path.exists(_ipath):
+                return 0
             incs = self._list_incs(job_id)
             if not incs:
                 return 0
@@ -1710,6 +1744,10 @@ class LruArenaStore:
             # 反向遍历 (tail first)
             for (s, e, path) in reversed(incs):
                 if released >= max_need:
+                    break
+                # ★ 每 inc 复查 inflight: flag 一出现立即停手 (兜 mark 的
+                #   claim 等待超时残余路)。
+                if os.path.exists(_ipath):
                     break
                 if e > committed:
                     # 未提交的 inc (正在被 writer 写), 跳过, 不能淘
