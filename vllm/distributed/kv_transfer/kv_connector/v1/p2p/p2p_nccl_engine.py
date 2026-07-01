@@ -29,6 +29,10 @@ from vllm.utils import current_stream, get_ip
 
 logger = logging.getLogger(__name__)
 
+# ★ LICHT_PROBE=1: master switch for stall-investigation probes (BRIDGE-POP-SLOW,
+# LBM-SLOW here). Default off → zero overhead. See vllm/v1/engine/core.py.
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
+
 DEFAULT_MEM_POOL_SIZE_GB = 32
 DEFAULT_REQUEST_COMPLETION_TIMEOUT_S = 120.0
 DEFAULT_GET_RETRY_TIMEOUT_S = 30.0
@@ -336,6 +340,7 @@ class P2pNcclEngine:
 
         # Fast path: single non-blocking probe, useful for per-step retries.
         if timeout_s <= 0:
+            _bp_t = time.time()
             payload = self._rpc(
                 remote_address,
                 {
@@ -343,6 +348,16 @@ class P2pNcclEngine:
                     "request_id": request_id,
                 },
             )
+            try:
+                _bp_ms = (time.time() - _bp_t) * 1000.0
+                if _LICHT_PROBE and _bp_ms > 200.0:
+                    logger.warning(
+                        "BRIDGE-POP-SLOW rpc=%.0fms req=%s remote=%s — decode "
+                        "阻塞在 BRIDGE_POP 同步等 prefill router 回包 (prefill "
+                        "忙/单线程 router 排队, 非 decode GIL)",
+                        _bp_ms, request_id, remote_address)
+            except Exception:
+                pass
             if payload.get("ret") == 0:
                 self._delay_free_ts.setdefault(request_id, {})[
                     "bridge_popped_ts"] = time.time()
@@ -437,10 +452,19 @@ class P2pNcclEngine:
                                dtype=torch.int64,
                                device="cpu")
 
+        _lbm_t = time.time()
         for attempt in range(2):
             try:
+                _ev_t = time.time()
                 self._ensure_remote_kv_views(
                     remote_address, force_refresh=(attempt > 0))
+                _ev_ms = (time.time() - _ev_t) * 1000.0
+                if _LICHT_PROBE and _ev_ms > 500.0:
+                    logger.warning(
+                        "LBM-SLOW ensure_kv_views=%.0fms attempt=%d req=%s "
+                        "remote=%s — decode 卡在 GET_IPC RPC 同步等 prefill "
+                        "router 回包 (prefill 忙时阻塞, 非 decode GIL)",
+                        _ev_ms, attempt, request_id, remote_address)
                 remote_views = self.remote_kv_views.get(remote_address, {})
                 if not remote_views:
                     raise RuntimeError("Remote KV views are not initialized "
@@ -465,6 +489,15 @@ class P2pNcclEngine:
                 with self.state_lock:
                     self.pending_migrations[request_id] = (event,
                                                            remote_address)
+                try:
+                    _lbm_ms = (time.time() - _lbm_t) * 1000.0
+                    if _LICHT_PROBE and _lbm_ms > 500.0:
+                        logger.warning(
+                            "LBM-SLOW total=%.0fms attempt=%d req=%s — 若 "
+                            "ensure_kv_views 未告警则卡在 cuda migrate enqueue "
+                            "(recv_stream 堵)", _lbm_ms, attempt, request_id)
+                except Exception:
+                    pass
                 return True
             except Exception:
                 if attempt == 0:

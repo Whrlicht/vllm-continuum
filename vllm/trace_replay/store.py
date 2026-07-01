@@ -33,10 +33,44 @@ class TraceStore:
             return Path(configured)
 
         default_path = Path.cwd() / "trace_data" / \
-            "swe_bench_sample_300_tool_clean_with_timings.json"
+            "mixed"
         if default_path.exists():
             return default_path
         return None
+
+    def _collect_files(self) -> list[Path]:
+        """Expand self.trace_path into a concrete list of *.json trace files.
+
+        self.trace_path may be a single file, a DIRECTORY (loads every *.json
+        in it), or a comma-separated list of either.  This lets several
+        datasets be replayed together — just point VLLM_TRACE_REPLAY_PATH at a
+        folder.  MUST stay in lock-step with the client's _collect_trace_files
+        so both sides load the identical traj_id set.
+        """
+        if self.trace_path is None:
+            return []
+        files: list[Path] = []
+        for part in str(self.trace_path).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            p = Path(part).expanduser()
+            if p.is_dir():
+                files.extend(sorted(p.glob("*.json")))
+            elif p.is_file():
+                files.append(p)
+            else:
+                logger.warning("Trace replay: path not found, skipping: %s", p)
+        # Dedup while preserving order (a folder may also hold a merged file).
+        seen: set[str] = set()
+        uniq: list[Path] = []
+        for f in files:
+            key = str(f.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(f)
+        return uniq
 
     def _load_if_needed(self) -> None:
         if self._loaded:
@@ -46,40 +80,46 @@ class TraceStore:
         if self.trace_path is None:
             logger.warning(
                 "Trace replay enabled but no trace file configured. Set "
-                "VLLM_TRACE_REPLAY_PATH to a JSON file containing traj_id and "
-                "token id sequences.")
+                "VLLM_TRACE_REPLAY_PATH to a JSON file/dir containing traj_id "
+                "and token id sequences.")
             return
 
-        if not self.trace_path.exists():
+        files = self._collect_files()
+        if not files:
             raise FileNotFoundError(
-                f"Trace replay file not found: {self.trace_path}")
+                f"Trace replay path(s) not found: {self.trace_path}")
 
-        with self.trace_path.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-
-        entries = raw if isinstance(raw, list) else [raw]
         loaded = 0
-        for entry in entries:
-            if not isinstance(entry, dict):
+        for fp in files:
+            try:
+                with fp.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (ValueError, OSError) as exc:
+                logger.warning("Trace replay: skip %s (%s)", fp, exc)
                 continue
-            data_ids = [
-                data_id for data_id in
-                (entry.get("traj_id"), entry.get("instance_id")) if data_id
-            ]
-            if not data_ids:
-                continue
-            for data_id in data_ids:
-                self.entry_by_data_id[str(data_id)] = entry
 
-            token_ids = self._extract_token_ids(entry)
-            if token_ids is None:
-                continue
-            for data_id in data_ids:
-                self.by_traj_id[str(data_id)] = token_ids
-            loaded += 1
+            entries = raw if isinstance(raw, list) else [raw]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                data_ids = [
+                    data_id for data_id in
+                    (entry.get("traj_id"), entry.get("instance_id")) if data_id
+                ]
+                if not data_ids:
+                    continue
+                for data_id in data_ids:
+                    self.entry_by_data_id[str(data_id)] = entry
 
-        logger.info("Trace replay loaded %d trajectories from %s", loaded,
-                    self.trace_path)
+                token_ids = self._extract_token_ids(entry)
+                if token_ids is None:
+                    continue
+                for data_id in data_ids:
+                    self.by_traj_id[str(data_id)] = token_ids
+                loaded += 1
+
+        logger.info("Trace replay loaded %d trajectories from %d file(s) [%s]",
+                    loaded, len(files), self.trace_path)
 
     @staticmethod
     def _is_int_list(value: Any) -> bool:
@@ -131,7 +171,7 @@ class TraceStore:
     def get_entry(self, traj_id: str) -> dict[str, Any]:
         self._load_if_needed()
         entry = self.entry_by_data_id.get(traj_id)
-        if entry is None and self.trace_path is not None and self.trace_path.exists():
+        if entry is None and self._collect_files():
             # Handle in-place dataset updates without requiring server restart.
             self._force_reload()
             entry = self.entry_by_data_id.get(traj_id)
@@ -145,7 +185,7 @@ class TraceStore:
 
     def get_trace(self, traj_id: str) -> list[int]:
         self._load_if_needed()
-        if traj_id not in self.by_traj_id and self.trace_path is not None and self.trace_path.exists():
+        if traj_id not in self.by_traj_id and self._collect_files():
             # Handle in-place dataset updates without requiring server restart.
             self._force_reload()
         if traj_id not in self.by_traj_id:

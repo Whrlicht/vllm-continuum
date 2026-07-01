@@ -7,8 +7,8 @@ set -Eeuo pipefail
 #   ./run_disagg_p2p_nccl_xpyd_prod.sh --prefill-gpus 0 --decode-gpus 1,2
 
 MODEL_PATH="/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct"
-PREFILL_GPUS="6"
-DECODE_GPUS="7"
+PREFILL_GPUS="7"
+DECODE_GPUS="4,5,6"
 
 PROXY_DISCOVERY_HOST="0.0.0.0"
 PROXY_DISCOVERY_PORT=30001
@@ -28,6 +28,16 @@ STEP_EVENT_PORT_BASE=25001
 
 PREFILL_GPU_MEMORY_UTILIZATION=0.95
 DECODE_GPU_MEMORY_UTILIZATION=0.95
+# CUDA graph on the DECODE worker only (prefill stays --enforce-eager: graphs
+# don't help variable-length chunked prefill and risk the long-ctx path).
+# Decode-only cudagraph + eager-prefill is an officially supported P/D pattern
+# (gpu_model_runner.py:~1680).  Default OFF (both eager, unchanged).  Enable
+# with --decode-cuda-graph.  NOTE: capture needs spare VRAM; at gpu-mem-util
+# 0.95 it may OOM at "Capturing CUDA graphs" — if so, lower
+# DECODE_GPU_MEMORY_UTILIZATION to ~0.90.  Verify trace_replay outputs still
+# match after enabling (correctness check that the KV-connector hooks captured
+# cleanly).
+DECODE_CUDA_GRAPH=false
 
 # DistServe-style direct block migration mode.
 # Decode actively pops bridge metadata and migrates blocks from prefill.
@@ -122,8 +132,13 @@ LICHT=false
 LICHT_V2=false
 LICHT_V3=false
 # --prefill-opt: FINAL optimal prefill stack (all env-gated, prefill-only):
-#   shorts-first longcap_fcfs : shorts get priority + are UNcapped; longs capped
-#       to <= theta footprint (LICHT_LONGCAP_ORDER=short + LICHT_LONG_THETA).
+#   shorts-first longcap_fcfs : shorts get priority + are UNcapped; longs are
+#       throttled only when KV is near-full -- a new long is rejected if total
+#       ACTUAL usage + its footprint would leave shorts less than
+#       LICHT_SHORT_RESERVE (0.2) free (LICHT_LONGCAP_ORDER=short +
+#       LICHT_LONG_THETA presence enables it). When KV is abundant longs flow
+#       freely (replaces the old fixed "longs <= 30% footprint" cap, which
+#       blocked longs even at low real usage).
 #   C=5120 boundary           : short/long split (LICHT_LONG_C; also drives the
 #       dynamic_chunk cstar).
 #   reservation               : oldest waiting long gets a reserved slot so a
@@ -131,13 +146,22 @@ LICHT_V3=false
 #   FCFS-break                : a long that can't be admitted STOPS the long lane
 #       (strict FCFS among longs; younger longs can't jump it) -> fixes the
 #       big-prefix-long starvation (max 230->148) (LICHT_LONGCAP_FCFS_BREAK=1).
-#   dynamic_chunk (dynC)      : per-step chunk size from the calibrated beta_r/b
-#       (LICHT_DYN_CHUNK=C + LICHT_DYN_BRB_FILE).
+#   dynamic_chunk (mode F)    : per-step chunk size = sqrt(num/den) from calibrated
+#       beta_r/b. num = re-read (brb*sum lam*D*C) + shared "big waits for shorts"
+#       (T_short*sum lam*C / N_long); den = drag (W_soft * sum lam*D). T_short is
+#       running shorts only; W_soft counts running shorts + waiting (SHORT_SET=all).
+#       Cures mode E over-chunking (LICHT_DYN_CHUNK=F + SHORT_SET=all + BRB_FILE).
 # vs fcfs: p50 47->3s (15x), p99/max higher (longs wait). Requires the LICHT-V2
 # timeline scheduler (auto-enabled below). Off = no change to scheduling.
 PREFILL_OPT=false
+PREFILL_FCFS=false           # --prefill-fcfs: LICHT-V3 + pure-FCFS priority + fixed
+                             # native chunk (no longcap, no dynamic_chunk). Diagnostic
+                             # baseline; mutually exclusive with --prefill-opt.
 PREFILL_OPT_THETA=0.3        # long-lane KV ceiling (head-of-line safe; sweep best)
 PREFILL_OPT_LONGC=5120       # short/long boundary C (sweep best for break stack)
+PREFILL_OPT_CLOW=2048        # dynamic_chunk mode F: smooth long/short band low (lambda=0 below)
+PREFILL_OPT_CHIGH=5120       # dynamic_chunk mode F: smooth band high (lambda=1 above)
+PREFILL_OPT_SHORT_RESERVE=0.2 # keep this fraction of KV free for shorts (lower = use more KV)
 
 WAIT_TIMEOUT_SECONDS=1200
 SHUTDOWN_GRACE_SECONDS=20
@@ -146,7 +170,7 @@ FAIL_ON_WAIT_TIMEOUT=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/swe_bench_sample_300_tool_clean_with_timings.json"
+TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/mixed"
 # LICHT-V3 tool-time predictor bundle (tool_call_time): bash family → ML
 # p50/p95, editor/submit family → bucket-median 查表.  Unset/missing →
 # the predictor degrades to a constant fallback.  Override: --tool-predictor-dir.
@@ -353,6 +377,10 @@ while [[ $# -gt 0 ]]; do
       NUMA_BIND=false
       shift
       ;;
+    --decode-cuda-graph)
+      DECODE_CUDA_GRAPH=true
+      shift
+      ;;
     --request-completion-timeout)
       REQUEST_COMPLETION_TIMEOUT_S="$2"
       shift 2
@@ -387,6 +415,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prefill-opt)
       PREFILL_OPT=true
+      shift
+      ;;
+    --prefill-fcfs)
+      PREFILL_FCFS=true
       shift
       ;;
     --prefill-opt-theta)
@@ -444,11 +476,13 @@ done
 # v3_shadow_predictions.jsonl and v3_step_time.jsonl stay empty.  Export
 # so the decode worker (a setsid child) inherits it.
 if [[ "${LICHT_V3}" == "true" ]]; then
-  export LICHT_V3_USE_SHADOW_SCHED=1
+  export LICHT_V3_USE_SHADOW_SCHED=0
+  #export LICHT_V3_USE_SHADOW_SCHED=1
   # Tool-time predictor bundle (bash→ML p50/p95, editor/submit→bucket 查表).
   # Without this the predictor runs in constant-fallback mode.
   if [[ -f "${TOOL_PREDICTOR_DIR}/bundle.json" ]]; then
-    export LICHT_V3_TOOL_PREDICTOR_DIR="${TOOL_PREDICTOR_DIR}"
+    #export LICHT_V3_TOOL_PREDICTOR_DIR="${TOOL_PREDICTOR_DIR}"
+    export LICHT_V3_TOOL_PREDICTOR_DIR=""
   else
     echo "WARN: tool predictor bundle not found at ${TOOL_PREDICTOR_DIR}/bundle.json"
     echo "      → tool-time prediction will use the constant fallback."
@@ -495,6 +529,12 @@ export LICHT_PHASE1_SAVE_ON_PREEMPT=1
 # is full).  Default threshold 0.80.
 export LICHT_PHASE2_ADMISSION_GATE=1
 export LICHT_PHASE2_GATE_THRESHOLD=0.90
+# SINK 自愈: ARENA_SINK 写入复核出真实 LCP < manifest 声称的 total (中间被 dedup
+# 淘空一段, 单数字 manifest 表达不了中间洞) 时, 把 manifest+进度回退到真实 LCP,
+# 下次从洞口重存填洞 (数据在 hold 的 GPU 块里) → 一次收敛, 取代无限 SINK-RETRY +
+# GPU 块泄漏. 两端都 export (prefill 存得多, decode 也存少量在途 KV). 默认即开,
+# 这里显式声明. 关掉: LICHT_SINK_HEAL=0 (回到旧的无限重试, 仅 A/B 用).
+export LICHT_SINK_HEAL=1
 if [[ "${ROUND_KV_RAW}" != "true" ]]; then
   export LICHT_ROUND_KV_RAW=0
 fi
@@ -550,8 +590,11 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${TRACE_REPLAY_PATH}" ]]; then
-  echo "Trace replay file does not exist: ${TRACE_REPLAY_PATH}"
+# Accept a single file OR a directory (TraceStore loads every *.json in a dir,
+# so several datasets can be replayed together).  Comma-separated lists are
+# supported by the loaders but not validated here.
+if [[ ! -e "${TRACE_REPLAY_PATH}" ]]; then
+  echo "Trace replay path does not exist: ${TRACE_REPLAY_PATH}"
   exit 1
 fi
 
@@ -912,14 +955,57 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
                   | grep -oE 'BRB_RESULT_PATH=[^ ]+' | tail -1 | cut -d= -f2)"
     export LICHT_SCHED_SCHEME=longcap_fcfs
     export LICHT_LONGCAP_ORDER=short
-    export LICHT_LONG_THETA="${PREFILL_OPT_THETA}"
+    # Prefix-hit-aware scheduling: predict each waiting request's real cross-tier
+    # (HBM+arena) prefix hit BEFORE scoring, so a returning round with a big
+    # cached prefix (big prompt, small REAL remaining) is classified short ->
+    # short lane -> admitted fast (not starved in the long lane).  Also makes
+    # FCFS-break "close the long lane" (continue, shorts backfill) instead of a
+    # hard break, and feeds dyn_chunk the real D/C.  Auto-on with longcap.
+    export LICHT_SCHED_HIT_PRED=1
+    export LICHT_LONG_THETA="${PREFILL_OPT_THETA}"   # presence enables the long throttle
+    export LICHT_SHORT_RESERVE="${PREFILL_OPT_SHORT_RESERVE}"  # keep this frac KV free
+                                                     # for shorts; longs use the rest
+                                                     # (only throttled near-full, not by
+                                                     # a fixed footprint cap)
     export LICHT_LONG_C="${PREFILL_OPT_LONGC}"
     export LICHT_LONG_RESV=1
     export LICHT_LONGCAP_FCFS_BREAK=1
-    export LICHT_DYN_CHUNK=C
+    # θ 容量帽松绑: 本步若【所有短请求都进去了】(没有短请求因放不下被挡),
+    # θ 帽就没有保护对象 → 对长请求松开 θ, 用 future-free 物理检查把空着的 KV
+    # 塞满长请求, 直到某个长请求装不下为止. 短请求一旦有被挡下的, θ 立即恢复.
+    # 解决"长请求多、短请求已塞满、但 KV 还空着被 θ 挡住"的浪费. 配合
+    # LICHT_LONGCAP_FOOTPRINT=1(footprint 帽)使用.
+    export LICHT_LONG_THETA_RELAX=1
+    # dynamic_chunk mode F: smooth long/short via lambda=smoothstep((C-Clow)/(Chigh-Clow)).
+    # F adds the "big request also waits for short requests each round" penalty
+    # (shared by N_long), curing mode E's over-chunking (S* floored ~256 under
+    # congestion). SHORT_SET=all => drag penalty W_soft counts running shorts AND
+    # waiting requests' extra wait => more conservative chunks, best p50/mean under
+    # load (validated jps=10: p50 37.5->36.5, mean 54.4->53.7, all tail metrics down).
+    # timeline (R_at/B_at) uses this real per-step chunk so future_free matches reality.
+    export LICHT_DYN_CHUNK=F
+    export LICHT_DYN_SHORT_SET=all
+    export LICHT_DYN_CLOW="${PREFILL_OPT_CLOW}"
+    export LICHT_DYN_CHIGH="${PREFILL_OPT_CHIGH}"
     [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
     echo "  prefill[$i]: PREFILL_OPT on (shorts-first longcap_fcfs + theta=${PREFILL_OPT_THETA}"\
-         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + dynamic_chunk; brb=${_brb_file:-default216})"
+         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + dynamic_chunk[F/all] band=${PREFILL_OPT_CLOW}-${PREFILL_OPT_CHIGH}"\
+         "+ short_reserve=${PREFILL_OPT_SHORT_RESERVE}; brb=${_brb_file:-default216})"
+  elif [[ "${PREFILL_FCFS}" == "true" ]]; then
+    # --prefill-fcfs: DIAGNOSTIC baseline. Keep LICHT-V3 (round-kv arena reuse)
+    # intact but strip every prefill-opt scheduling trick:
+    #   * priority = pure FCFS by arrival (LICHT_SCHED_SCHEME=fcfs) INSTEAD of the
+    #     round-based licht score -> rounds of one conversation are NOT reordered
+    #     apart, so a returning round's prefix is less likely evicted before it runs.
+    #   * NO longcap (no theta / reserve / order / FCFS-break).
+    #   * NO dynamic_chunk -> fixed chunk = vLLM native long_prefill_token_threshold
+    #     (= int(0.04*max_model_len) = 5242 for 131072 ctx); LICHT_DYN_CHUNK unset.
+    # Purpose: test whether the low prefix-cache hit rate is caused by scheduling
+    # reorder (longcap/score separating a conversation's rounds in time) vs the
+    # arena itself. If hit rate recovers -> scheduling; if still low -> arena.
+    export LICHT_SCHED_SCHEME=fcfs
+    echo "  prefill[$i]: PREFILL_FCFS on (LICHT-V3 + pure-FCFS priority + fixed chunk=native"\
+         "long_prefill_token_threshold; NO longcap, NO dynamic_chunk)"
   fi
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
@@ -941,7 +1027,7 @@ done
 # prefill-opt env is prefill-only: clear before launching decode workers so
 # decode scheduling is untouched.
 if [[ "${PREFILL_OPT}" == "true" ]]; then
-  unset LICHT_SCHED_SCHEME LICHT_LONGCAP_ORDER LICHT_LONG_THETA LICHT_LONG_C LICHT_LONG_RESV LICHT_LONGCAP_FCFS_BREAK LICHT_DYN_CHUNK LICHT_DYN_BRB_FILE
+  unset LICHT_SCHED_SCHEME LICHT_LONGCAP_ORDER LICHT_LONG_THETA LICHT_SHORT_RESERVE LICHT_LONG_C LICHT_LONG_RESV LICHT_LONGCAP_FCFS_BREAK LICHT_SCHED_HIT_PRED LICHT_LONG_THETA_RELAX LICHT_DYN_CHUNK LICHT_DYN_SHORT_SET LICHT_DYN_CLOW LICHT_DYN_CHIGH LICHT_DYN_BRB_FILE
 fi
 
 echo "Starting decode workers..."
@@ -954,6 +1040,13 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
 
   echo "  decode[$i]: gpu=${gpu_id}, http_port=${http_port}, kv_port=${kv_port}"
   DECODE_EXTRA_ARGS=()
+  # Decode runs eager unless --decode-cuda-graph is passed (prefill is always
+  # eager, hardcoded below).
+  if [[ "${DECODE_CUDA_GRAPH}" != "true" ]]; then
+    DECODE_EXTRA_ARGS+=(--enforce-eager)
+  else
+    [[ "$i" == "0" ]] && echo "  decode: CUDA graph ENABLED (eager off) — watch startup for 'Capturing CUDA graphs' + check trace_replay match"
+  fi
   if (( MAX_MODEL_LEN > 0 )); then
     DECODE_EXTRA_ARGS+=(--max-model-len "${MAX_MODEL_LEN}")
   fi
@@ -988,7 +1081,6 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
   NUMA_WRAP="$(numa_wrap_for_gpu "${gpu_id}")"
   [[ -n "${NUMA_WRAP}" ]] && echo "  decode[$i]: numa-bind gpu ${gpu_id} via '${NUMA_WRAP}'"
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
-    --enforce-eager \
     --host 0.0.0.0 \
     --port "${http_port}" \
     --tensor-parallel-size 1 \

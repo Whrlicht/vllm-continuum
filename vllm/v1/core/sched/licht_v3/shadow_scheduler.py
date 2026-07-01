@@ -991,10 +991,11 @@ class ShadowScheduler:
         return 2
 
     def _r_total(self, num_tokens: int, hit_length: int) -> int:
-        """Chunked-prefill chunks needed.  chunk_size ≈ 5242 tokens
-        (LICHTV2 default); fall back to ceil(num_tokens / 5242)."""
+        """Chunked-prefill chunks needed.  Uses the prefill-synced
+        chunk_size_tokens (real per-step chunk, dynamic-aware) instead of a
+        hardcoded 5242, so the shadow fallback R matches prefill."""
         remaining = max(num_tokens - hit_length, 0)
-        chunk = 5242
+        chunk = max(getattr(self, "chunk_size_tokens", 5242), 1)
         return max((remaining + chunk - 1) // chunk, 1)
 
     # ------------------------------------------------------------------

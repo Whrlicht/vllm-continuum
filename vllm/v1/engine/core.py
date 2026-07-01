@@ -53,6 +53,13 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# ★ LICHT_PROBE=1: master switch for the stall-investigation diagnostic
+# probes (SLOW-STEP / INPUT-WAIT here; EXEC-SPLIT / SLK-SLOW / LBM-SLOW /
+# BRIDGE-POP-SLOW / MIG-LOOP-SLOW / HITPRED-SLOW / STORE-SLOW / ENQUEUE-BLOCK
+# in their own modules). Default off → zero log noise / overhead in
+# production. Read once at import (set in the launch env before start).
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
+
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -288,15 +295,86 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # ★ STEP-PROF (LICHT_STEP_PROFILE=1): 分段计时 schedule / execute /
+        # update 的墙钟, 每 N 步汇总 p50/p90/max → 定位"利用率暴降"是卡在
+        # 调度(LICHT-V3 manager / 准入循环)、执行(forward + connector arena
+        # 加载 / NCCL)还是 update(输出处理 / recorder)。只计时, 不改逻辑。
+        _prof = os.environ.get("LICHT_STEP_PROFILE") == "1"
+        # ★ 无条件计时(perf_counter 极廉价): slow-phase 探针抓 stall —— 任一段
+        # >1s 立即告警, 定位 4-8s 卡死在 idle(步间阻塞)/ sched / exec / update
+        # 哪一段。不用等 200 步汇总。
+        _t0 = time.perf_counter()
+        # idle = 上一步结束到这一步开始的空窗(engine 被阻塞/等输入/等 worker)。
+        _pe = getattr(self, "_licht_prev_step_end", None)
+        _idle = (_t0 - _pe) * 1e3 if _pe is not None else 0.0
         scheduler_output = self.scheduler.schedule()
+        _t1 = time.perf_counter()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        _t2 = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+        _te = time.perf_counter()
+        self._licht_prev_step_end = _te
+        try:
+            _sched_ms = (_t1 - _t0) * 1e3
+            _exec_ms = (_t2 - _t1) * 1e3
+            _upd_ms = (_te - _t2) * 1e3
+            if _LICHT_PROBE and (_idle > 1000.0 or _sched_ms > 1000.0
+                                 or _exec_ms > 1000.0 or _upd_ms > 1000.0):
+                logger.warning(
+                    "SLOW-STEP idle=%.0f sched=%.0f exec=%.0f update=%.0f ms "
+                    "(ntok=%d nrun=%d) — stall 卡在最大那段", _idle, _sched_ms,
+                    _exec_ms, _upd_ms,
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(self.scheduler.running))
+            if _prof:
+                self._licht_step_prof(
+                    _idle, _sched_ms, _exec_ms, _upd_ms,
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(getattr(scheduler_output, "num_scheduled_tokens",
+                                None) or ()))
+        except Exception:  # pragma: no cover - profiling must never break
+            pass
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
+
+    def _licht_step_prof(self, idle_ms: float, sched_ms: float, exec_ms: float,
+                         upd_ms: float, ntok: int, nreq: int) -> None:
+        """STEP-PROF 累积器: 每 LICHT_STEP_PROFILE_N 步(默认200)汇总一次。
+        idle = 步间空窗(engine 阻塞); sched/exec/update = 步内三段。
+        p90/max 远大于 p50 = 有间歇性卡步(GPU 气泡 / 利用率暴降的现场)。"""
+        buf = getattr(self, "_licht_prof_buf", None)
+        if buf is None:
+            buf = self._licht_prof_buf = []
+        buf.append((idle_ms, sched_ms, exec_ms, upd_ms,
+                    float(ntok), float(nreq)))
+        _N = int(os.environ.get("LICHT_STEP_PROFILE_N", "200"))
+        if len(buf) < _N:
+            return
+        try:
+            import numpy as np
+            a = np.array(buf)
+
+            def q(c):
+                return (f"p50={np.percentile(a[:, c], 50):.1f} "
+                        f"p90={np.percentile(a[:, c], 90):.1f} "
+                        f"max={a[:, c].max():.1f}")
+
+            tot = a[:, 0] + a[:, 1] + a[:, 2] + a[:, 3]
+            logger.info(
+                "STEP-PROF n=%d | idle_ms(%s) | sched_ms(%s) | exec_ms(%s) | "
+                "update_ms(%s) | total_ms(p50=%.1f p90=%.1f max=%.1f) | "
+                "ntok p50=%.0f nreq p50=%.0f", len(buf), q(0), q(1), q(2),
+                q(3), float(np.percentile(tot, 50)),
+                float(np.percentile(tot, 90)), float(tot.max()),
+                float(np.percentile(a[:, 4], 50)),
+                float(np.percentile(a[:, 5], 50)))
+        except Exception:  # pragma: no cover - profiling must never break step
+            pass
+        self._licht_prof_buf = []
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -741,13 +819,30 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
+        _iw_t0 = time.perf_counter()
+        _iw_blocked = False
         while not self.engines_running and not self.scheduler.has_requests() \
                 and not self.batch_queue:
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
+            # ★ INPUT-WAIT 探针: 引擎无可跑请求, 在这 get() 上阻塞等输入。若
+            # stall 期间 blocked=数千ms, 坐实"引擎是【饿死】(没货可跑、等下一个
+            # 请求到达), 不是被某操作卡住"。has_requests()=False 才会进这。
+            _iw_blocked = True
             req = self.input_queue.get()
             self._handle_client_request(*req)
+        if _iw_blocked:
+            try:
+                _iw_bl = (time.perf_counter() - _iw_t0) * 1e3
+                if _LICHT_PROBE and _iw_bl > 1000.0:
+                    logger.warning(
+                        "INPUT-WAIT blocked=%.0fms nrun=%d nwait=%d "
+                        "(引擎无可跑请求, 等输入到达 = 饿死, 不是被卡)", _iw_bl,
+                        len(self.scheduler.running),
+                        len(getattr(self.scheduler, "waiting", ()) or ()))
+            except Exception:  # pragma: no cover - probe must never break
+                pass
 
         if waited:
             logger.debug("EngineCore loop active.")

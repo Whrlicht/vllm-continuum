@@ -47,6 +47,11 @@ from vllm.v1.core.estimate_with_func import ToolCallEstimator, Continuum_Recorde
 
 logger = init_logger(__name__)
 
+# ★ LICHT_PROBE=1: master switch for stall-investigation probes (HITPRED-SLOW
+# here). Default off → zero overhead. See vllm/v1/engine/core.py. NOTE: the
+# _bg_free_loop Fix B (blocking queue) is NOT gated — it is a real fix, always on.
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
+
 
 def _sanitize_output_tag(value: str) -> str:
     sanitized = "".join(
@@ -132,7 +137,7 @@ class Scheduler(SchedulerInterface):
     # for long-tail (R(j) > N) candidates and 0 otherwise.  Additionally
     # future_alloc[t] + B_j(t) must not exceed max_num_batched_tokens /
     # block_size to respect the per-step token budget.
-    LICHTV2_N = 50
+    LICHTV2_N = 300
     LICHTV2_LONG_TAIL_HEADROOM_RATIO = 0.025
     LICHTV2_MAX_LONG_BRIDGE = 2
 
@@ -293,6 +298,13 @@ class Scheduler(SchedulerInterface):
         # decode-side simulator uses this to model returning requests'
         # 回传'd prefix.  request_id → (hit_length, evictable_prefix).
         self._v3_waiting_hit: dict[str, tuple[int, int]] = {}
+        # LICHT_SCHED_HIT_PRED: per-step predicted cross-tier prefix hit
+        # (HBM + arena) for WAITING requests, computed BEFORE scoring so the
+        # score/dyn_precompute see the real remaining C (= num_tokens - hit)
+        # instead of treating waiting reqs as num_computed=0 (which mis-scores
+        # a returning round with a big cached prefix as LONG).  Rebuilt each
+        # step.  Empty (env off) -> consumers fall back to num_computed_tokens.
+        self._sched_hit_pred: dict[str, int] = {}
         # 回传 REMOVED (2026-05-21): no defer/push-back state on the prefill.
         # Total number of GPU blocks (denominator for headroom ratio).
         self._total_kv_blocks = num_gpu_blocks
@@ -646,8 +658,12 @@ class Scheduler(SchedulerInterface):
         # original round-based score below — no effect on normal runs.
         _scheme = os.environ.get("LICHT_SCHED_SCHEME")
         if _scheme:
-            C = max(request.num_tokens - request.num_computed_tokens, 1)
-            L = max(request.num_computed_tokens, 0)
+            # Use the predicted cross-tier hit for WAITING reqs (else
+            # num_computed_tokens: real for running, 0 for fresh waiting).
+            _hit = self._sched_hit_pred.get(
+                request.request_id, request.num_computed_tokens)
+            C = max(request.num_tokens - _hit, 1)
+            L = max(_hit, 0)
             base = math.log(L * C + C * C + 1.0)        # log(L*C + C^2)
             if _scheme == "sjf":
                 return -base                            # shortest-job first
@@ -734,9 +750,70 @@ class Scheduler(SchedulerInterface):
     #   C: S   = sqrt(brb * Σ D_iC_i / (W_t * Σ D_i))   (batch S, lumped W_t)
     #   D: S   = sqrt(brb * Σ D_iC_i / Σ N_short(i)D_i)  (batch S, SRPT victims)
     # brb = beta_r/b (tokens).  Short reqs (rem<=C*) never chunked.
+    def _licht_build_sched_hit_pred(self) -> None:
+        """Predict each WAITING request's real cross-tier prefix hit
+        (HBM local + arena external) BEFORE scoring / dyn_precompute /
+        admission.  Lets the score & dyn_precompute use C_eff = num_tokens -
+        hit instead of treating waiting reqs as num_computed=0 (which mis-
+        classifies a returning round with a big cached prefix as LONG).
+
+        SIDE-EFFECT-FREE: find_longest_cache_hit is a pure read (we skip
+        get_computed_blocks's prefix_cache_stats update); the connector arena
+        lookup is a pure read that caches per request_id in _rk_lk_cache (so
+        the value is reused for free at admit).  Rebuilt every step so
+        eviction is reflected.  Best-effort: any failure -> no entry ->
+        consumers fall back to request.num_computed_tokens.
+
+        Gated by LICHT_SCHED_HIT_PRED=1; off -> empty dict -> current behaviour.
+        """
+        self._sched_hit_pred = {}
+        if os.environ.get("LICHT_SCHED_HIT_PRED") != "1":
+            return
+        if not (self.licht_prefill_sched_enabled
+                and getattr(self.kv_cache_manager, "enable_caching", False)):
+            return
+        coord = getattr(self.kv_cache_manager, "coordinator", None)
+        if coord is None:
+            return
+        _hp_t0 = time.perf_counter()
+        _hp_flc = 0.0  # find_longest_cache_hit 累计
+        _hp_ext = 0.0  # arena get_num_new_matched_tokens 累计
+        _hp_n = 0
+        for req in self.waiting:
+            try:
+                _hp_n += 1
+                # HBM local hit (pure read; no stats touched).
+                _fa = time.perf_counter()
+                _, local_hit = coord.find_longest_cache_hit(
+                    req.block_hashes, max(req.num_tokens - 1, 0))
+                _fb = time.perf_counter()
+                _hp_flc += (_fb - _fa)
+                hit = local_hit
+                # arena external hit beyond local (pure read, cached).
+                if self.connector is not None:
+                    ext, _async = self.connector.get_num_new_matched_tokens(
+                        req, local_hit)
+                    if ext:
+                        hit += ext
+                    _hp_ext += (time.perf_counter() - _fb)
+                self._sched_hit_pred[req.request_id] = hit
+            except Exception:  # pragma: no cover - best-effort, never raise
+                pass
+        try:
+            _hp_ms = (time.perf_counter() - _hp_t0) * 1000.0
+            if _LICHT_PROBE and _hp_ms > 300.0:
+                logger.warning(
+                    "HITPRED-SLOW total=%.0fms n_waiting=%d "
+                    "find_longest_cache_hit=%.0fms arena_lookup=%.0fms — "
+                    "prefill schedule() 卡在逐 waiting 请求的 hit 预测 "
+                    "(LICHT_SCHED_HIT_PRED), 霸占 prefill GIL",
+                    _hp_ms, _hp_n, _hp_flc * 1000.0, _hp_ext * 1000.0)
+        except Exception:
+            pass
+
     def _licht_dyn_precompute(self) -> None:
         self._dyn_mode = os.environ.get("LICHT_DYN_CHUNK")
-        if self._dyn_mode not in ("A", "B", "C", "D"):
+        if self._dyn_mode not in ("A", "B", "C", "D", "E", "F"):
             return
         # brb = beta_r/b (tokens). Prefer a startup-calibrated value from a
         # json file (LICHT_DYN_BRB_FILE, written by the boot calibration
@@ -762,19 +839,76 @@ class Scheduler(SchedulerInterface):
             "LICHT_DYN_CSTAR", os.environ.get("LICHT_LONG_C", "5120")))
         self._dyn_floor = int(os.environ.get("LICHT_DYN_FLOOR", "256"))
         cstar = self._dyn_cstar
+        # mode E: smooth long/short via lambda = smoothstep((C-Clow)/(Chigh-Clow))
+        clow = float(os.environ.get("LICHT_DYN_CLOW", "2048"))
+        chigh = float(os.environ.get("LICHT_DYN_CHIGH", "5120"))
+        self._dyn_clow = int(clow)
         rema = []                 # remaining new-prefill tokens, all in-system
         longs = []                # (C_i, D_i) for long reqs (rem > cstar)
-        for r in list(self.running) + list(self.waiting):
-            rem = r.num_tokens - r.num_computed_tokens
+        e_num = e_gA = e_wsoft = 0.0   # mode E: Σλ_iD_iC_i, Σλ_iD_i, Σ(1-λ_i)
+        # mode F: 长项(λ)只算 running; 短项(1-λ)分 running/waiting 两堆,
+        # 由 LICHT_DYN_SHORT_SET 选用哪堆。f_lC=Σλ_run C, f_Nlong=Σλ_run。
+        f_lDC = f_lC = f_lD = f_Nlong = 0.0
+        f_Ts_run = f_ws_run = f_Ts_wait = f_ws_wait = 0.0
+        _n_run = len(self.running)
+        for _idx, r in enumerate(list(self.running) + list(self.waiting)):
+            # predicted cross-tier hit for waiting (real num_computed for
+            # running / when prediction is off) -> real D and C.
+            _hd = self._sched_hit_pred.get(r.request_id, r.num_computed_tokens)
+            rem = r.num_tokens - _hd
             if rem > 0:
                 rema.append(rem)
                 if rem > cstar:
-                    longs.append((rem, r.num_computed_tokens))
+                    longs.append((rem, _hd))
+                # smoothstep longness lambda_i in [0,1]
+                _x = (rem - clow) / max(chigh - clow, 1e-9)
+                _lam = (0.0 if _x <= 0.0 else
+                        (1.0 if _x >= 1.0 else (3.0 * _x * _x - 2.0 * _x ** 3)))
+                _D = _hd
+                e_num += _lam * _D * rem
+                e_gA += _lam * _D
+                e_wsoft += (1.0 - _lam)
+                _s = 1.0 - _lam
+                if _idx < _n_run:                       # running
+                    f_lDC += _lam * _D * rem
+                    f_lC += _lam * rem
+                    f_lD += _lam * _D
+                    f_Nlong += _lam
+                    f_Ts_run += _s * _D * rem
+                    f_ws_run += _s
+                else:                                   # waiting
+                    f_Ts_wait += _s * _D * rem
+                    f_ws_wait += _s
         self._dyn_ntotal = len(rema)
         self._dyn_wt = sum(1 for x in rema if x <= cstar)   # short victims
         self._dyn_sorted = sorted(rema)
         self._dyn_S = 0
-        if self._dyn_mode in ("C", "D") and longs:
+        if self._dyn_mode == "E":
+            # S* = sqrt( brb * Σλ_iD_iC_i / (W_soft * Σλ_iD_i) )  (minimize J(S))
+            if e_num > 0.0 and e_gA > 0.0 and e_wsoft > 0.0:
+                self._dyn_S = self._dyn_clamp(
+                    math.sqrt(self._dyn_brb * e_num
+                              / (e_wsoft * e_gA)), None)
+            # else degenerate (no longs / all fresh D=0) -> _dyn_S=0, cap falls
+            # back to static so a fresh lone long still gets a first chunk.
+        elif self._dyn_mode == "F":
+            # 大请求被拖慢(分子) = 重读 brb·Σλ_run DC  +  分摊版"等短请求":
+            #   T_short·Σλ_run C / Σλ_run   (T_short=Σ(1-λ)DC, 恒为 running 短请求,
+            #   物理意义=大请求每轮要等的、batch里实际在跑的短请求算力)
+            # 小请求被拖慢(分母) = W_soft · Σλ_run D
+            #   W_soft=Σ(1-λ)=被更大chunk拖慢的请求数, 由 LICHT_DYN_SHORT_SET 选:
+            #     run = 只 running 短请求被拖慢;
+            #     all = running 短请求被拖 + waiting 请求也要多等一轮.
+            # 注意: 只有 W_soft 随 all/run 变, T_short 永远是 running.
+            _sset = os.environ.get("LICHT_DYN_SHORT_SET", "all")
+            _Tshort = f_Ts_run
+            _wsoft = f_ws_run + (f_ws_wait if _sset == "all" else 0.0)
+            _num = (self._dyn_brb * f_lDC
+                    + _Tshort * f_lC / max(f_Nlong, 1e-9))
+            _den = _wsoft * f_lD
+            if _num > 0.0 and _den > 0.0:
+                self._dyn_S = self._dyn_clamp(math.sqrt(_num / _den), None)
+        elif self._dyn_mode in ("C", "D") and longs:
             sum_DC = sum(D * C for C, D in longs)
             if self._dyn_mode == "C":
                 denom = max(self._dyn_wt, 1) * max(sum(D for C, D in longs), 1)
@@ -797,8 +931,18 @@ class Scheduler(SchedulerInterface):
         # 0 = no cap (run whole).  When disabled, fall back to the static
         # global threshold so existing behaviour is byte-for-byte unchanged.
         mode = getattr(self, "_dyn_mode", None)
-        if mode not in ("A", "B", "C", "D"):
+        if mode not in ("A", "B", "C", "D", "E", "F"):
             return self.scheduler_config.long_prefill_token_threshold
+        if mode in ("E", "F"):
+            # smooth: short (lambda=0, C<=Clow) runs whole; else chunk at S*.
+            if remaining <= getattr(self, "_dyn_clow", 2048):
+                return 0
+            if self._dyn_S > 0:
+                return min(self._dyn_S, remaining)
+            # degenerate S*=0 (fresh lone long): fall back to static chunk so it
+            # still gets a bounded first step (then D>0 and the formula kicks in).
+            _stat = self.scheduler_config.long_prefill_token_threshold
+            return min(_stat if _stat > 0 else remaining, remaining)
         if remaining <= self._dyn_cstar:       # short request: never chunk
             return 0
         if mode == "A":
@@ -972,6 +1116,19 @@ class Scheduler(SchedulerInterface):
         chunk = self.scheduler_config.long_prefill_token_threshold
         return chunk if chunk > 0 else self.scheduler_config.max_num_batched_tokens
 
+    def _licht_v2_chunk_for(self, request: Request, remaining: int) -> int:
+        """Per-request per-step chunk the timeline should assume — the SAME
+        value the real prefill uses, so future_free/R_at match reality.
+
+        When dynamic_chunk is active this is _licht_dyn_cap (short -> run whole
+        in 1 step; long -> S*).  Otherwise the static threshold.  cap==0 means
+        "run whole" -> 1 step -> chunk = full remaining.
+        """
+        cap = self._licht_dyn_cap(request, remaining)
+        if cap <= 0:
+            return max(remaining, 1)
+        return cap
+
     def _licht_v2_R_at(self, request: Request, current_offset: int) -> int:
         """Remaining prefill scheduler steps starting from `current_offset`.
 
@@ -980,10 +1137,10 @@ class Scheduler(SchedulerInterface):
         is about to be admitted, pass the value that will become its
         num_computed_tokens (typically the prefix-cache hit count).
         """
-        chunk = self._licht_v2_chunk_size()
         remaining = max(request.num_tokens - current_offset, 0)
         if remaining <= 0:
             return 0
+        chunk = self._licht_v2_chunk_for(request, remaining)
         return (remaining + chunk - 1) // chunk
 
     def _licht_v2_release_blocks(
@@ -1015,9 +1172,9 @@ class Scheduler(SchedulerInterface):
         Ri = self._licht_v2_R_at(request, current_offset)
         if not (0 <= t < Ri):
             return 0
-        chunk = self._licht_v2_chunk_size()
         bs = self.block_size
         remaining_now = max(request.num_tokens - current_offset, 0)
+        chunk = self._licht_v2_chunk_for(request, remaining_now)
         cum_t = current_offset + min(chunk * (t + 1), remaining_now)
         cum_prev = current_offset + (
             min(chunk * t, remaining_now) if t > 0 else 0)
@@ -1262,11 +1419,21 @@ class Scheduler(SchedulerInterface):
             return True
 
         long_tail = Rj > N
+        _capr = os.environ.get("LICHT_ADMIT_PROBE")
+        _capr_on = (os.environ.get("LICHT_ADMIT_PROBE_ALL") == "1") or (
+            bool(_capr) and _capr in (getattr(request, "job_id", "") or ""))
+        if _capr_on and os.environ.get("LICHT_ADMIT_PROBE_ALL") != "1":
+            logger.info("PROBE-GUARD enter rid=%s Rj=%d longtail=%s",
+                        request.request_id, Rj, long_tail)
 
         # Guard 1: long-tail concurrency cap.
         if long_tail:
             long_count = self._licht_v2_count_long_running()
             if long_count + 1 > self.LICHTV2_MAX_LONG_BRIDGE:
+                if _capr_on:
+                    logger.info("PROBE-GUARD reject=Guard1_MAXLONGBRIDGE "
+                                "long_count=%d max=%d", long_count,
+                                self.LICHTV2_MAX_LONG_BRIDGE)
                 return False
 
         threshold = (int(self.LICHTV2_LONG_TAIL_HEADROOM_RATIO
@@ -1303,22 +1470,80 @@ class Scheduler(SchedulerInterface):
                 if _aged:
                     pass                                 # aged -> skip theta cap
                 elif _theta is not None:
-                    # theta: long reqs may collectively hold <= theta * total KV.
                     bs = self.block_size
-                    cur = sum((r.num_tokens + bs - 1) // bs for r in self.running
-                              if (r.num_tokens - r.num_computed_tokens) > thr)
                     cand = (request.num_tokens + bs - 1) // bs
-                    # theta gates STACKING extra longs, but never blocks the
-                    # head-of-line long when the lane is empty (cur==0) -> a
-                    # request bigger than theta*total still runs (alone), so no
-                    # permanent starvation; feasibility guard below keeps safety.
-                    if cur > 0 and cur + cand > float(_theta) * self._total_kv_blocks:
-                        return False
+                    # head-of-line: if no long is running yet, admit anyway (a
+                    # request larger than any cap still runs alone -> no permanent
+                    # starvation; feasibility guards below keep safety).
+                    any_long = any((r.num_tokens - r.num_computed_tokens) > thr
+                                   for r in self.running)
+                    # θ-relax (LICHT_LONG_THETA_RELAX=1): 本步没有短请求被挡下
+                    # (短请求都进去了) → θ 帽没有保护对象 → 松开 θ, 让长请求把
+                    # 空着的 KV 填满 (物理 future-free 仍兜底, 装不下才停)。短请求
+                    # order=short 优先 peek, 走到长请求时短请求都已处理完, 故
+                    # "没短请求被 skip" 即"短请求全进去了"。
+                    _theta_relax = (
+                        os.environ.get("LICHT_LONG_THETA_RELAX") == "1"
+                        and not getattr(self, "_licht_short_skipped", False))
+                    if os.environ.get("LICHT_LONGCAP_FOOTPRINT") == "1":
+                        # FOOTPRINT theta cap: bound the LONG lane to theta of total
+                        # KV by PROJECTED footprint (sum of running longs' full L+C
+                        # blocks + this candidate).  Unlike the SHORT_RESERVE branch,
+                        # this counts the FUTURE occupancy of longs still mid-prefill,
+                        # so admitting many longs while KV is momentarily low can NOT
+                        # over-commit and starve shorts a few seconds later (the bug
+                        # that turned shorts into long recomputes once their prefix
+                        # aged out of the arena).
+                        cur_long = sum((r.num_tokens + bs - 1) // bs
+                                       for r in self.running
+                                       if (r.num_tokens - r.num_computed_tokens) > thr)
+                        cap_long = float(_theta) * self._total_kv_blocks
+                        if any_long and cur_long + cand > cap_long:
+                            if _theta_relax:
+                                # 松 θ: 没短请求要保护, 不 return → 落到下面的
+                                # future-free 物理检查, 装得下就塞这个长请求。
+                                if _capr_on:
+                                    logger.info(
+                                        "PROBE-GUARD theta_relax PACK-LONG "
+                                        "cur_long=%d cand=%d cap=%d "
+                                        "(no short pending)", cur_long, cand,
+                                        int(cap_long))
+                            else:
+                                if _capr_on:
+                                    logger.info("PROBE-GUARD reject=LONG_THETA_FP "
+                                                "cur_long=%d cand=%d cap=%d",
+                                                cur_long, cand, int(cap_long))
+                                return False
+                        # physical feasibility within the timeline horizon: don't
+                        # admit a long the predicted free blocks can't hold now.
+                        ff = getattr(self, "_licht_v2_future_free", None)
+                        if any_long and ff and ff[0] < cand:
+                            if _capr_on:
+                                logger.info("PROBE-GUARD reject=LONG_FUTURE_FREE "
+                                            "ff0=%d cand=%d", ff[0], cand)
+                            return False
+                    else:
+                        # SHORT-RESERVE throttle (legacy patch; default).  Only
+                        # throttle a NEW long when TOTAL ACTUAL KV usage would push
+                        # past (1 - reserve).  Uses CURRENT usage, NOT projected
+                        # footprint -> over-admits longs while KV sits low because it
+                        # ignores how big the admitted-but-mid-prefill longs will grow.
+                        reserve = float(os.environ.get("LICHT_SHORT_RESERVE", "0.2"))
+                        used = self.kv_cache_manager.usage * self._total_kv_blocks
+                        ceiling = (1.0 - reserve) * self._total_kv_blocks
+                        if any_long and used + cand > ceiling and not _theta_relax:
+                            if _capr_on:
+                                logger.info("PROBE-GUARD reject=SHORT_RESERVE used=%d "
+                                            "cand=%d ceiling=%d reserve=%.2f",
+                                            int(used), cand, int(ceiling), reserve)
+                            return False
                 else:
                     Nlong = int(os.environ.get("LICHT_LONG_N", "2"))
                     nbig = sum(1 for r in self.running
                                if (r.num_tokens - r.num_computed_tokens) > thr)
                     if nbig >= Nlong:
+                        if _capr_on:
+                            logger.info("PROBE-GUARD reject=N_CAP nbig=%d N=%d", nbig, Nlong)
                         return False
             elif (not _is_long) and _short_cap:
                 # SHORT-CAP mode (mirror of longs-first): shorts get priority but
@@ -1334,6 +1559,8 @@ class Scheduler(SchedulerInterface):
                     cand_s = (request.num_tokens + bs - 1) // bs
                     cap_s = (1.0 - float(_theta_s)) * self._total_kv_blocks
                     if cur_s > 0 and cur_s + cand_s > cap_s:
+                        if _capr_on:
+                            logger.info("PROBE-GUARD reject=SHORT_CAP")
                         return False
             # reservation-backfill: protect the head big's slot T* (set in
             # build_timeline). Other bigs head-of-line behind it; smalls may
@@ -1341,6 +1568,10 @@ class Scheduler(SchedulerInterface):
             if (getattr(self, "_resv2_id", None) is not None
                     and request.request_id != self._resv2_id):
                 if request.num_tokens - num_computed_at_admit > thr:
+                    if _capr_on:
+                        logger.info("PROBE-GUARD reject=RESV_OTHER_BIG "
+                                    "resv_head=%s resv_blk=%d resv_T=%d",
+                                    self._resv2_id, self._resv2_blk, self._resv2_T)
                     return False           # no other big past the reserved head
                 T = min(self._resv2_T, len(self._licht_v2_future_free) - 1)
                 free_at_T = self._licht_v2_future_free[T]
@@ -1349,6 +1580,8 @@ class Scheduler(SchedulerInterface):
                 # Rj = candidate's steps-to-finish (releases its KV at t=Rj).
                 # If it still holds blocks at T*, it must leave slack >= F_big.
                 if Rj > T and free_at_T - F_small < self._resv2_blk:
+                    if _capr_on:
+                        logger.info("PROBE-GUARD reject=RESV_BACKFILL")
                     return False
         if _sch == "sjf_reservation":
             # reserve the head big job's footprint against all other candidates.
@@ -1381,6 +1614,10 @@ class Scheduler(SchedulerInterface):
 
             # Guard 2: block availability (with optional headroom).
             if self._licht_v2_future_free[t] + cum_delta < threshold:
+                if _capr_on:
+                    logger.info("PROBE-GUARD reject=GUARD2_BLOCKAVAIL t=%d "
+                                "future_free=%d cum_delta=%d threshold=%d",
+                                t, self._licht_v2_future_free[t], cum_delta, threshold)
                 return False
 
             # Guard 3: per-step alloc budget (only applies during j's
@@ -1388,6 +1625,10 @@ class Scheduler(SchedulerInterface):
             if t < Rj:
                 if (self._licht_v2_future_alloc[t] + bit_j
                         > max_alloc_per_step):
+                    if _capr_on:
+                        logger.info("PROBE-GUARD reject=GUARD3_ALLOCBUDGET t=%d "
+                                    "future_alloc=%d bit_j=%d max=%d", t,
+                                    self._licht_v2_future_alloc[t], bit_j, max_alloc_per_step)
                     return False
 
         return True
@@ -1509,6 +1750,11 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+
+        # Prefix-hit prediction (LICHT_SCHED_HIT_PRED=1): BEFORE scoring /
+        # dyn_precompute / admission, predict each waiting request's real
+        # cross-tier prefix hit so they are classified by REAL remaining C.
+        self._licht_build_sched_hit_pred()
 
         # LICHTV2: build the backfill window BEFORE the running loop so
         # that current_free / num_computed_tokens are both in their
@@ -1807,11 +2053,47 @@ class Scheduler(SchedulerInterface):
             # loop.  Each successful admit below applies its events to
             # the same timeline so subsequent candidates see the impact
             # of earlier ones in the same scheduler step.
+            if os.environ.get("LICHT_LOG_KV") == "1" and self.waiting:
+                logger.info("KVLOG usage=%.3f running=%d waiting=%d",
+                            self.kv_cache_manager.usage,
+                            len(self.running), len(self.waiting))
+            _adm_pr = os.environ.get("LICHT_ADMIT_PROBE")
+            _adm_pr_wait0 = bool(_adm_pr) and any(
+                _adm_pr in (getattr(r, "job_id", "") or "") for r in self.waiting)
+            _adm_peeked = False
+            # LICHT_SCHED_HIT_PRED: replace the hard FCFS_BREAK with a
+            # "close the long lane" flag (per-step).  When a GENUINE long (by
+            # REAL remaining) can't be admitted we close the long lane so
+            # younger longs can't jump it, but the loop CONTINUES so shorts /
+            # returning-rounds keep backfilling (no spurious break on a
+            # big-prompt-but-real-short request).
+            _hit_pred_on = os.environ.get("LICHT_SCHED_HIT_PRED") == "1"
+            _lc_thr = int(os.environ.get("LICHT_LONG_C", "5120"))
+            _long_lane_closed = False
+            # LICHT_LONG_THETA_RELAX: θ 容量帽是给【还在排队的短请求】留的预留。
+            # 本步一旦有短请求被挡下(放不进), 说明短请求还需要空间 → θ 保持。
+            # 若本步所有短请求都进去了(没有短请求被 skip), θ 就没有保护对象 →
+            # can_admit 里对长请求松开 θ 帽, 只保留物理 future-free 检查, 把空着
+            # 的 KV 塞长请求, 直到某个长请求物理装不下。每步重置。
+            self._licht_short_skipped = False
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    if _adm_pr_wait0:
+                        logger.info("PROBE-EXIT reason=max_running rid_present "
+                                    "peeked=%s nrun=%d nwait=%d kv=%.3f",
+                                    _adm_peeked, len(self.running),
+                                    len(self.waiting), self.kv_cache_manager.usage)
                     break
 
                 request = self._peek_waiting_request()
+                if _adm_pr and _adm_pr in (getattr(request, "job_id", "") or ""):
+                    _adm_peeked = True
+                    logger.info("PROBE-PEEK t=%.3f rid=%s status=%s C=%d nrun=%d "
+                                "nwait=%d kv=%.3f tokbudget=%d",
+                                time.time(), request.request_id, request.status,
+                                request.num_tokens - request.num_computed_tokens,
+                                len(self.running), len(self.waiting),
+                                self.kv_cache_manager.usage, token_budget)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -1947,6 +2229,17 @@ class Scheduler(SchedulerInterface):
                 # push-back trigger.  Returning requests admit normally (plain
                 # LICHT-V2 timeline behaviour); the prefix is recomputed if not
                 # cached, exactly like before回传 existed.
+
+                # Long lane closed: skip any further GENUINE long (by REAL
+                # remaining = num_tokens - real hit) so it can't jump the stuck
+                # oldest long.  Shorts / returning-rounds (real rem <= thr)
+                # fall through and keep backfilling.
+                if (_hit_pred_on and _long_lane_closed
+                        and (request.num_tokens
+                             - num_computed_tokens) > _lc_thr):
+                    self._pop_waiting_request(request)
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 encoder_inputs_to_schedule = None
                 new_encoder_compute_budget = encoder_compute_budget
@@ -2085,22 +2378,59 @@ class Scheduler(SchedulerInterface):
                     self._v3_waiting_hit[request.request_id] = (
                         anchor_lv2, evictable_prefix_lv2)
                     if not can_admit_lv2:
+                        if _adm_pr and _adm_pr in (getattr(request, "job_id", "") or ""):
+                            logger.info("PROBE-CANADMIT-FALSE rid=%s C=%d nrun=%d "
+                                        "kv=%.3f", request.request_id,
+                                        request.num_tokens - request.num_computed_tokens,
+                                        len(self.running), self.kv_cache_manager.usage)
+                        # θ-relax: 一个【短请求】没能进 → 短请求还需要空间 →
+                        # 本步不松 θ 帽 (留着给短请求, 别被长请求占了)。
+                        if (request.num_tokens - anchor_lv2) <= _lc_thr:
+                            self._licht_short_skipped = True
                         self._pop_waiting_request(request)
                         skipped_waiting_requests.prepend_request(request)
-                        # change 3 (LICHT_LONGCAP_FCFS_BREAK=1): a LONG that
-                        # can't be admitted STOPS the waiting loop — younger
-                        # longs must not jump ahead of it (strict FCFS among
-                        # longs).  Shorts were already peeked first (higher
-                        # score) so they keep backfilling; only the long lane
-                        # is gated.  Prevents big-prefix longs from being
-                        # starved by small-footprint longs grabbing the space
-                        # they are waiting to accumulate.
+                        # LICHT_SCHED_HIT_PRED: replace the hard break with a
+                        # "close the long lane" flag, classified by the REAL
+                        # remaining (num_computed_tokens local = real hit).  A
+                        # genuine long that can't be admitted closes the lane
+                        # (younger longs skipped above) but the loop CONTINUES
+                        # so shorts/returning-rounds keep backfilling.  A
+                        # big-prompt-but-real-short request that fails admit no
+                        # longer spuriously breaks the loop.
+                        if _hit_pred_on:
+                            if (os.environ.get("LICHT_SCHED_SCHEME")
+                                    in ("longcap_sjf", "longcap_fcfs")
+                                    and (request.num_tokens
+                                         - num_computed_tokens) > _lc_thr):
+                                _long_lane_closed = True
+                                if os.environ.get("LICHT_LOG_KV") == "1":
+                                    logger.info(
+                                        "EXITLOG reason=longcap_lane_closed "
+                                        "kv=%.3f nrun=%d nwait=%d C=%d",
+                                        self.kv_cache_manager.usage,
+                                        len(self.running), len(self.waiting),
+                                        request.num_tokens - num_computed_tokens)
+                            continue
+                        # change 3 (LICHT_LONGCAP_FCFS_BREAK=1, legacy / hit-pred
+                        # off): a LONG that can't be admitted STOPS the waiting
+                        # loop — younger longs must not jump ahead of it (strict
+                        # FCFS among longs).  Shorts were already peeked first
+                        # (higher score) so they keep backfilling; only the long
+                        # lane is gated.
                         if (os.environ.get("LICHT_LONGCAP_FCFS_BREAK") == "1"
                                 and os.environ.get("LICHT_SCHED_SCHEME")
                                 in ("longcap_sjf", "longcap_fcfs")):
                             _thr_b = int(os.environ.get("LICHT_LONG_C", "5120"))
                             if (request.num_tokens
                                     - request.num_computed_tokens) > _thr_b:
+                                if os.environ.get("LICHT_LOG_KV") == "1":
+                                    logger.info(
+                                        "EXITLOG reason=longcap_break kv=%.3f "
+                                        "nrun=%d nwait=%d C=%d",
+                                        self.kv_cache_manager.usage,
+                                        len(self.running), len(self.waiting),
+                                        request.num_tokens
+                                        - request.num_computed_tokens)
                                 break
                         continue
 
@@ -2117,6 +2447,20 @@ class Scheduler(SchedulerInterface):
                     )
 
                 if new_blocks is None:
+                    if os.environ.get("LICHT_LOG_KV") == "1":
+                        logger.info(
+                            "EXITLOG reason=alloc_none kv=%.3f nrun=%d nwait=%d "
+                            "C=%d numnew=%d delayfree=%d",
+                            self.kv_cache_manager.usage, len(self.running),
+                            len(self.waiting),
+                            request.num_tokens - request.num_computed_tokens,
+                            num_new_tokens, self._num_delay_free_blocks)
+                    if _adm_pr and _adm_pr in (getattr(request, "job_id", "") or ""):
+                        logger.info("PROBE-ALLOC-NONE rid=%s C=%d nrun=%d kv=%.3f "
+                                    "(passed can_admit but allocate_slots failed)",
+                                    request.request_id,
+                                    request.num_tokens - request.num_computed_tokens,
+                                    len(self.running), self.kv_cache_manager.usage)
                     #print(f"Request {request.request_id} cannot be scheduled due to no slots")
                     # The request cannot be scheduled.
                     # Delay-free admission control: if delay-free blocks
@@ -2286,6 +2630,33 @@ class Scheduler(SchedulerInterface):
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+                # DIAGNOSTIC (LICHT_LIFECYCLE_LOG=1): one line per admit showing
+                # what SCORING saw (C_score = prompt, because num_computed=0 for
+                # waiting reqs) vs the REAL remaining (C_real = prompt - real hit).
+                # A returning round with a big prefix shows scored=LONG / real=short
+                # -> it was mis-classified into the long lane and (if waited is big)
+                # starved there by FCFS_BREAK despite being cheap to run.
+                if (os.environ.get("LICHT_LIFECYCLE_LOG") == "1"
+                        and self.licht_prefill_sched_enabled):
+                    _thrL = int(os.environ.get("LICHT_LONG_C", "5120"))
+                    _c_score = request.num_tokens
+                    _c_real = request.num_tokens - num_computed_tokens
+                    _now = time.time()
+                    # total = engine-entry -> admit (includes input-queue delay);
+                    # sched = add-to-waiting -> admit (pure scheduler wait, the
+                    # part the long-lane mis-scoring / FCFS_BREAK can inflate).
+                    _q_total = _now - request.arrival_time
+                    _q_sched = _now - getattr(request, "_licht_add_ts",
+                                              request.arrival_time)
+                    logger.info(
+                        "LIFECYCLE rid=%s job=%s prompt=%d hit=%d C_score=%d "
+                        "C_real=%d scored=%s real=%s waited=%.2fs sched_wait=%.2fs",
+                        request.request_id,
+                        (getattr(request, "job_id", "") or "")[:40],
+                        request.num_tokens, num_computed_tokens, _c_score,
+                        _c_real, "LONG" if _c_score > _thrL else "short",
+                        "LONG" if _c_real > _thrL else "short",
+                        _q_total, _q_sched)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request.request_id] = (
@@ -2341,6 +2712,42 @@ class Scheduler(SchedulerInterface):
                                    "sum_c_ctx": int(_scd),
                                    "n_run": len(self.running),
                                    "n_sched": len(num_scheduled_tokens)}
+        # Per-step per-request chunk ground-truth log (env LICHT_LOG_CHUNK=1).
+        # Each line = one scheduler step: the batch S* plus every scheduled
+        # request's pre-step num_computed (D) and this step's chunk.  Lets us
+        # reconstruct each request's exact D trajectory without any guessing.
+        if os.environ.get("LICHT_LOG_CHUNK") == "1" and num_scheduled_tokens:
+            try:
+                self._chunk_log_step = getattr(self, "_chunk_log_step", 0) + 1
+                _reqs = []
+                for _r in self.running:
+                    _ck = num_scheduled_tokens.get(_r.request_id, 0)
+                    if _ck > 0:
+                        _reqs.append({
+                            "rid": _r.request_id,
+                            "job": getattr(_r, "job_id", None),
+                            "computed": int(_r.num_computed_tokens),
+                            "chunk": int(_ck),
+                            "prompt": int(_r.num_prompt_tokens),
+                        })
+                # waiting 也记: 公式用 running+waiting, waiting 的 num_computed
+                # 此刻=0(代码口径), 记 prompt+computed 以便完整复现 W_soft。
+                _wait = [{"rid": _w.request_id,
+                          "prompt": int(_w.num_prompt_tokens),
+                          "computed": int(_w.num_computed_tokens)}
+                         for _w in list(self.waiting)]
+                _p = os.environ.get("LICHT_CHUNK_LOG_PATH",
+                                    "/tmp/licht_chunk_log.jsonl")
+                with open(_p, "a") as _f:
+                    _f.write(json.dumps({
+                        "step": self._chunk_log_step,
+                        "S_star": int(getattr(self, "_dyn_S", 0) or 0),
+                        "n_run": len(self.running),
+                        "n_wait": len(self.waiting),
+                        "running": _reqs,
+                        "waiting": _wait}) + "\n")
+            except Exception:
+                pass
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -2596,7 +3003,8 @@ class Scheduler(SchedulerInterface):
                           if self.licht_v2_enabled else []),
             lichtv2_horizon_n=int(getattr(self, "LICHTV2_N", 0)),
             chunk_size_tokens=int(
-                self._licht_v2_chunk_size()
+                (getattr(self, "_dyn_S", 0)
+                 or self._licht_v2_chunk_size())
                 if self.licht_v2_enabled else 0),
             max_alloc_per_step_blocks=int(
                 self.max_num_scheduled_tokens // max(self.block_size, 1)),
@@ -3132,6 +3540,12 @@ class Scheduler(SchedulerInterface):
                 pass
         self.tool_call_estimator.request_arrives(request)
         self.continuum_recorder.request_arrives(request)
+        # DIAGNOSTIC: stamp when the SCHEDULER first sees this request (enters
+        # the waiting set).  request.arrival_time is the ENGINE-entry time
+        # (processor.py), which includes time spent in the engine input queue
+        # before the scheduler picked it up.  This stamp isolates the pure
+        # scheduler-waiting time (add -> admit) from that input-queue delay.
+        request._licht_add_ts = time.time()
 
         #print(f"Adding request {request.job_id} to waiting queue")
         #print(f"Request last_func_call: {request.last_func_call}")
@@ -3196,15 +3610,48 @@ class Scheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request)
 
+    def _licht_upd_acc(self, phase: str, dt: float,
+                       bump: bool = False) -> None:
+        """UPD-PROF (LICHT_STEP_PROFILE=1): 累积 update 收尾各子操作耗时, 每
+        LICHT_UPD_PROFILE_N(默认200)个结束请求汇总一次 → 看 update 暴击是
+        decode_manager / tool_estimator / recorder 哪个吃的(per-finish avg)。"""
+        try:
+            acc = getattr(self, "_licht_upd_buf", None)
+            if acc is None:
+                acc = self._licht_upd_buf = {}
+                self._licht_upd_n = 0
+            acc[phase] = acc.get(phase, 0.0) + dt
+            if not bump:
+                return
+            self._licht_upd_n += 1
+            if self._licht_upd_n < int(
+                    os.environ.get("LICHT_UPD_PROFILE_N", "200")):
+                return
+            n = self._licht_upd_n
+            parts = " ".join(
+                f"{k}={v * 1000.0:.0f}ms(avg{v / n * 1000.0:.3f})"
+                for k, v in sorted(acc.items()))
+            logger.info("UPD-PROF finishes=%d | per-phase total(per-finish "
+                        "avg ms): %s", n, parts)
+            self._licht_upd_buf = {}
+            self._licht_upd_n = 0
+        except Exception:  # pragma: no cover - profiling must never break
+            pass
+
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
         # LICHTV3: on decode, every finished request is a "round end".
         # Notify the v3 coordinator BEFORE we free state so its predictor
         # sees consistent num_tokens / agent_round on the request.  This
         # call never raises (manager wraps the pipeline in try/except).
+        _uprof = os.environ.get("LICHT_STEP_PROFILE") == "1"
         if self.licht_v3_decode_manager is not None:
+            _ut = time.perf_counter() if _uprof else 0.0
             self.licht_v3_decode_manager.on_round_finished(
                 request, decode_finish_ts=time.time())
+            if _uprof:
+                self._licht_upd_acc("decode_manager",
+                                    time.perf_counter() - _ut)
         # LICHTV3 GPU-tier retention: if the v3 decision wanted to keep
         # KV in decode GPU until the prewarm push fires, stash the
         # request here and SKIP the normal free path.  The decode
@@ -3215,8 +3662,15 @@ class Scheduler(SchedulerInterface):
                     request.request_id)):
             self._v3_retained_requests[request.request_id] = request
             return None
+        _ut = time.perf_counter() if _uprof else 0.0
         self.tool_call_estimator.request_finished(request)
+        if _uprof:
+            self._licht_upd_acc("tool_estimator", time.perf_counter() - _ut)
+            _ut = time.perf_counter()
         self.continuum_recorder.request_finished(request)
+        if _uprof:
+            self._licht_upd_acc("recorder", time.perf_counter() - _ut,
+                                bump=True)
         self._drop_licht_waiting_state(request.request_id)
         self.licht_running_admit_ts.pop(request.request_id, None)
         self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
@@ -3567,11 +4021,17 @@ class Scheduler(SchedulerInterface):
         _PENDING_STALENESS_S = 30.0   
 
         while True:
-            # Block until at least one item is available.
-            released = poll_fn()
+            # Fix B: block ON the queue instead of poll+sleep, so the thread
+            # truly OS-sleeps (GIL fully released) when idle — no busy wakeups.
+            # When `pending` is non-empty, use a short timeout so pending is
+            # rechecked promptly: pending items resolve on ENGINE-thread
+            # progress (is_finished() flip), not on a queue event, so we must
+            # wake periodically to recheck rather than block indefinitely.
+            # When idle, use a long timeout for a genuine sleep. Bounded (never
+            # None) so this daemon thread stays responsive at shutdown.
+            released = poll_fn(timeout=(0.005 if pending else 0.5))
             if not released and not pending:
-                # poll_fn returned empty and no pending — sleep briefly.
-                time.sleep(0.001)
+                # Timed out with nothing to do — sleep again.
                 continue
 
             # Merge newly released items with pending retries.

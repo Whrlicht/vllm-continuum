@@ -244,6 +244,35 @@ class LichtV3DecodeManager:
         except Exception as e:  # pragma: no cover
             logger.warning("LICHTV3 on_round_finished error: %s", e)
 
+    def _dmgr_prof(self, seg: str, dt: float, bump: bool = False) -> None:
+        """DMGR-PROF (LICHT_STEP_PROFILE=1): 拆 on_round_finished 的四段
+        (observe / predict / shadow / write), 每 LICHT_UPD_PROFILE_N(默认200)
+        个 finish 汇总一次 → 定位那 ~140ms/finish 到底谁吃的。"""
+        try:
+            if os.environ.get("LICHT_STEP_PROFILE") != "1":
+                return
+            acc = getattr(self, "_dmgr_prof_buf", None)
+            if acc is None:
+                acc = self._dmgr_prof_buf = {}
+                self._dmgr_prof_n = 0
+            acc[seg] = acc.get(seg, 0.0) + dt
+            if not bump:
+                return
+            self._dmgr_prof_n += 1
+            if self._dmgr_prof_n < int(
+                    os.environ.get("LICHT_UPD_PROFILE_N", "200")):
+                return
+            n = self._dmgr_prof_n
+            parts = " ".join(
+                f"{k}={v * 1000.0:.0f}ms(avg{v / n * 1000.0:.2f})"
+                for k, v in sorted(acc.items()))
+            logger.info("DMGR-PROF finishes=%d | per-seg total(per-finish "
+                        "avg ms): %s", n, parts)
+            self._dmgr_prof_buf = {}
+            self._dmgr_prof_n = 0
+        except Exception:  # pragma: no cover - profiling must never break
+            pass
+
     def _on_round_finished_inner(self, request: Any,
                                  decode_finish_ts: Optional[float]
                                  ) -> None:
@@ -333,6 +362,7 @@ class LichtV3DecodeManager:
                 measured_t = max(cur_pf_arrival - prev_decode_finish_ts,
                                  0.0)
                 # Pull obs text from the just-arrived round's prompt.
+                _t_obs = time.perf_counter()
                 obs_text = ""
                 try:
                     from .features_adapter import extract_observation_text
@@ -345,12 +375,20 @@ class LichtV3DecodeManager:
                 self.tool_predictor.observe_for_job(
                     job_id_str, prev_tc, measured_t,
                     observation_text=obs_text)
+                self._dmgr_prof("observe", time.perf_counter() - _t_obs)
         # ---- Extract THIS round's tc once; reuse for predict + save ----
+        _t_ex = time.perf_counter()
         cur_tc = self.tool_predictor.extract_tool_call_for_request(request)
+        # extract_tc = detokenize 输出 + 解析 tool_call(怀疑慢在 tokenizer.decode)
+        _t_pf = time.perf_counter()
+        self._dmgr_prof("extract_tc", _t_pf - _t_ex)
         # Step 1: predict T_tool.  Returns dict with p50/p95/p_timeout,
         # or None when no tool call detected (trajectory ended).
         t_tool_full = self.tool_predictor.predict_full_for_request(
             request, tc=cur_tc)
+        # predict_full = feature_row(建特征) + pd.DataFrame + ML predict_df。
+        # bump=True: 此处所有 finish 都会到(在 SKIP 判断之前)→ 每 finish 计一次。
+        self._dmgr_prof("predict_full", time.perf_counter() - _t_pf, bump=True)
         if t_tool_full is None:
             t_tool_s = None
         else:
@@ -414,6 +452,7 @@ class LichtV3DecodeManager:
         # fails → KV sinks to CPU/SSD (conservative).
         t_step_end_s = 0.0
         if self.shadow_scheduler is not None:
+            _t_shadow = time.perf_counter()
             try:
                 traj_id_for_shadow = (
                     str(getattr(request, "traj_id", None)
@@ -438,6 +477,7 @@ class LichtV3DecodeManager:
                 _tse = self.shadow_scheduler.predicted_step_end_ts()
                 if _tse is not None:
                     t_step_end_s = float(_tse)
+                self._dmgr_prof("shadow", time.perf_counter() - _t_shadow)
             except Exception as e:
                 logger.debug("ShadowScheduler.on_decode_finish err: %s "
                              "(falling back to k_queue=%d)", e, k_queue)
@@ -455,11 +495,13 @@ class LichtV3DecodeManager:
         # has `execution_time_seconds` = the trace's ground truth).
         # File lives in $LICHT_V3_PRED_LOG or default /data/whr/vllm-continuum/output/v3_predictions.jsonl
         # ----------------------------------------------------------------
+        _t_wr = time.perf_counter()
         self._write_prediction_record(
             request=request, agent_round=agent_round_curr,
             num_prompt_tokens=num_prompt_tokens,
             num_blocks=num_blocks, k_queue=k_queue,
             t_tool_full=t_tool_full, decode_finish_ts=decode_finish_ts)
+        self._dmgr_prof("write", time.perf_counter() - _t_wr)
         # ====================================================================
         # 回传 REMOVED (2026-05-21, user request): LICHT-V3 is now LICHT-V2 +
         # the three predictors (prediction OUTPUTS only).  decode no longer

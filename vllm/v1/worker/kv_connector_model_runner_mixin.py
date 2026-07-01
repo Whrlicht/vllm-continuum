@@ -4,6 +4,7 @@
 Define KV connector functionality mixin for model runners.
 """
 import copy
+import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Generator  # noqa: UP035
 from typing import TYPE_CHECKING, Optional
@@ -22,6 +23,10 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+# ★ LICHT_PROBE=1: master switch for stall-investigation probes (EXEC-SPLIT
+# here). Default off → zero overhead in production. See vllm/v1/engine/core.py.
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -120,12 +125,33 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
+        # ★ EXEC-SPLIT 探针: 把 exec(execute_model)拆成 start_load_kv(connector
+        # 加载/收 KV)/ forward(yield=model() dispatch)/ wait_for_save 三段。任一
+        # >1s 告警。若 forward 段大且 GPU idle → 引擎线程连 model() dispatch 都跑
+        # 不动 = GIL 被后台 arena 线程饿住(坐实 GIL 争用)。
+        import time as _esp_t
+        _esp0 = _esp_t.perf_counter()
         kv_connector.start_load_kv(get_forward_context())
+        _esp1 = _esp_t.perf_counter()
         try:
             yield output
         finally:
+            _esp2 = _esp_t.perf_counter()
             if wait_for_save:
                 kv_connector.wait_for_save()
+            try:
+                _esp3 = _esp_t.perf_counter()
+                _esp_load = (_esp1 - _esp0) * 1e3
+                _esp_fwd = (_esp2 - _esp1) * 1e3
+                _esp_save = (_esp3 - _esp2) * 1e3
+                if _LICHT_PROBE and (_esp_load > 1000.0 or _esp_fwd > 1000.0
+                                     or _esp_save > 1000.0):
+                    logger.warning(
+                        "EXEC-SPLIT start_load_kv=%.0f forward=%.0f "
+                        "wait_save=%.0f ms — exec stall 在这段", _esp_load,
+                        _esp_fwd, _esp_save)
+            except Exception:  # pragma: no cover - probe must never break
+                pass
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids))

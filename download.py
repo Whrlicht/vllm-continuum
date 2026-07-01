@@ -1,6 +1,6 @@
 from datasets import load_dataset
 
 ds = load_dataset(
-    "SWE-bench/SWE-smith-trajectories",
-    cache_dir="/data/whr/datasets/SWE-bench/SWE-smith-trajectories",
+    "allenai/WildChat-1M",
+    cache_dir="/data/whr/vllm-continuum/trace_data/origin_data/general/wildchat",
 )

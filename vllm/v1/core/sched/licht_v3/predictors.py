@@ -186,10 +186,34 @@ class ToolTimePredictorWrapper:
                     "source": "bucket_median",
                 }
             # ML path (bash family) — run predict_df once, harvest all 3.
+            # TPRED-PROF (LICHT_STEP_PROFILE=1): 拆 feature_row(建特征) vs
+            # DataFrame+ML predict_df, 每 200 次 ML 预测汇总 → 定位 predict_full
+            # 那 ~200ms 是建特征慢还是模型推理慢。
+            import os as _os
+            import time as _time
+            _tp = _os.environ.get("LICHT_STEP_PROFILE") == "1"
+            _tt = _time.perf_counter() if _tp else 0.0
             row = self._tracker.feature_row(job_id, tc)
+            _tt2 = _time.perf_counter() if _tp else 0.0
             import pandas as pd
             df = pd.DataFrame([row])
             out = self._predictor.predict_df(df)
+            if _tp:
+                try:
+                    self._fr_acc = getattr(self, "_fr_acc", 0.0) + (_tt2 - _tt)
+                    self._pd_acc = (getattr(self, "_pd_acc", 0.0)
+                                    + (_time.perf_counter() - _tt2))
+                    self._tp_n = getattr(self, "_tp_n", 0) + 1
+                    if self._tp_n >= 200:
+                        logger.info(
+                            "TPRED-PROF n=%d | feature_row=%.0fms(avg%.2f) | "
+                            "df+predict_df=%.0fms(avg%.2f)", self._tp_n,
+                            self._fr_acc * 1e3, self._fr_acc / self._tp_n * 1e3,
+                            self._pd_acc * 1e3, self._pd_acc / self._tp_n * 1e3)
+                        self._fr_acc = self._pd_acc = 0.0
+                        self._tp_n = 0
+                except Exception:
+                    pass
             def _safe(col: str, default: float = 0.0) -> float:
                 if col not in out.columns:
                     return default

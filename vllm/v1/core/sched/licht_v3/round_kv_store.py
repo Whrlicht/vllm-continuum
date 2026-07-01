@@ -54,6 +54,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# ★ LICHT_PROBE=1: master switch for stall-investigation probes (STORE-SLOW,
+# ENQUEUE-BLOCK here). Default off → zero overhead. See vllm/v1/engine/core.py.
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
+
 _MANIFEST = "manifest.json"
 
 
@@ -1334,10 +1338,22 @@ class RoundKVStore:
                 ev = None
         try:
             # block=True => high-water back-pressure (rare); never drops.
+            # ★ 探针: 引擎线程在这 put 上被背压阻塞多久(假设的卡点)。只在
+            # 阻塞 >50ms 时打 → 若 stall 期间出现 blocked=数千ms, 就坐实"引擎
+            # 卡在 store 队列背压"。qsize 看队列是不是满(==high_water)。
+            _eb_t = time.time()
+            _eb_q = self._queue.qsize()
             self._queue.put(
                 (job_id, list(full_block_ids), list(full_token_ids),
                  request_id, ev, bool(sink), 0, 0.0),
                 block=True, timeout=None)
+            _eb_bl = time.time() - _eb_t
+            if _LICHT_PROBE and _eb_bl > 0.05:
+                logger.warning(
+                    "ENQUEUE-BLOCK job=%s blocked=%.0fms qsize=%d->%d/%d "
+                    "(引擎被 store 队列背压卡住)", str(job_id)[:32],
+                    _eb_bl * 1000.0, _eb_q, self._queue.qsize(),
+                    self._high_water)
         except Exception as e:  # pragma: no cover
             logger.warning("RoundKVStore.enqueue_store failed job=%s: %s",
                            job_id, e)
@@ -1371,8 +1387,18 @@ class RoundKVStore:
                 time.sleep(0.05)
                 continue
             try:
+                # ★ 探针: 后台 store 线程每个任务耗时。只在 >100ms 时打 → 若
+                # do_store=数千ms, 坐实"后台 store 被(小 arena 的锁内)淘汰拖住,
+                # 排不动队 → 队列填满 → 上面 ENQUEUE-BLOCK"。qsize 看积压。
+                _ds_t = time.time()
                 self._do_store(job_id, block_ids, token_ids, request_id,
                                ev, stream, sink=sink, attempt=attempt)
+                _ds_dt = time.time() - _ds_t
+                if _LICHT_PROBE and _ds_dt > 0.1:
+                    logger.warning(
+                        "STORE-SLOW job=%s do_store=%.0fms qsize=%d sink=%s "
+                        "attempt=%d (后台 store 慢, 队列堵)", str(job_id)[:32],
+                        _ds_dt * 1000.0, self._queue.qsize(), sink, attempt)
             except Exception as e:  # pragma: no cover
                 logger.warning("RoundKVStore store failed job=%s: %s",
                                job_id, e)
@@ -1434,6 +1460,44 @@ class RoundKVStore:
                 os.environ.get("LICHT_SINK_RETRY_S", "0.5"))
         return v
 
+    def _heal_sink_rollback(self, job_id, matched) -> None:
+        """★ SINK 自愈 (LICHT_SINK_HEAL=1, 默认开): verify 复核出真实连续 LCP
+        = matched, 但 manifest.total 比它大 → 说明 [matched, total) 中间有洞
+        (dedup 共享 slot 被别 job 减到 0 释放, 而本 job manifest 没回退 → 单数字
+        manifest 表达不了中间洞 → 增量存 last 从虚高 total 往后走, 永远跳过洞)。
+
+        修法: 把 manifest + 内存进度【回退到 matched】, 下次 STALE-LAST 读到
+        回退后的 manifest → last=matched → 从洞口重存 [matched, end)。sink 路
+        block_ids 是整份(这轮 prefill 已把丢失段重算), 洞用 hold 的 GPU 块填上。
+
+        正确性:
+          - content-addr 的 lookup 逐块 probe 哈希表算 LCP(不信 manifest 数字),
+            故回退期间并发 lookup 仍得正确 matched, 不会读错;
+          - 重存 [matched, end) 与既有 inc 重叠 → refcnt++ 平衡(淘汰逐 .slot
+            decref + hash 校验防误减), 不损坏;
+          - 在途保护下重存段不被再淘 → 一次重存即填满洞 → verify FULL 收敛。
+        给 retry 和 give-up 两条路都回退: 即便本请求放弃, manifest 也不再说谎,
+        下一轮同 job 不会再被这个洞坑。"""
+        if os.environ.get("LICHT_SINK_HEAL", "1") != "1":
+            return
+        m = max(int(matched), 0)
+        cur = self._last_stored.get(job_id)
+        if cur is not None and m >= cur:
+            return   # 洞不在 last 下面, 无需回退
+        self._last_stored[job_id] = m
+        ls = self._lru_store
+        if ls is not None:
+            try:
+                if hasattr(ls, "_last_stored"):
+                    ls._last_stored[job_id] = m
+                ls._rewrite_manifest_for_self_heal(job_id, m)
+            except Exception as e:  # pragma: no cover - best-effort
+                logger.debug("SINK-HEAL rollback failed job=%s: %s",
+                             str(job_id)[:40], e)
+        logger.info(
+            "round-kv SINK-HEAL job=%s 回退 last/manifest %s->%d "
+            "(下次从洞口重存)", str(job_id)[:40], cur, m)
+
     def _do_store(self, job_id, block_ids, token_ids, request_id, ev,
                   stream, sink: bool = False, attempt: int = 0) -> None:
         with self._job_lock(job_id):
@@ -1449,7 +1513,7 @@ class RoundKVStore:
                 #   已存的段, 行为同旧)。
                 _man = self._read_total_blocks(job_id)
                 if _man < last:
-                    logger.info(
+                    logger.debug(
                         "STALE-LAST job=%s inmem=%d manifest=%d 重补[%d,%d)",
                         str(job_id)[:40], last, _man, _man, last)
                     last = _man   # ★ 用回退后的共享 manifest, 触发重补
@@ -1467,6 +1531,8 @@ class RoundKVStore:
                 if sink:
                     short = self._sink_verify_short(job_id, token_ids)
                     if short is not None:
+                        # 洞在 [matched, total) 中间: 回退到 matched, 下次重存填洞
+                        self._heal_sink_rollback(job_id, short)
                         if self.is_inflight(job_id):
                             self._requeue_sink(
                                 job_id, block_ids, token_ids, request_id,
@@ -1497,7 +1563,7 @@ class RoundKVStore:
                     # manifest 已由 LruArenaStore.write_inc 写过同一文件同内容
                     # (store-direct 必走 LRU), 不重复写 (省 O(token) JSON).
                     self._last_stored[job_id] = end
-                    logger.info(
+                    logger.debug(
                         "round-kv STORE-DIRECT: job=%s inc_blocks=%d "
                         "write_ms=%.0f", str(job_id)[:32], end - last,
                         (time.time() - _t1) * 1000.0)
@@ -1519,6 +1585,8 @@ class RoundKVStore:
                             last, end, attempt, (time.time() - _t1) * 1000.0)
                         return
                     reason = "verify_short(matched=%s)" % short
+                    # 洞在 [matched, total) 中间: 回退到 matched, 下次重存填洞
+                    self._heal_sink_rollback(job_id, short)
                 else:
                     reason = "write_failed"
                 if self.is_inflight(job_id):
@@ -1592,6 +1660,8 @@ class RoundKVStore:
                 # ★ sink: 写成功仍要复核整份可见, 齐才放 GPU 块。
                 short = self._sink_verify_short(job_id, token_ids)
                 if short is not None:
+                    # 洞在 [matched, total) 中间: 回退到 matched, 下次重存填洞
+                    self._heal_sink_rollback(job_id, short)
                     if self.is_inflight(job_id):
                         self._requeue_sink(job_id, block_ids, token_ids,
                                            request_id, ev, attempt,

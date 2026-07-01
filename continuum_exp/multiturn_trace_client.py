@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -66,10 +67,12 @@ class ClientConfig:
     concurrency: int
     jps: float
     poisson_max_concurrency: int
+    max_concurrent_sessions: int
     temperature: float
     top_p: float
     max_tokens_per_round: int
     job_id_field: str
+    shuffle_seed: int
     output_mode: str
     prefill_monitoring_path: str
     decode_monitoring_path: str
@@ -93,7 +96,7 @@ def parse_args() -> ClientConfig:
 
     parser.add_argument(
         "--trace-path",
-        default="trace_data/swe_bench_sample_300_tool_clean_with_timings.json",
+        default="trace_data/mixed",
         help="Path to trace dataset JSON")
     parser.add_argument("--output-dir",
                         default="output",
@@ -119,7 +122,7 @@ def parse_args() -> ClientConfig:
                         help="0 means full rounds derived from trace")
     parser.add_argument("--request-timeout-s",
                         type=float,
-                        default=300.0,
+                        default=10000.0,
                         help="HTTP timeout per request")
 
     # Unified trace_replay switch.
@@ -136,7 +139,7 @@ def parse_args() -> ClientConfig:
     # Distribution control.
     parser.add_argument("--dispatch-mode",
                         choices=["fixed", "poisson"],
-                        default="fixed",
+                        default="poisson",
                         help="Task dispatch strategy")
     parser.add_argument("--concurrency",
                         type=int,
@@ -144,12 +147,27 @@ def parse_args() -> ClientConfig:
                         help="Used in fixed mode")
     parser.add_argument("--jps",
                         type=float,
-                        default=3.0,
+                        default=2.0,
                         help="Poisson jobs per second")
     parser.add_argument("--poisson-max-concurrency",
                         type=int,
-                        default=48,
-                        help="Concurrency cap in poisson mode")
+                        default=256,
+                        help="Open-loop SAFETY VALVE: max concurrently IN-FLIGHT "
+                             "requests (held only around each request, released "
+                             "during think gaps). Set large/high for a fully "
+                             "uncapped open-loop run; load is governed by --jps.")
+    parser.add_argument("--max-concurrent-sessions",
+                        type=int,
+                        default=512,
+                        help="Cap on concurrently ACTIVE trajectories (sessions). "
+                             "A session holds its slot for its WHOLE lifetime — "
+                             "first round through last round, INCLUDING inter-round "
+                             "think gaps — so this directly bounds the server's "
+                             "cross-round prefix-KV working set (unlike "
+                             "--poisson-max-concurrency, which counts only in-flight "
+                             "requests and is released during think gaps). Excess "
+                             "arrivals queue until a slot frees. 0 = unlimited "
+                             "(default; current open-loop behaviour).")
 
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -166,6 +184,15 @@ def parse_args() -> ClientConfig:
         default="traj_id",
         help=("Which trace id to send as request job_id for scheduler/"
               "monitoring grouping."),
+    )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=1234,
+        help=("Seed for shuffling the combined trajectory list before "
+              "dispatch (so multiple datasets interleave and the "
+              "--max-trajectories cap samples across all of them). "
+              "Use a negative value to keep on-disk order."),
     )
     parser.add_argument(
         "--output-mode",
@@ -206,10 +233,12 @@ def parse_args() -> ClientConfig:
         concurrency=max(1, ns.concurrency),
         jps=max(1e-6, ns.jps),
         poisson_max_concurrency=max(1, ns.poisson_max_concurrency),
+        max_concurrent_sessions=max(0, ns.max_concurrent_sessions),
         temperature=ns.temperature,
         top_p=ns.top_p,
         max_tokens_per_round=max(0, ns.max_tokens_per_round),
         job_id_field=ns.job_id_field,
+        shuffle_seed=ns.shuffle_seed,
         output_mode=ns.output_mode,
         prefill_monitoring_path=ns.prefill_monitoring_path,
         decode_monitoring_path=ns.decode_monitoring_path,
@@ -316,6 +345,16 @@ def extract_round_specs(messages: list[dict[str, Any]]) -> list[RoundSpec]:
             if call_times:
                 # Use max as conservative delay for this round.
                 exec_seconds = max(call_times)
+        # Non-agent traces (e.g. general chat) carry the inter-round gap as a
+        # plain per-message field instead of via tool_calls.  tool_calls would
+        # be inlined into `content` by the normalizer and corrupt the chat text
+        # + forced output, so chat datasets must use this direct field.  Only
+        # consulted when tool_calls did not already supply a time (agent traces
+        # keep using tool_calls.execution_time_seconds).
+        if exec_seconds == 0.0:
+            direct = msg.get("execution_time_seconds")
+            if isinstance(direct, (int, float)):
+                exec_seconds = float(direct)
         rounds.append(
             RoundSpec(
                 assistant_round_index=assistant_round_index,
@@ -732,36 +771,90 @@ def _enrich_results_with_monitoring(
     }
 
 
+def _collect_trace_files(spec: str) -> list[Path]:
+    """Expand a trace-path spec into concrete *.json files.
+
+    `spec` may be a single file, a DIRECTORY (loads every *.json in it), or a
+    comma-separated list of either — so several datasets can be replayed
+    together by pointing --trace-path at a folder.  MUST stay in lock-step with
+    the server-side TraceStore._collect_files so both load the same traj_id set.
+    """
+    files: list[Path] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        p = Path(part).expanduser()
+        if p.is_dir():
+            files.extend(sorted(p.glob("*.json")))
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f"Warning: trace path not found, skipping: {p}")
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for f in files:
+        key = str(f.resolve())
+        if key not in seen:
+            seen.add(key)
+            uniq.append(f)
+    return uniq
+
+
 def load_trajectories(path: str,
-                      max_trajectories: int = 0) -> list[TrajectorySample]:
-    with Path(path).open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+                      max_trajectories: int = 0,
+                      shuffle_seed: int = -1) -> list[TrajectorySample]:
+    files = _collect_trace_files(path)
+    if not files:
+        return []
 
-    entries = raw if isinstance(raw, list) else [raw]
     out: list[TrajectorySample] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
+    seen_traj: set[str] = set()
+    dup = 0
+    for fp in files:
+        try:
+            with fp.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (ValueError, OSError) as exc:
+            print(f"Warning: skip trace file {fp}: {exc}")
             continue
 
-        traj_id = str(entry.get("traj_id") or entry.get("instance_id") or "")
-        instance_id = str(entry.get("instance_id") or traj_id)
-        if not traj_id:
-            continue
+        entries = raw if isinstance(raw, list) else [raw]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
 
-        messages = parse_messages_field(entry.get("messages"))
-        rounds = extract_round_specs(messages)
+            traj_id = str(
+                entry.get("traj_id") or entry.get("instance_id") or "")
+            instance_id = str(entry.get("instance_id") or traj_id)
+            if not traj_id:
+                continue
+            if traj_id in seen_traj:  # collision across files (e.g. merged dup)
+                dup += 1
+                continue
+            seen_traj.add(traj_id)
 
-        out.append(
-            TrajectorySample(
-                traj_id=traj_id,
-                instance_id=instance_id,
-                messages=messages,
-                rounds=rounds,
-            ))
+            messages = parse_messages_field(entry.get("messages"))
+            rounds = extract_round_specs(messages)
 
-        if max_trajectories > 0 and len(out) >= max_trajectories:
-            break
+            out.append(
+                TrajectorySample(
+                    traj_id=traj_id,
+                    instance_id=instance_id,
+                    messages=messages,
+                    rounds=rounds,
+                ))
 
+    # Shuffle BEFORE the cap so a mix of datasets interleaves (and the cap
+    # samples across all of them) instead of draining one file first.  Seeded
+    # => reproducible arrival order across runs.  shuffle_seed < 0 disables.
+    if shuffle_seed >= 0:
+        random.Random(shuffle_seed).shuffle(out)
+    if max_trajectories > 0:
+        out = out[:max_trajectories]
+
+    print(f"Loaded {len(out)} trajectories from {len(files)} file(s)"
+          + (f"; skipped {dup} duplicate traj_id(s)" if dup else ""))
     return out
 
 
@@ -850,6 +943,7 @@ async def run_single_trajectory(
     sample: TrajectorySample,
     cfg: ClientConfig,
     session: aiohttp.ClientSession,
+    inflight_sem: Optional[asyncio.Semaphore] = None,
 ) -> dict[str, Any]:
     start_ts = time.time()
     rounds = sample.rounds
@@ -873,15 +967,19 @@ async def run_single_trajectory(
             disagg_route: dict[str, Any] | None = None
 
             try:
-                raw_response = await chat_once(
-                    cfg,
-                    session,
-                    prompt_messages,
-                    sample.traj_id,
-                    sample.instance_id,
-                    round_spec.assistant_round_index,
-                    is_last_step=(i == len(rounds) - 1),
-                )
+                # Open-loop: the in-flight cap (if any) is held ONLY around the
+                # actual request, NOT across the inter-round think gap below, so
+                # a sleeping trajectory does not occupy a slot.  None => uncapped.
+                async with (inflight_sem or contextlib.nullcontext()):
+                    raw_response = await chat_once(
+                        cfg,
+                        session,
+                        prompt_messages,
+                        sample.traj_id,
+                        sample.instance_id,
+                        round_spec.assistant_round_index,
+                        is_last_step=(i == len(rounds) - 1),
+                    )
                 output_text = extract_output_text(raw_response)
                 route_meta = raw_response.get("_disagg_route")
                 if isinstance(route_meta, dict):
@@ -1000,14 +1098,36 @@ async def run_poisson_dispatch(
     session: aiohttp.ClientSession,
     results_sink: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
-    sem = asyncio.Semaphore(cfg.poisson_max_concurrency)
+    # OPEN-LOOP load generator.  Conversations ARRIVE as a Poisson process at
+    # `jps`, independent of how fast the server drains them.  By default there is
+    # NO session-level concurrency throttle: a trajectory sitting in its
+    # inter-round think gap does NOT hold back new arrivals (that was the
+    # closed-loop bug that left the server idle when many sessions were mid-gap).
+    # `poisson_max_concurrency` is repurposed as an optional SAFETY VALVE on the
+    # number of concurrently IN-FLIGHT requests (held only around each request,
+    # released during think gaps) — set it large for a fully uncapped open-loop.
+    inflight_sem = (asyncio.Semaphore(cfg.poisson_max_concurrency)
+                    if cfg.poisson_max_concurrency > 0 else None)
+    # OPTIONAL admission control: cap concurrently ACTIVE sessions.  Unlike
+    # inflight_sem, this slot is held for the trajectory's WHOLE lifetime (first
+    # round → last round, INCLUDING think gaps), so it bounds the server's
+    # cross-round prefix-KV working set (active sessions × their prefix).  Arrivals
+    # still happen on schedule (open-loop), but a trajectory blocks before its
+    # first request until a slot frees — excess arrivals queue, not run.
+    session_sem = (asyncio.Semaphore(cfg.max_concurrent_sessions)
+                   if cfg.max_concurrent_sessions > 0 else None)
     launched: list[asyncio.Task] = []
     results = results_sink if results_sink is not None else []
 
     async def guarded_run(sample: TrajectorySample) -> None:
-        async with sem:
-            result = await run_single_trajectory(sample, cfg, session)
-            results.append(result)
+        if session_sem is not None:
+            async with session_sem:
+                result = await run_single_trajectory(
+                    sample, cfg, session, inflight_sem=inflight_sem)
+        else:
+            result = await run_single_trajectory(
+                sample, cfg, session, inflight_sem=inflight_sem)
+        results.append(result)
 
     for i, sample in enumerate(samples):
         launched.append(asyncio.create_task(guarded_run(sample)))
@@ -1075,7 +1195,8 @@ def dump_output(
 
 
 async def async_main(cfg: ClientConfig) -> int:
-    samples = load_trajectories(cfg.trace_path, cfg.max_trajectories)
+    samples = load_trajectories(cfg.trace_path, cfg.max_trajectories,
+                                cfg.shuffle_seed)
     if not samples:
         print("No valid trajectories found in trace dataset")
         return 1

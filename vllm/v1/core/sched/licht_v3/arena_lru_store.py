@@ -181,6 +181,13 @@ class LruArenaStore:
         # 诊断日志 (LICHT_ARENA_DEBUG=1): 打 write_inc/evict/load 的 slot/gen
         # 细节, 用于验证 Phase 1/2 等路径下 LRU 真在工作且 slot/gen 对得上.
         self._debug = os.environ.get("LICHT_ARENA_DEBUG", "0") == "1"
+        # ★ SHORT 根因猎杀 (LICHT_ARENA_FREE_TRACE=1): 每次 refcnt→0 真释放一个 slot
+        # 时, 记下 slot/hash/受害job/refcnt_before + 该内容 hash 是否属于一个【在途】
+        # job. 复现 verify_short 后, 用 SHORT-WHY 给出的 hash 反查这里 → 一眼看到
+        # 谁/何时/在 refcnt 几的情况下把它释放的 (refcnt_before==1 = 引用漏算;
+        # inflight_seen 列出当时哪些 job 还在途 = 在途保护被绕). 默认关 (高频, 仅猎杀用).
+        self._free_trace = (
+            os.environ.get("LICHT_ARENA_FREE_TRACE", "0") == "1")
 
         # ★ Stage 6 内容寻址总开关 (LICHT_ARENA_CONTENT_ADDR=1).
         # 开: store 走 dedup (probe hash 表, 命中 refcnt++ 不新分配), .slot 写 v2;
@@ -533,10 +540,10 @@ class LruArenaStore:
             return False
         # ★诊断: 记每次 write 的范围 + 之前的 committed 边界 (查"重复写覆盖"假设:
         #   死亡轮 D2H 写 [0,N) 后, 有没有一次更小范围的 write 把 committed 压回去)
-        logger.info("WRITE-INC job=%s range=[%d,%d) last_before=%s inflight=%s",
-                    str(job_id)[:40], start_block, end_block,
-                    self._last_stored.get(job_id),
-                    os.path.exists(self._inflight_path(job_id)))
+        logger.debug("WRITE-INC job=%s range=[%d,%d) last_before=%s inflight=%s",
+                     str(job_id)[:40], start_block, end_block,
+                     self._last_stored.get(job_id),
+                     os.path.exists(self._inflight_path(job_id)))
         self._ensure_bg_evictor()   # Phase 1a: 写端惰性启动后台 evictor
 
         # ★ Stage 6: 内容寻址 dedup 路径 (probe hash 表, 命中复用不新分配)
@@ -676,10 +683,10 @@ class LruArenaStore:
         #   (SHORT 断在 block N → 找 start_block=N 的 WROTE-H, 比 hS 与 SHORT-WHY 的
         #   lookup hash: 一样=写过又没了(淘汰); 不一样=两端 token 口径不一致)。
         if end_block > start_block and len(all_hashes) >= end_block:
-            logger.info("WROTE-H job=%s [%d,%d) hS=%08x hE=%08x",
-                        str(job_id)[:40], start_block, end_block,
-                        all_hashes[start_block] & 0xffffffff,
-                        all_hashes[end_block - 1] & 0xffffffff)
+            logger.debug("WROTE-H job=%s [%d,%d) hS=%08x hE=%08x",
+                         str(job_id)[:40], start_block, end_block,
+                         all_hashes[start_block] & 0xffffffff,
+                         all_hashes[end_block - 1] & 0xffffffff)
         if len(all_hashes) < end_block:
             logger.warning(
                 "dedup write_inc: token_ids 不足 job=%s end=%d have=%d",
@@ -1479,7 +1486,7 @@ class LruArenaStore:
                     #   - inflight=False 但这 job 后来 SHORT → 内容在【非在途间隙】被淘
                     #     (Bug6 时机问题: 跑动期写的块没保护)。
                     if freed or left_pinned:
-                        logger.info(
+                        logger.debug(
                             "FREED-LF job=%s inc=[%d,%d) freed=%d pinned=%d "
                             "inflight=%s", str(victim)[:40], s, e, freed,
                             left_pinned,
@@ -1855,6 +1862,16 @@ class LruArenaStore:
                 _atomic.ht_remove(self._ht_base, self._ht_cap, h)
                 self._allocator.free_n([slot_id])
                 freed += 1
+                if self._free_trace:
+                    # ★ SHORT 猎杀: 用 SHORT-WHY 的 hash 反查这条 → 谁在 refcnt
+                    # 几(此处必为 1→0)真销毁了它. victim_job = 触发本次淘汰的 job
+                    # (不一定是受害内容的 owner); inflight=本进程此刻是否看到该
+                    # victim 的 .inflight (应为 False, 否则就是在途保护被绕的现场).
+                    logger.info(
+                        "ARENA-FREE slot=%d hash=%d h32=0x%08x victim_job=%s "
+                        "inc=[%d,%d) inflight=%s", slot_id, h,
+                        h & 0xffffffff, str(job_id)[:40], s, e,
+                        os.path.exists(self._inflight_path(job_id)))
             else:
                 # refcnt>0, 数据留给别的 job, 仅摘本 job 引用
                 self._stat_evict_decref += 1

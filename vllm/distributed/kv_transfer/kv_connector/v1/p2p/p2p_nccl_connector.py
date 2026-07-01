@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -27,6 +28,11 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# ★ LICHT_PROBE=1: master switch for stall-investigation probes (SLK-SLOW,
+# MIG-LOOP-SLOW here). Default off → zero overhead. See vllm/v1/engine/core.py.
+# (Module has a global `import os`; methods still use local `import os as _os`.)
+_LICHT_PROBE = os.environ.get("LICHT_PROBE") == "1"
 
 
 @dataclass
@@ -442,6 +448,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if (self._phase1_save_on_preempt
                     and self._round_kv_enabled and metadata.preempt_store
                     and self._round_store_obj is not None):
+                _ps_t = time.time()
                 for ps in metadata.preempt_store:
                     try:
                         ok = self._round_store_obj.save_preempted_sync(
@@ -456,6 +463,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         logger.warning(
                             "Phase1 preempt-save failed req=%s: %s",
                             ps.request_id, e)
+                try:
+                    _ps_ms = (time.time() - _ps_t) * 1000.0
+                    if _LICHT_PROBE and _ps_ms > 500.0:
+                        logger.warning("SLK-SLOW preempt_save=%.0fms n=%d",
+                                       _ps_ms, len(metadata.preempt_store))
+                except Exception:
+                    pass
 
             # Phase 2 (PD path selector) ARENA_SINK fires: tell each
             # prefill side to D2H its KV for this request and release
@@ -466,6 +480,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             # lookup to succeed).
             if (self._phase2_admission_gate and metadata.arena_sink
                     and self.p2p_nccl_engine is not None):
+                _as_t = time.time()
                 for (req_id, job_id, prompt_tids, remote_addr) in \
                         metadata.arena_sink:
                     if not remote_addr:
@@ -491,6 +506,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         logger.warning(
                             "ARENA_SINK send failed req=%s remote=%s: %s",
                             req_id, remote_addr, e)
+                try:
+                    _as_ms = (time.time() - _as_t) * 1000.0
+                    if _LICHT_PROBE and _as_ms > 500.0:
+                        logger.warning("SLK-SLOW arena_sink_send=%.0fms n=%d",
+                                       _as_ms, len(metadata.arena_sink))
+                except Exception:
+                    pass
 
             # Consumer recovery (Phase 1 save-on-preempt AND Phase 2
             # admission-gate): arena → GPU paged buffer for re-admitted
@@ -505,8 +527,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     and self._round_kv_enabled and metadata.round_load
                     and self._round_store_obj is not None):
                 _items = [_rl_item(rl) for rl in metadata.round_load]
+                _lb_t = time.time()
                 try:
                     _res = self._round_store_obj.load_batch(_items)
+                    _lb_ms = (time.time() - _lb_t) * 1000.0
+                    if _LICHT_PROBE and _lb_ms > 500.0:
+                        logger.warning("SLK-SLOW load_batch=%.0fms n=%d",
+                                       _lb_ms, len(_items))
                     logger.info(
                         "consumer arena load_batch: reqs=%d ok=%d "
                         "(Phase1/2 recovery, decode reads arena)",
@@ -528,6 +555,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     self._round_store_obj.enqueue_store(
                         rs.job_id, rs.block_ids, rs.token_ids, rs.request_id)
 
+            _mig_t = time.time()
+            _mig_n = len(metadata.requests)
             for req_meta in metadata.requests:
                 remote_address = req_meta.remote_prefill_address
                 if remote_address is None:
@@ -583,6 +612,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         decoding_block_ids,
                         remote_address,
                     )
+            try:
+                _mig_ms = (time.time() - _mig_t) * 1000.0
+                if _LICHT_PROBE and _mig_ms > 500.0:
+                    logger.warning(
+                        "MIG-LOOP-SLOW total=%.0fms nreq=%d — direct_block "
+                        "迁移循环(pop_bridge_request + launch_block_migration)"
+                        "整体阻塞, 结合 BRIDGE-POP-SLOW/LBM-SLOW 定位",
+                        _mig_ms, _mig_n)
+            except Exception:
+                pass
             return
 
         # Legacy layer-wise GET/PUT path.
@@ -653,6 +692,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             ip, port = self.parse_request_id(request.request_id,
                                              is_prefill=False)
             remote_address = ip + ":" + str(port + self._rank)
+            _rt0 = time.time()
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
 
@@ -677,6 +717,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                 inject_kv_into_layer(layer, kv_cache, request.block_ids,
                                      request.request_id)
+            # ★ RECV-BLOCK: 这个请求逐层 NCCL 收 KV 用了多久。>1s = decode 在
+            # recv_tensor 上阻塞等 prefill 送 KV (exec stall 的真凶)。
+            _rt = (time.time() - _rt0) * 1000.0
+            if _rt > 1000.0:
+                logger.warning(
+                    "RECV-BLOCK req=%s recv_kv=%.0fms (decode 在 NCCL 收 KV 上"
+                    "阻塞, 等 prefill 送)", request.request_id, _rt)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -792,7 +839,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 ls, le = self._step_t_load_start, self._step_t_load_end
                 # Only log steps that actually forwarded requests — skip the
                 # frequent idle steps (reqs=0) that spam the log.
-                if ls is not None and le is not None and _nreq > 0:
+                import os as _os
+                if (ls is not None and le is not None and _nreq > 0
+                        and _os.environ.get("LICHT_STEP_PROFILE") == "1"):
                     idle = ((ls - self._step_prev_save_end) * 1000.0
                             if self._step_prev_save_end is not None else 0.0)
                     logger.info(
@@ -949,11 +998,21 @@ p2p_nccl_engine import get_fast_release_queue
         return {}
 
     @staticmethod
-    def poll_fast_releases() -> list[tuple[str, dict[str, float]]]:
+    def poll_fast_releases(
+            timeout: float = 0.0) -> list[tuple[str, dict[str, float]]]:
         """Drain the fast-release queue (scheduler-side, Change 3).
 
         Returns a list of (request_id, timestamps) for requests whose
         RELEASE has been received by the listener thread.
+
+        timeout=0.0 (default): non-blocking drain — original behaviour, used
+        by the main-thread fallback path (_poll_fast_releases Path B).
+        timeout>0: block up to `timeout` seconds for the FIRST item (true OS
+        sleep, GIL fully released while waiting), then drain the rest
+        non-blocking.  Used by _bg_free_loop so the bg thread sleeps instead
+        of busy-polling when idle (Fix B: replaces Fix A's poll+1ms-sleep,
+        eliminating the ~1000/s idle wakeups that still briefly grabbed the
+        GIL).
         """
         from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
             get_fast_release_queue)
@@ -961,6 +1020,13 @@ p2p_nccl_engine import get_fast_release_queue
         if q is None:
             return []
         released: list[tuple[str, dict[str, float]]] = []
+        if timeout > 0:
+            # Block for the first item so the thread truly sleeps when idle
+            # (SimpleQueue.get raises queue.Empty on timeout → return empty).
+            try:
+                released.append(q.get(timeout=timeout))
+            except Exception:
+                return []
         while True:
             try:
                 item = q.get_nowait()
