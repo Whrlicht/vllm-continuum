@@ -207,6 +207,20 @@ class LruArenaStore:
         self._stat_miss_blocks = 0
         self._stat_evict_freed = 0
         self._stat_evict_decref = 0
+        # ★ P0 (SSD tier 前置): 三条驱逐路径分别的触发/释放计数.
+        #   路径① bg evictor: _stat_bg_rounds/_stat_bg_freed (已有, 见下).
+        #   路径② store preevict (锁外): _stat_preevict_*.
+        #   路径③ CS1 锁内 fallback: _stat_locked_* (含非 dedup 旧路径).
+        # 周期汇总由 bg evictor 线程打 (ARENA-STAT, 默认 30s 一行), 用于回答
+        # "驱逐流量的路径分布" -> SSD demote (只挂路径①) 的覆盖率上限.
+        # 多 store 线程并发 += 有丢数可能 (GIL 下极少), 统计用途可接受.
+        self._stat_preevict_calls = 0
+        self._stat_preevict_freed = 0
+        self._stat_locked_calls = 0
+        self._stat_locked_freed = 0
+        self._stat_last_report = 0.0
+        self._stat_interval = float(
+            os.environ.get("LICHT_ARENA_STAT_INTERVAL_S", "30"))
         # 进程内淘汰锁: 锁外两阶段淘汰要改 _job_lru/_last_stored 等进程内结构,
         # 多 store 线程并发淘汰需串行 (跨进程一致性仍靠 alloc_mutex). 只 1 个线程
         # 在本进程淘汰, 其余等 (淘汰是后台路径, 串行可接受).
@@ -747,12 +761,14 @@ class LruArenaStore:
 
                     _bud = (self._store_evict_budget_ms
                             if self._store_evict_budget_ms > 0 else None)
-                    self._evict_lockfree(_need + _margin,
-                                         exclude_job_id=job_id,
-                                         deferred=evict_deferred,
-                                         prof=(_pp if _prof else None),
-                                         recheck_fn=_recheck_need,
-                                         budget_ms=_bud)
+                    self._stat_preevict_calls += 1
+                    self._stat_preevict_freed += self._evict_lockfree(
+                        _need + _margin,
+                        exclude_job_id=job_id,
+                        deferred=evict_deferred,
+                        prof=(_pp if _prof else None),
+                        recheck_fn=_recheck_need,
+                        budget_ms=_bud)
         except Exception as _e:  # pragma: no cover
             logger.debug("pre-evict (lockfree) skipped: %s", _e)
         if _prof:
@@ -1599,6 +1615,34 @@ class LruArenaStore:
                         self._stat_bg_freed += gained
                         if gained == 0:
                             break   # 本进程 job 淘不动了 (都共享/pinned) → 退避
+                # ---- P0 周期统计: 三条驱逐路径的分布 (ARENA-STAT).
+                # 借 bg evictor 的巡检节奏, 每 LICHT_ARENA_STAT_INTERVAL_S
+                # (默认 30s, 0=关) 打一行本进程累计计数. 供评测驱逐流量
+                # 的路径分布 (= SSD demote 只挂路径① 时的覆盖率上限).
+                if self._stat_interval > 0:
+                    _now = time.time()
+                    if _now - self._stat_last_report >= self._stat_interval:
+                        self._stat_last_report = _now
+                        try:
+                            _free = int(
+                                self._allocator.count_free_accurate())
+                        except Exception:
+                            _free = -1
+                        logger.info(
+                            "ARENA-STAT free=%d/%d | bg(rounds=%d freed=%d)"
+                            " preevict(calls=%d freed=%d)"
+                            " locked(calls=%d freed=%d)"
+                            " | dedup(hit=%d miss=%d)"
+                            " evict(freed=%d decref=%d)",
+                            _free, self._num_slots,
+                            self._stat_bg_rounds, self._stat_bg_freed,
+                            self._stat_preevict_calls,
+                            self._stat_preevict_freed,
+                            self._stat_locked_calls,
+                            self._stat_locked_freed,
+                            self._stat_hit_blocks, self._stat_miss_blocks,
+                            self._stat_evict_freed,
+                            self._stat_evict_decref)
                 # idle 等待 (被 _signal_bg_evictor 唤醒 or 超时巡检)
                 with self._bg_cv:
                     self._bg_cv.wait(timeout=self._bg_interval)
@@ -1623,6 +1667,7 @@ class LruArenaStore:
         """
         if need <= 0:
             return True
+        self._stat_locked_calls += 1     # P0 统计: 路径③ 触发次数
         gained = 0
         _dl = ((time.time() + budget_ms / 1000.0)
                if budget_ms is not None else None)
@@ -1637,8 +1682,9 @@ class LruArenaStore:
             if exclude_job_id is not None and victim == exclude_job_id:
                 continue
             seen.add(victim)
-            gained += self._evict_job_tail_first(victim, need - gained,
-                                                 deferred)
+            _g = self._evict_job_tail_first(victim, need - gained, deferred)
+            gained += _g
+            self._stat_locked_freed += _g
         # 单遍不够 (victim 多被 pin / 内存 LRU 不全, 罕见): 兜底反复挑 (含文件系统)
         attempted: set[str] = set(seen)
         if exclude_job_id is not None:
@@ -1652,8 +1698,9 @@ class LruArenaStore:
                                "gained=%d need=%d", gained, need)
                 return False
             attempted.add(victim)
-            gained += self._evict_job_tail_first(victim, need - gained,
-                                                 deferred)
+            _g = self._evict_job_tail_first(victim, need - gained, deferred)
+            gained += _g
+            self._stat_locked_freed += _g
         return True
 
     def _pick_lru_victim(self,

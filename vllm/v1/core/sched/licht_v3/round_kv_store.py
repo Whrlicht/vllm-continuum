@@ -370,6 +370,30 @@ class RoundKVStore:
         # pin 时一致. 此计数 > 0 == pin/evict 不变量被破坏 (严重 bug), error 报警.
         self._lru_postload_fail_count = 0
 
+        # ============================================================
+        # SSD tier (P0 骨架, env: LICHT_SSD_TIER=1)
+        # ============================================================
+        # 三层存储的最冷层 (ssd_tier.py): CPU arena 驱逐时 bg evictor 把活跃
+        # job 的 inc 降级到 SSD (P1), lookup miss 时从 SSD promote 回 CPU
+        # (P2). 账本是第二个 LruArenaStore (元数据在 shm), 数据是 SSD 上单个
+        # fallocate 大文件. 默认关; 初始化失败自动禁用 (best-effort), 主路径
+        # 不受影响. 实例化在 _arena_init 末尾 (需 slot_bytes, worker 侧才知).
+        self._ssd_enabled = os.environ.get("LICHT_SSD_TIER", "0") == "1"
+        self._ssd_path = os.environ.get("LICHT_SSD_PATH", "")
+        self._ssd_gb = float(os.environ.get("LICHT_SSD_GB", "100"))
+        self._ssd_meta_path = os.environ.get(
+            "LICHT_SSD_META_PATH", "/dev/shm/licht_ssd_meta")
+        # P1 占位: 降级写线程数 (实测该盘写并发无收益, 2 够) / 降级队列深度
+        # (有限深, 盘追不上时放弃降级退化为丢弃) / O_DIRECT 开关 (A/B 用).
+        self._ssd_writers = int(os.environ.get("LICHT_SSD_WRITERS", "2"))
+        self._ssd_queue_depth = int(os.environ.get("LICHT_SSD_QUEUE", "64"))
+        self._ssd_direct = os.environ.get("LICHT_SSD_DIRECT", "0") == "1"
+        self._ssd_tier = None    # SsdTier, 由 _arena_init 设置 (worker 侧)
+        if self._ssd_enabled and not self._ssd_path:
+            logger.warning(
+                "LICHT_SSD_TIER=1 但 LICHT_SSD_PATH 未设置 -> SSD tier 禁用")
+            self._ssd_enabled = False
+
     # ------------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------------
@@ -650,6 +674,23 @@ class RoundKVStore:
                     ("C-fast" if (_HAS_C_LOOKUP
                                   and self._lru_store.content_addr)
                      else "PY/own-slot"))
+                # ---- SSD tier (P0): 冷层骨架, 依赖 slot_bytes/LRU 账本就绪.
+                # 失败只 log + 禁用 (best-effort), 绝不影响 CPU arena 主路径.
+                if self._ssd_enabled:
+                    try:
+                        from vllm.v1.core.sched.licht_v3.ssd_tier import (
+                            SsdTier)
+                        self._ssd_tier = SsdTier.open_or_create(
+                            meta_path=self._ssd_meta_path,
+                            data_path=self._ssd_path,
+                            ssd_gb=self._ssd_gb,
+                            slot_bytes=self._slot_bytes,
+                            block_size=self.block_size)
+                    except Exception as e:
+                        logger.warning(
+                            "round-kv SSD tier init failed: %s -> disabled",
+                            e)
+                        self._ssd_tier = None
                 return
             except Exception as e:
                 logger.warning(
@@ -3597,6 +3638,11 @@ class RoundKVStore:
         if self._load_pool is not None:
             try:
                 self._load_pool.shutdown(wait=False)
+            except Exception:
+                pass
+        if self._ssd_tier is not None:
+            try:
+                self._ssd_tier.close()
             except Exception:
                 pass
 
