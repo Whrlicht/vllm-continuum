@@ -686,6 +686,14 @@ class RoundKVStore:
                             ssd_gb=self._ssd_gb,
                             slot_bytes=self._slot_bytes,
                             block_size=self.block_size)
+                        # ---- P1 接线: 降级数据面 + demote 回调 ----
+                        # CPU arena mmap 作数据源 (pwrite 直达); LRU store 的
+                        # bg evictor 扫描/闸门自此生效 (demote-ahead 洗衣模型,
+                        # 见 arena_lru_store.bind_demote_fn 文档).
+                        self._ssd_tier.bind_cpu_source(
+                            self._arena_mm, self._slot_bytes)
+                        self._lru_store.bind_demote_fn(
+                            self._ssd_tier.demote_inc)
                     except Exception as e:
                         logger.warning(
                             "round-kv SSD tier init failed: %s -> disabled",

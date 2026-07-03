@@ -31,6 +31,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 from typing import Optional
 
 from vllm.v1.core.sched.licht_v3.arena_lru_store import LruArenaStore
@@ -54,10 +55,22 @@ class SsdTier:
         self._slot_bytes = slot_bytes
         self._block_size = block_size
         self._closed = False
-        # P1 起会加: demote 队列/写线程/计数器
-        self._stat_demote_blocks = 0
-        self._stat_demote_skipped = 0
+        # P1: CPU arena 数据源 (bind_cpu_source 注入; memoryview 零拷贝切片)
+        self._cpu_mv: Optional[memoryview] = None
+        self._stat_demote_blocks = 0      # 真写盘的 block 数
+        self._stat_demote_hit_blocks = 0  # dedup 命中零 I/O 的 block 数
+        self._stat_demote_skipped = 0     # write_inc 失败放弃的 block 数
         self._stat_promote_blocks = 0
+        # ★ 摊销 sync (真机修 A): 每 inc 一次 fdatasync 在慢盘上是吞吐灾难
+        # (4 进程写同一文件, 每次 sync 互刷对方脏页 -> 同步风暴; 实测 demote
+        # 只有 ~3 inc/s). 这是缓存不是持久存储 —— promote 读回走 page cache
+        # 天然一致, 崩溃本来就是冷启动 (shm 账本同灭). sync 只为限制脏页
+        # 积压 + 让 fadvise 真能丢页, 所以按写入量摊销: 每累计
+        # LICHT_SSD_SYNC_MB (默认 512) 才 fdatasync+fadvise 一次.
+        self._sync_bytes_cap = int(
+            os.environ.get("LICHT_SSD_SYNC_MB", "512")) * 1024 * 1024
+        self._bytes_since_sync = 0
+        self._sync_lock = threading.Lock()   # 2+ 写线程并发计数
 
     # ============================================================
     # Lifecycle
@@ -164,6 +177,12 @@ class SsdTier:
         if self._closed:
             return
         self._closed = True
+        if self._cpu_mv is not None:
+            try:
+                self._cpu_mv.release()   # 释放对 CPU arena mmap 的引用
+            except Exception:
+                pass
+            self._cpu_mv = None
         try:
             os.close(self._data_fd)
         except OSError:
@@ -199,6 +218,76 @@ class SsdTier:
         """slot_id -> 数据文件内字节偏移 (线性映射)."""
         return slot_id * self._slot_bytes
 
+    # ============================================================
+    # P1: 降级数据面 (CPU arena -> SSD 文件, pwrite 直达零中间缓冲)
+    # ============================================================
+    def bind_cpu_source(self, cpu_buf, cpu_slot_bytes: int) -> None:
+        """绑定 CPU arena 作为降级数据源 (worker 侧, _arena_init 后调).
+
+        cpu_buf: 支持 buffer 协议的对象 (生产 = CPU arena 的 mmap; 单测 =
+        任意 bytes-like). memoryview 切片零拷贝 -> pwrite 时内核直接从
+        shm 物理页 DMA 到盘, 我方不申请任何中转内存.
+        """
+        if cpu_slot_bytes != self._slot_bytes:
+            raise ValueError(
+                f"CPU slot_bytes={cpu_slot_bytes} != SSD {self._slot_bytes}"
+                " (两层 slot 布局必须一致)")
+        self._cpu_mv = memoryview(cpu_buf)
+        # SSD 账本的 data_writer: 只在 dedup MISS 时被调 (HIT 零 I/O).
+        self._store.bind_data_writer(self._pwrite_from_cpu)
+
+    def _pwrite_from_cpu(self, ssd_slot: int, blk_idx: int, src) -> None:
+        """LruArenaStore data_writer 钩子: src[blk_idx] 是 CPU slot_id."""
+        cpu_slot = src[blk_idx]
+        off = cpu_slot * self._slot_bytes
+        os.pwrite(self._data_fd,
+                  self._cpu_mv[off:off + self._slot_bytes],
+                  self.slot_offset(ssd_slot))
+
+    def demote_inc(self, job_id: str, s: int, e: int, records) -> bool:
+        """降级一个 inc (LruArenaStore 降级写线程回调).
+
+        records: [(cpu_slot, gen, hash), ...] —— 调用方已整 inc pin 住
+        (数据不会被动/被改), 返回后由调用方 unpin.
+
+        走 SSD 账本的标准 write_inc (hash 注入): 内容寻址命中 -> refcnt++
+        零字节 I/O ("每份内容终生只写一次盘"); miss -> alloc SSD slot +
+        _pwrite_from_cpu 落盘 + 两段式发布. SSD 满时 write_inc 内部走
+        自己的 LRU 淘汰 (drop-only). 失败返 False (调用方不标干净,
+        该 inc 退化为直接丢弃).
+        """
+        if self._cpu_mv is None or self._closed:
+            return False
+        cpu_slots = [r[0] for r in records]
+        hashes = [r[2] for r in records]
+        _miss_before = self._store._stat_miss_blocks
+        ok = self._store.write_inc(job_id, s, e, token_ids=[],
+                                   source_obj=cpu_slots,
+                                   inc_hashes=hashes)
+        if not ok:
+            self._stat_demote_skipped += len(records)
+            return False
+        _written = self._store._stat_miss_blocks - _miss_before
+        self._stat_demote_blocks += _written
+        self._stat_demote_hit_blocks += len(records) - _written
+        if _written > 0:
+            # 摊销 sync+丢缓存 (见 __init__ 注释): 攒够 LICHT_SSD_SYNC_MB
+            # 才刷一次. buffered 写脏页要先回写才可被 fadvise 丢.
+            _do_sync = False
+            with self._sync_lock:
+                self._bytes_since_sync += _written * self._slot_bytes
+                if self._bytes_since_sync >= self._sync_bytes_cap:
+                    self._bytes_since_sync = 0
+                    _do_sync = True
+            if _do_sync:
+                try:
+                    os.fdatasync(self._data_fd)
+                    os.posix_fadvise(self._data_fd, 0, 0,
+                                     os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+        return True
+
     def stats(self) -> dict:
         try:
             free = self._store.free_count()
@@ -208,6 +297,7 @@ class SsdTier:
             "num_slots": self._num_slots,
             "free": free,
             "demote_blocks": self._stat_demote_blocks,
+            "demote_hit_blocks": self._stat_demote_hit_blocks,
             "demote_skipped": self._stat_demote_skipped,
             "promote_blocks": self._stat_promote_blocks,
         }
