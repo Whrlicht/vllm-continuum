@@ -147,7 +147,7 @@ def parse_args() -> ClientConfig:
                         help="Used in fixed mode")
     parser.add_argument("--jps",
                         type=float,
-                        default=2.0,
+                        default=10.0,
                         help="Poisson jobs per second")
     parser.add_argument("--poisson-max-concurrency",
                         type=int,

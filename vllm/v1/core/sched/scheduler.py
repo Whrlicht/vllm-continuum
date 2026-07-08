@@ -292,6 +292,14 @@ class Scheduler(SchedulerInterface):
         # Without this, the timeline under-counts admit-time consumption
         # for multi-turn workloads that hit prior-turn prefix cache.
         self.licht_v2_evictable_prefix_at_admit: dict[str, int] = {}
+        # ★ 计划钉死 (2026-07-05): 准入那一刻的 dyn-chunk cap 快照. 已准入的
+        # 请求运行期用它, 不再随每步全局 S* 漂移. timeline 在准入时按此 cap
+        # 预订 R/B 并过 guard; 若运行期 cap 被 S*→0 退化改写成整段/DEGEN_CAP,
+        # 在跑请求单步索取远超预订 → 打穿 KV 池 → 驱逐 (2026-07-04 复盘). 钉死
+        # 后 S* 变化只影响【新准入】者 → plan==reality → 零驱逐不变式恢复.
+        self.licht_v2_dyn_cap_at_admit: dict[str, int] = {}
+        self._dyn_pin_cap = (
+            os.environ.get("LICHT_DYN_PIN_CAP", "1") == "1")
         # P5b: last-probed (prefix-hit, evictable) per WAITING request, so
         # the StepEvent can report the real prefix hit for waiting reqs
         # (their request.num_computed_tokens is still 0 pre-admit).  The
@@ -928,6 +936,17 @@ class Scheduler(SchedulerInterface):
         return c
 
     def _licht_dyn_cap(self, request: Request, remaining: int) -> int:
+        # ★ 计划钉死: 已准入的请求返回准入那一刻快照的 cap (与 timeline 预订
+        # 一致), 不随全局 S* 漂移. 未准入的候选走 live (用当前 S* 评估). 判据
+        # = request_id 是否已在 num_computed_at_admit 里 (= 已 admit). 见
+        # licht_v2_dyn_cap_at_admit 注释.
+        if self._dyn_pin_cap:
+            _pinned = self.licht_v2_dyn_cap_at_admit.get(request.request_id)
+            if _pinned is not None:
+                return _pinned
+        return self._licht_dyn_cap_live(request, remaining)
+
+    def _licht_dyn_cap_live(self, request: Request, remaining: int) -> int:
         # 0 = no cap (run whole).  When disabled, fall back to the static
         # global threshold so existing behaviour is byte-for-byte unchanged.
         mode = getattr(self, "_dyn_mode", None)
@@ -942,6 +961,12 @@ class Scheduler(SchedulerInterface):
             # degenerate S*=0 (fresh lone long): fall back to static chunk so it
             # still gets a bounded first step (then D>0 and the formula kicks in).
             _stat = self.scheduler_config.long_prefill_token_threshold
+            if _stat <= 0:
+                # ★ 退化分支兜底 (2026-07-03 OOM 复盘): 全系统皆长请求时
+                # W_soft=0 -> S*=0, 且 static 未配 -> 原行为整段不切 -> 一步
+                # 22 万 token 的激活分配踩中碎片化. LICHT_DYN_DEGEN_CAP>0
+                # 时用它封顶 (opt-in, 默认 0 = 原行为字节级不变).
+                _stat = int(os.environ.get("LICHT_DYN_DEGEN_CAP", "0"))
             return min(_stat if _stat > 0 else remaining, remaining)
         if remaining <= self._dyn_cstar:       # short request: never chunk
             return 0
@@ -1949,6 +1974,10 @@ class Scheduler(SchedulerInterface):
                             preempted_req.request_id, None)
                         self.licht_v2_evictable_prefix_at_admit.pop(
                             preempted_req.request_id, None)
+                        # 计划钉死: 抢占后清 cap 快照, 下次重新准入时按新
+                        # 时刻的 S* 重新钉 (它此刻是全新候选).
+                        self.licht_v2_dyn_cap_at_admit.pop(
+                            preempted_req.request_id, None)
                         # Accumulate victim count for the LICHT preempt
                         # selector.  Unconditional: non-LICHT paths never
                         # read this field, so the write is harmless.
@@ -2521,6 +2550,15 @@ class Scheduler(SchedulerInterface):
                         request.request_id] = anchor_lv2
                     self.licht_v2_evictable_prefix_at_admit[
                         request.request_id] = evictable_prefix_lv2
+                    # ★ 计划钉死: 快照 chunk cap.  用 live 版 (此刻 request_id
+                    # 还没进 num_computed_at_admit, 但下一行就进了, 所以直接调
+                    # live 避免自引用) 按【全额剩余】算, 与 timeline 的
+                    # _licht_v2_chunk_for(remaining=num_tokens-anchor) 同口径.
+                    if self._dyn_pin_cap:
+                        self.licht_v2_dyn_cap_at_admit[request.request_id] = (
+                            self._licht_dyn_cap_live(
+                                request,
+                                max(request.num_tokens - anchor_lv2, 1)))
                     self._licht_v2_apply_to_timeline(
                         request, anchor_lv2, evictable_prefix_lv2)
                     # LICHTV2 monitoring: dump the four block-accounting
@@ -3675,6 +3713,7 @@ class Scheduler(SchedulerInterface):
         self.licht_running_admit_ts.pop(request.request_id, None)
         self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
         self.licht_v2_evictable_prefix_at_admit.pop(request.request_id, None)
+        self.licht_v2_dyn_cap_at_admit.pop(request.request_id, None)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
@@ -3734,6 +3773,7 @@ class Scheduler(SchedulerInterface):
             self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
             self.licht_v2_evictable_prefix_at_admit.pop(
                 request.request_id, None)
+            self.licht_v2_dyn_cap_at_admit.pop(request.request_id, None)
             delay_free_blocks, _ = self._connector_finished(request)
             self.encoder_cache_manager.free(request)
             self.finished_req_ids.add(request_id)
