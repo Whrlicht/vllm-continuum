@@ -25,14 +25,18 @@ P0 只有生命周期 (open/close/stats); demote/promote 在 P1/P2 加入.
 """
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import json
 import logging
 import os
+import queue
 import shutil
 import tempfile
 import threading
 from typing import Optional
+
+import licht_arena_atomic as _atomic
 
 from vllm.v1.core.sched.licht_v3.arena_lru_store import LruArenaStore
 
@@ -50,6 +54,29 @@ class SsdTier:
                  num_slots: int, slot_bytes: int, block_size: int):
         self._store = store
         self._data_fd = data_fd
+        # ★ P2 修 (实测 2026-07-04): promote 读走 O_DIRECT —— 同等写压力下
+        # 0.389 vs buffered 0.121 GB/s (3.2x). buffered 冷读要在 page cache
+        # 抢页 (本机内存大头被 pinned shm arena 锁死, 直接回收停顿), O_DIRECT
+        # 直达设备. 对齐天然满足 (偏移/长度 = slot_bytes 整数倍, 目标地址 =
+        # 页对齐 mmap 的 slot 偏移). 打不开 (如 tmpfs 不支持) 退回 buffered.
+        self._data_fd_direct = -1
+        try:
+            self._data_fd_direct = os.open(data_file,
+                                           os.O_RDONLY | os.O_DIRECT)
+        except OSError:
+            pass
+        # ★ 2026-07-07: 写也走 O_DIRECT (对称于上面的读). buffered pwrite 会在
+        # 内核 page cache 生成脏页; 本机 400G pinned shm arena 锁死内存, 脏页撞
+        # vm.dirty_ratio 触发全局 direct-reclaim/限流 -> prefill+decode 引擎
+        # 【一起】卡到 0 (复盘: 大环放大写量后复现, 小环因 94% 丢弃写量小而无感).
+        # O_DIRECT 直写设备不产脏页, 阻塞代价关在写进程内不外溢. 对齐由环 slot
+        # 数据区 4096 对齐保证 (ssd_stage_ring._meta_bytes). 不支持则退回 buffered.
+        self._data_fd_direct_w = -1
+        try:
+            self._data_fd_direct_w = os.open(data_file,
+                                             os.O_WRONLY | os.O_DIRECT)
+        except OSError:
+            pass
         self._data_file = data_file
         self._num_slots = num_slots
         self._slot_bytes = slot_bytes
@@ -71,6 +98,42 @@ class SsdTier:
             os.environ.get("LICHT_SSD_SYNC_MB", "512")) * 1024 * 1024
         self._bytes_since_sync = 0
         self._sync_lock = threading.Lock()   # 2+ 写线程并发计数
+        # ★ 2026-07-06 capture-at-eviction 重构 (取代 demote-ahead+pin):
+        #   驱逐【释放块前】把整 inc 数据 memcpy 进 blob (capture_inc), 后台
+        #   写线程刷 SSD. 驱逐本身走纯 LRU、零 pin -> 和纯 CPU 一致. (旧路
+        #   demote_scan 提前 pin 冷块, 逼驱逐淘热块 -> hit 崩塌, 2026-07-05
+        #   复盘.) 字节预算封顶暂存 RAM: inflight+inc > budget 就丢 (那些块不
+        #   进 SSD = 纯 CPU 丢弃, 绝不阻塞驱逐). 超大 inc(>max_blk) 也丢.
+        # 暂存总预算 (RAM 上限). 相对 400G pinned arena 可忽略, 给足以流水.
+        self._stage_budget = int(
+            os.environ.get("LICHT_SSD_STAGE_MB", "512")) * (1 << 20)
+        # 分块粒度: 大 inc (长 prompt 首轮可几千块) 切成 chunk 块一段逐段存,
+        # 不再整段丢 (和 CPU 驱逐 bg_chunk 同哲学).
+        self._stage_chunk = max(
+            1, int(os.environ.get("LICHT_SSD_STAGE_CHUNK_BLK", "64")))
+        # ★ 2026-07-06 Q2: 暂存改用【跨进程 SHM 环】(ssd_stage_ring). 生产端
+        #   (decode) 建环, capture memmove 数据进环槽 + 发布; 消费端 (独立写
+        #   进程) drain 环 -> SSD 账本 write_inc + pwrite. 整个写路径 (含
+        #   fdatasync/fadvise) 搬出 decode 进程 -> decode 只剩 memmove(放 GIL),
+        #   写线程的磁盘/内存副作用彻底和 decode 隔离. 环满即丢 (背压 = 纯 CPU 丢).
+        #   环槽数 = 预算 / chunk字节 (和旧池同量 RAM, 只是挪进 shm).
+        self._ring_slotbytes = self._stage_chunk * int(slot_bytes)
+        self._ring_n = max(2, self._stage_budget // max(self._ring_slotbytes, 1))
+        self._ring_dir = os.environ.get("LICHT_SSD_RING_DIR", "/dev/shm")
+        self._ring = None                # 生产端 (decode bind 时建) / 消费端 open
+        self._ring_path = None
+        self._stat_capture_ok = 0        # 成功入环的 inc 数
+        self._stat_capture_drop = 0      # 环满/超大丢弃的 block 数
+        self._stat_capture_blocks = 0    # 成功 capture 的 block 数
+        # ★ capture 拷贝改用 libc.memmove: ctypes 调 C 时【释放 GIL】, 2MB/块
+        #   拷贝不再和 decode 计算抢 GIL (实测: memoryview 拷贝把计算线程打到
+        #   -67%, memmove 只 -4%, 2026-07-06). argtypes 必设, 否则 64 位地址被
+        #   当 c_int 截断 -> 段错误.
+        self._libc = ctypes.CDLL(None)
+        self._libc.memmove.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        self._libc.memmove.restype = ctypes.c_void_p
+        self._cpu_base = 0               # CPU arena mmap 基址 (bind_cpu_source 设)
 
     # ============================================================
     # Lifecycle
@@ -177,6 +240,18 @@ class SsdTier:
         if self._closed:
             return
         self._closed = True
+        # 关 SHM 环 (生产端删文件; 消费端只 close mmap)
+        if self._ring is not None:
+            try:
+                self._ring.close()
+            except Exception:
+                pass
+            if self._ring_path is not None:   # 生产端建的, 删文件
+                try:
+                    os.unlink(self._ring_path)
+                except OSError:
+                    pass
+            self._ring = None
         if self._cpu_mv is not None:
             try:
                 self._cpu_mv.release()   # 释放对 CPU arena mmap 的引用
@@ -187,6 +262,16 @@ class SsdTier:
             os.close(self._data_fd)
         except OSError:
             pass
+        if self._data_fd_direct >= 0:
+            try:
+                os.close(self._data_fd_direct)
+            except OSError:
+                pass
+        if self._data_fd_direct_w >= 0:
+            try:
+                os.close(self._data_fd_direct_w)
+            except OSError:
+                pass
         self._store.close()
 
     def __enter__(self):
@@ -233,8 +318,31 @@ class SsdTier:
                 f"CPU slot_bytes={cpu_slot_bytes} != SSD {self._slot_bytes}"
                 " (两层 slot 布局必须一致)")
         self._cpu_mv = memoryview(cpu_buf)
+        # CPU arena mmap 基址 (给 memmove 用). from_buffer 拿首字节地址后立即
+        # 释放临时 export (del), 地址随 mmap 生命周期稳定不变. mmap 可写连续,
+        # 与并存的 _cpu_mv 不冲突 (多 buffer export 允许).
+        _tmp = (ctypes.c_char * 1).from_buffer(cpu_buf)
+        self._cpu_base = ctypes.addressof(_tmp)
+        del _tmp
         # SSD 账本的 data_writer: 只在 dedup MISS 时被调 (HIT 零 I/O).
         self._store.bind_data_writer(self._pwrite_from_cpu)
+        # ★ 生产端: 建 SHM 环 (decode capture 往里推). 独立写进程 open 它来 drain.
+        #   命名带 pid -> 每 decode 一个环 (SPSC 无锁); 写进程 glob 发现.
+        #   不再起进程内写线程 -> 写路径全在独立进程, 和 decode 隔离.
+        if self._ring is None:
+            from vllm.v1.core.sched.licht_v3.ssd_stage_ring import StageRing
+            os.makedirs(self._ring_dir, exist_ok=True)
+            # pid + id(self): 保证同进程多实例 (测试) 与跨进程都唯一;
+            # 写进程 glob licht_ssd_stage_*.ring 全收.
+            self._ring_path = os.path.join(
+                self._ring_dir,
+                f"licht_ssd_stage_{os.getpid()}_{id(self) & 0xffffff}.ring")
+            self._ring = StageRing.create(
+                self._ring_path, n_slots=self._ring_n,
+                chunk_blocks=self._stage_chunk, slot_bytes=self._slot_bytes)
+            logger.info("SsdTier stage ring created %s "
+                        "(slots=%d chunk=%d blk) — writes go to sidecar",
+                        self._ring_path, self._ring_n, self._stage_chunk)
 
     def _pwrite_from_cpu(self, ssd_slot: int, blk_idx: int, src) -> None:
         """LruArenaStore data_writer 钩子: src[blk_idx] 是 CPU slot_id."""
@@ -243,6 +351,108 @@ class SsdTier:
         os.pwrite(self._data_fd,
                   self._cpu_mv[off:off + self._slot_bytes],
                   self.slot_offset(ssd_slot))
+
+    def capture_inc(self, job_id: str, s: int, e: int, records) -> None:
+        """★ 生产端 (decode): 驱逐释放块【前】把 inc 分块 memmove 进 SHM 环槽 +
+        发布. best-effort 绝不抛. 环满即丢 (背压 = 纯 CPU 丢). 只做 memmove(放
+        GIL) + 发布, 不碰盘/账本 -> 对 decode 计算冲击 ~-1% (实测).
+
+        分块: 长 prompt 首轮 inc 可几千块, 切成 _stage_chunk 块一段逐段.
+        records: [(cpu_slot, gen, hash), ...]. 块此刻仍分配 (arena 持 _evict_lock)."""
+        if self._cpu_mv is None or self._closed or self._ring is None:
+            return
+        n = e - s
+        if n <= 0 or len(records) != n:
+            if n > 0:
+                self._stat_capture_drop += n
+            return
+        sb = self._slot_bytes
+        chunk = self._stage_chunk
+        off = 0
+        while off < n:
+            c = min(chunk, n - off)
+            r = self._ring.reserve()        # 判满 + 拿槽; 满则丢该段及之后
+            if r is None:
+                self._stat_capture_drop += (n - off)
+                return
+            h, idx = r
+            try:
+                dst = self._ring.data_addr(idx)
+                hashes = []
+                for i in range(c):
+                    rec = records[off + i]
+                    # memmove 释放 GIL; 数据进环槽 (arena 持锁, CPU 数据稳定).
+                    self._libc.memmove(dst + i * sb,
+                                       self._cpu_base + int(rec[0]) * sb, sb)
+                    hashes.append(rec[2])
+                self._ring.publish(h, idx, str(job_id),
+                                   int(s + off), c, hashes)
+                self._stat_capture_ok += 1
+                self._stat_capture_blocks += c
+            except Exception:
+                self._stat_capture_drop += c
+                # 未 publish 的槽自然不占 head, 无需归还.
+            off += c
+
+    def drain_ring(self, ring, max_items: int = 256) -> int:
+        """★ 消费端 (独立写进程 / 测试): 从环取就绪槽 -> SSD 账本 write_inc
+        (从环槽读, 零中间拷贝) -> release. 返回处理的 inc 数. 慢 I/O 全在此
+        (和 decode 隔离). 摊销 sync 同旧写线程."""
+        done = 0
+        for _ in range(max_items):
+            item = ring.pop()
+            if item is None:
+                break
+            job_id, start, count, hashes, idx = item
+            e = start + count
+            try:
+                def _dw(ssd_slot, blk, _src, _r=ring, _i=idx):
+                    _off = self.slot_offset(ssd_slot)
+                    _wfd = self._data_fd_direct_w
+                    if _wfd >= 0:
+                        try:
+                            # 环 slot 数据区 4096 对齐 -> 可 O_DIRECT 直写设备.
+                            os.pwritev(_wfd, [_r.block_mv(_i, blk)], _off)
+                            return
+                        except OSError as _e:   # 对齐/设备不支持 -> 永久退 buffered
+                            self._data_fd_direct_w = -1
+                            logger.warning(
+                                "O_DIRECT 写失败(%s) -> 退回 buffered "
+                                "(pinned-RAM 下有脏页停顿风险)", _e)
+                    os.pwrite(self._data_fd, _r.block_mv(_i, blk), _off)
+                _miss_before = self._store._stat_miss_blocks
+                ok = self._store.write_inc(
+                    job_id, start, e, token_ids=[],
+                    source_obj=None, inc_hashes=hashes, data_writer=_dw)
+                if ok:
+                    _written = self._store._stat_miss_blocks - _miss_before
+                    self._stat_demote_blocks += _written
+                    self._stat_demote_hit_blocks += count - _written
+                    if _written > 0:
+                        # 多写线程共享摊销 sync 计数, 加锁 (每环一线程 -> N 线程)
+                        _do_sync = False
+                        with self._sync_lock:
+                            self._bytes_since_sync += _written * self._slot_bytes
+                            if self._bytes_since_sync >= self._sync_bytes_cap:
+                                self._bytes_since_sync = 0
+                                _do_sync = True
+                        # O_DIRECT 写不产脏页, 且设备缓存对 O_DIRECT 读一致,
+                        # 无需 fdatasync (它本身阻塞刷设备缓存 = 又一处停顿源);
+                        # 仅 buffered 退路需靠摊销 sync 限制脏页积压.
+                        if _do_sync and self._data_fd_direct_w < 0:
+                            try:
+                                os.fdatasync(self._data_fd)
+                            except OSError:
+                                pass
+                else:
+                    self._stat_demote_skipped += count
+            except Exception as ex:  # pragma: no cover
+                logger.warning("drain_ring write failed job=%s [%d,%d): %s",
+                               str(job_id)[:32], start, e, ex)
+            finally:
+                ring.release()          # 无论成败都释放槽 (best-effort)
+            done += 1
+        return done
 
     def demote_inc(self, job_id: str, s: int, e: int, records) -> bool:
         """降级一个 inc (LruArenaStore 降级写线程回调).
@@ -288,6 +498,99 @@ class SsdTier:
                     pass
         return True
 
+    # ============================================================
+    # P2: 升级数据面 (SSD 文件 -> CPU arena, pread 直达零中间缓冲)
+    # ============================================================
+    def _pread_to_cpu(self, cpu_slot: int, blk_idx: int, src) -> None:
+        """CPU 账本 write_inc 的 data_writer 覆盖: src[blk_idx] 是 SSD
+        slot_id, 把它的字节 pread 直读进 CPU arena 新分配的 cpu_slot.
+        优先 O_DIRECT (见 __init__ 注释), 不可用退回 buffered."""
+        ssd_slot = src[blk_idx]
+        off = cpu_slot * self._slot_bytes
+        fd = (self._data_fd_direct if self._data_fd_direct >= 0
+              else self._data_fd)
+        os.preadv(fd,
+                  [self._cpu_mv[off:off + self._slot_bytes]],
+                  self.slot_offset(ssd_slot))
+
+    def promote_inc(self, cpu_store, job_id: str, start_block: int,
+                    end_block: int, records) -> Optional[list]:
+        """把 SSD 上的段 [start_block, end_block) 搬回 CPU arena (P2 升级).
+
+        调用于 worker 引擎线程 (admit 后同步基线): 卡引擎时长 = pread 时间,
+        上限由 claim 期的 LICHT_SSD_PROMOTE_MAX_MB 保证.
+
+        records: [(ssd_slot, gen, hash), ...] 与块区间逐块对齐 (scheduler
+        侧 resolve_range 的产物, claim 后 SSD 账本已 mark_inflight 防淘).
+
+        流程 (P1 demote 的镜像):
+          1. try_pin 全部 SSD 源槽 (gen 校验; 任一失败 = claim 后仍被淘的
+             残余竞态 -> 整段放弃, 调用方走 fail-closed);
+          2. CPU 账本标准 write_inc: hash 注入 + data_writer=pread 直读
+             (dedup HIT 的块零 I/O; 两段式发布保证半读不可见);
+          3. unpin; 用同批 hash 重探 CPU 表拿 (slot, gen) 返回, 喂显式 load.
+
+        返回 [(cpu_slot, gen), ...] 或 None (失败, 不 raise)."""
+        if self._cpu_mv is None or self._closed or not records:
+            return None
+        n = end_block - start_block
+        if n <= 0 or len(records) != n:
+            return None
+        # 1) pin SSD 源槽
+        pinned: list = []
+        for (slot, gen, _h) in records:
+            addr = self._store._hdr.slot_state_addr(slot)
+            if not _atomic.try_pin(addr, gen):
+                for a in pinned:
+                    _atomic.unpin(a)
+                # ★ 取证探针 (2026-07-04 复盘): 修复后 pin 失败理论不可能
+                # (当步现探 + claim 即 inflight), 真发生时把现场吐全 —— 到底
+                # 是 gen 变了(被淘复用) / 槽空闲(被释放) / inflight 没挡住.
+                try:
+                    _cur = _atomic.get_gen(addr)
+                    _free = bool(self._store._allocator.is_free(slot))
+                    _infl = self._store.is_inflight(str(job_id))
+                except Exception:
+                    _cur, _free, _infl = -1, None, None
+                logger.error(
+                    "promote_inc: SSD slot pin FAILED job=%s [%d,%d) "
+                    "slot=%d expected_gen=%d cur_gen=%s is_free=%s "
+                    "job_inflight=%s -> 整段放弃 (三道防陈旧闸有漏, 需查)",
+                    str(job_id)[:32], start_block, end_block,
+                    slot, gen, _cur, _free, _infl)
+                return None
+            pinned.append(addr)
+        try:
+            ssd_slots = [r[0] for r in records]
+            hashes = [r[2] for r in records]
+            # 2) 写进 CPU 账本 (pread 直读, dedup 幂等)
+            ok = cpu_store.write_inc(
+                job_id, start_block, end_block, token_ids=[],
+                source_obj=ssd_slots, inc_hashes=hashes,
+                data_writer=self._pread_to_cpu)
+            if not ok:
+                return None
+            # 3) 重探 CPU 表拿新 (slot, gen) —— dedup HIT 块拿到已有槽,
+            # 同样正确; 探不到 (极端并发) -> 整段失败 fail-closed.
+            sg = cpu_store.probe_slots(hashes)
+            if sg is None:
+                logger.warning(
+                    "promote_inc: post-promote probe miss job=%s [%d,%d)",
+                    str(job_id)[:32], start_block, end_block)
+                return None
+            self._stat_promote_blocks += n
+            # (P2 修) 不再 fadvise: O_DIRECT 读不经 page cache, fadvise 无
+            # 意义; buffered 退路下保留缓存反而救 thrash 二次读 (实测 fadvise
+            # 后重读慢 8x).
+            return sg
+        except Exception as e:  # pragma: no cover
+            logger.warning("promote_inc failed job=%s [%d,%d): %s",
+                           str(job_id)[:32], start_block, end_block, e)
+            return None
+        finally:
+            for a in pinned:
+                _atomic.unpin(a)
+
     def stats(self) -> dict:
         try:
             free = self._store.free_count()
@@ -300,4 +603,12 @@ class SsdTier:
             "demote_hit_blocks": self._stat_demote_hit_blocks,
             "demote_skipped": self._stat_demote_skipped,
             "promote_blocks": self._stat_promote_blocks,
+            # capture-at-eviction 计数
+            "capture_ok": self._stat_capture_ok,
+            "capture_blocks": self._stat_capture_blocks,
+            "capture_drop": self._stat_capture_drop,
+            # 环在途槽数 × chunk 字节 = 待写进程 drain 的暂存量 (MB)
+            "stage_inflight_mb": (
+                (self._ring.depth() * self._ring_slotbytes) >> 20)
+                if self._ring is not None else 0,
         }

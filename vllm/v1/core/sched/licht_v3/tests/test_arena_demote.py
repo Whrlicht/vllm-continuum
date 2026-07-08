@@ -69,80 +69,123 @@ def _get_pin(store, slot):
     return A.get_pin(store._hdr.slot_state_addr(slot))
 
 
+def _setup_capture(tmp_path, monkeypatch, num_slots=64, **env):
+    """CPU arena + SsdTier + 假 CPU buffer, 绑 capture-at-eviction.
+
+    CPU store 的 data_writer 往假 mmap 写真字节; SsdTier 从同一 buffer 读.
+    """
+    monkeypatch.setenv("LICHT_ARENA_CONTENT_ADDR", "1")
+    monkeypatch.setenv("LICHT_ARENA_BG_EVICTOR", "0")   # 手动驱逐, 确定性
+    # 每测试独立 ring 目录 (环名带 pid, 单进程多测试会撞名)
+    _rd = str(tmp_path / "ring")
+    __import__("os").makedirs(_rd, exist_ok=True)
+    monkeypatch.setenv("LICHT_SSD_RING_DIR", _rd)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    store = LruArenaStore.create(str(tmp_path / "cpu_arena"),
+                                 num_slots=num_slots, block_size=BS)
+    cpu, _ = _fake_cpu_arena(num_slots)
+
+    def cpu_writer(slot_id, i, src):
+        data = (src[i] * (SLOT_BYTES // len(src[i]) + 1))[:SLOT_BYTES]
+        cpu[slot_id * SLOT_BYTES:(slot_id + 1) * SLOT_BYTES] = data
+
+    store.bind_data_writer(cpu_writer)
+    tier = SsdTier.open_or_create(
+        meta_path=str(tmp_path / "ssd_meta"),
+        data_path=str(tmp_path / "ssd_data"),
+        ssd_gb=SLOT_BYTES * num_slots / (1024 ** 3),
+        slot_bytes=SLOT_BYTES, block_size=BS)
+    tier.bind_cpu_source(cpu, SLOT_BYTES)
+    store.bind_demote_fn(tier.capture_inc)   # capture-at-eviction (零 pin)
+    return store, cpu, tier
+
+
 # ============================================================
-# Group A - 降级基建
+# Group A - capture-at-eviction (2026-07-06, 取代 demote-ahead+pin)
 # ============================================================
-class TestDemoteInfra:
+class TestCapture:
+    """驱逐【释放块前】capture memmove 进 SHM 环 (零 pin, 纯 LRU 驱逐);
+    独立写进程 (测试里用 tier.drain_ring 同步模拟) 从环 drain -> SSD.
+    Q2: 写路径搬出 decode 进程 (2026-07-06)."""
 
-    def test_scan_demote_marks_clean_and_unpins(self, tmp_path, monkeypatch):
-        store = _make_store(tmp_path, monkeypatch)
-        calls = []
-
-        def fake_demote(job, s, e, records):
-            # 调用时 inc 的每个 slot 必须处于 pin 状态 (数据受保护)
-            assert all(_get_pin(store, r[0]) >= 1 for r in records)
-            calls.append((job, s, e, [r[2] for r in records]))
-            return True
-
-        store.bind_demote_fn(fake_demote)
-        _write_job(store, "jobA", 4, seed=1)
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_ok == 1)
-        assert len(calls) == 1 and calls[0][0] == "jobA"
-        # 洗完: 干净集合有键, 全部 unpin
-        assert len(store._clean_incs) == 1
-        idx = store._job_slot_index["jobA"][0][2]
-        assert all(_get_pin(store, r[0]) == 0 for r in idx)
-        # 重复扫描: 已干净, 不再入队
-        store._demote_scan()
-        time.sleep(0.1)
-        assert store._stat_demote_ok == 1
+    def test_capture_ring_to_ssd_no_pin(self, tmp_path, monkeypatch):
+        store, cpu, tier = _setup_capture(tmp_path, monkeypatch)
+        n = 4
+        _write_job(store, "jobA", n, seed=7)
+        recs = store._job_slot_index["jobA"][0][2]
+        orig = {r[2]: bytes(cpu[r[0] * SLOT_BYTES:(r[0] + 1) * SLOT_BYTES])
+                for r in recs}
+        # 纯 LRU 驱逐: 全部释放 (capture 不 pin -> 无 left_pinned -> gained==n)
+        assert store._evict_lockfree(999) == n
+        assert tier._stat_capture_ok >= 1              # 已推进环
+        # 模拟写进程: drain 环 -> 写 SSD
+        assert tier.drain_ring(tier._ring) >= 1
+        assert tier._stat_demote_blocks >= n
+        # 逐字节: SSD 上按内容 hash 找回, 与原 CPU 字节一致
+        with open(tier.data_file, "rb") as f:
+            for h, want in orig.items():
+                s_slot = A.ht_probe(tier.store._ht_base,
+                                    tier.store._ht_cap, h)[0]
+                assert s_slot >= 0, "内容 hash 应能在 SSD 账本中找到"
+                f.seek(tier.slot_offset(s_slot))
+                assert f.read(SLOT_BYTES) == want
+        tier.close()
         store.close()
 
-    def test_demote_fail_not_marked_clean(self, tmp_path, monkeypatch):
-        store = _make_store(tmp_path, monkeypatch)
-        store.bind_demote_fn(lambda *a: False)
-        _write_job(store, "jobA", 2, seed=1)
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_fail == 1)
-        assert len(store._clean_incs) == 0
-        # 失败后 inflight 已清 -> 可重试
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_fail == 2)
+    def test_capture_chunks_large_inc(self, tmp_path, monkeypatch):
+        """★ 大 inc 切块存, 不整段丢 (修 96% drop 根因): chunk=2, 写 5 块的
+        inc -> 切成 3 段 (2+2+1) 推环, drain 后全部进 SSD, 逐字节一致."""
+        store, cpu, tier = _setup_capture(
+            tmp_path, monkeypatch, LICHT_SSD_STAGE_CHUNK_BLK="2")
+        assert tier._stage_chunk == 2
+        n = 5
+        _write_job(store, "jobBig", n, seed=3)
+        recs = store._job_slot_index["jobBig"][0][2]
+        orig = {r[2]: bytes(cpu[r[0] * SLOT_BYTES:(r[0] + 1) * SLOT_BYTES])
+                for r in recs}
+        assert store._evict_lockfree(999) == n        # 纯 LRU, 全释放
+        assert tier._stat_capture_ok == 3             # 2+2+1 三段
+        assert tier._stat_capture_blocks == n
+        assert tier._stat_capture_drop == 0           # 一块没丢
+        assert tier.drain_ring(tier._ring) == 3       # drain 3 段
+        assert tier._stat_demote_blocks >= n
+        with open(tier.data_file, "rb") as f:         # 5 块逐字节都在 SSD
+            for h, want in orig.items():
+                s_slot = A.ht_probe(tier.store._ht_base,
+                                    tier.store._ht_cap, h)[0]
+                assert s_slot >= 0
+                f.seek(tier.slot_offset(s_slot))
+                assert f.read(SLOT_BYTES) == want
+        tier.close()
         store.close()
 
-    def test_scan_skips_inflight_and_finished(self, tmp_path, monkeypatch):
-        store = _make_store(tmp_path, monkeypatch)
-        seen = []
-        store.bind_demote_fn(
-            lambda job, s, e, r: (seen.append(job), True)[1])
-        _write_job(store, "jobIn", 2, seed=1)
-        _write_job(store, "jobFin", 2, seed=2)
-        _write_job(store, "jobOk", 2, seed=3)
-        store.mark_inflight("jobIn")
-        store._finished_jobs.add("jobFin")   # 模拟 mark->delete 窗口
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_ok == 1)
-        assert seen == ["jobOk"]
-        store.clear_inflight("jobIn")
-        store.close()
-
-    def test_queue_bounded(self, tmp_path, monkeypatch):
-        """队列有限深: 写线程被堵住时, 扫描不无界入队."""
-        store = _make_store(tmp_path, monkeypatch, qdepth=1)
-        gate = threading.Event()
-        store.bind_demote_fn(lambda *a: gate.wait(10) or True)
+    def test_capture_ring_full_drops_but_evict_unaffected(self, tmp_path,
+                                                          monkeypatch):
+        """环满 -> capture 丢; 但驱逐照常全部释放 (LRU 不受 capture 影响).
+        不 drain (环槽永不释放) -> 环 (2 槽) 推满后必丢."""
+        store, cpu, tier = _setup_capture(
+            tmp_path, monkeypatch,
+            LICHT_SSD_STAGE_CHUNK_BLK="1", LICHT_SSD_STAGE_MB="0")
+        assert tier._ring_n == 2                   # 预算 0 -> 环压到最小 2 槽
+        # 环只有 2 槽; 驱逐 4 个 job × 2 块 = 8 段, 推满 2 个后全丢
         for i in range(4):
             _write_job(store, f"job{i}", 2, seed=i)
-        store._demote_scan()   # 1 个进写线程堵住, 1 个占队列, 其余留脏
-        time.sleep(0.2)
-        with store._clean_lock:
-            n_inflight = len(store._demote_inflight)
-        assert n_inflight <= 2
-        gate.set()
-        # 反复扫描最终全部洗净
-        assert _wait(lambda: (store._demote_scan() or
-                              store._stat_demote_ok == 4), timeout=8)
+        assert store._evict_lockfree(999) == 8    # 驱逐全部释放, 不被拖
+        assert tier._stat_capture_ok == 2          # 环 2 槽, 只进 2
+        assert tier._stat_capture_drop >= 1        # 其余丢
+        tier.close()
+        store.close()
+
+    def test_capture_skips_finished(self, tmp_path, monkeypatch):
+        """已结束 job 不 capture (不会回来, 不值得写盘); 驱逐照常释放."""
+        store, cpu, tier = _setup_capture(tmp_path, monkeypatch)
+        _write_job(store, "jobFin", 2, seed=1)
+        store._finished_jobs.add("jobFin")
+        assert store._evict_lockfree(999) == 2
+        assert tier._stat_capture_ok == 0
+        store._finished_jobs.discard("jobFin")
+        tier.close()
         store.close()
 
 
@@ -150,31 +193,14 @@ class TestDemoteInfra:
 # Group B - 驱逐闸门
 # ============================================================
 class TestEvictGate:
-
-    def test_gate_skips_dirty_frees_clean(self, tmp_path, monkeypatch):
-        store = _make_store(tmp_path, monkeypatch)
-        store.bind_demote_fn(lambda *a: True)
-        _write_job(store, "jobA", 4, seed=1)   # 将洗净
-        _write_job(store, "jobB", 4, seed=2)   # 保持脏
-        # 只把 jobA 洗净 (手工构造: 扫描全部, 但 fn 只对 A 成功)
-        store._demote_fn = lambda job, s, e, r: job == "jobA"
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_ok + store._stat_demote_fail
-                     == 2)
-        free0 = store.free_count()
-        gained = store._evict_lockfree(999, clean_gate=True)
-        # 只有 jobA 的 4 块被释放; jobB 脏 -> gate 跳过
-        assert gained == 4
-        assert store.free_count() == free0 + 4
-        assert store._stat_gate_skip >= 1
-        # jobA 的干净标记已随释放作废
-        assert all(k[0] != "jobA" for k in store._clean_incs)
-        store.close()
+    # NB: test_gate_skips_dirty_frees_clean 已删除 (2026-07-06): 驱逐闸门依赖
+    # demote-ahead 填充的 clean-set, 该机制已被 capture-at-eviction 取代;
+    # 闸门默认关 (LICHT_SSD_EVICT_GATE), _clean_incs 不再被填充. 保留下面两
+    # 个直接测 _evict_lockfree(clean_gate=) 参数语义的用例 (与 demote 无关).
 
     def test_gate_off_frees_dirty(self, tmp_path, monkeypatch):
-        """紧急旁路 (clean_gate=False): 脏 inc 也放行 = 今天的丢弃语义."""
+        """clean_gate=False (默认): 纯 LRU, 全部释放 (今天的语义)."""
         store = _make_store(tmp_path, monkeypatch)
-        store.bind_demote_fn(lambda *a: True)   # 有降级基建但没洗过
         _write_job(store, "jobA", 4, seed=1)
         gained = store._evict_lockfree(999, clean_gate=False)
         assert gained == 4
@@ -265,6 +291,9 @@ class TestSsdDataPlane:
 class TestEndToEnd:
 
     def test_cpu_evict_pressure_demotes_to_ssd(self, tmp_path, monkeypatch):
+        _rd = str(tmp_path / "ring")
+        __import__("os").makedirs(_rd, exist_ok=True)
+        monkeypatch.setenv("LICHT_SSD_RING_DIR", _rd)
         store = _make_store(tmp_path, monkeypatch, num_slots=64)
         tier = SsdTier.open_or_create(
             meta_path=str(tmp_path / "ssd_meta"),
@@ -280,7 +309,7 @@ class TestEndToEnd:
 
         store.bind_data_writer(cpu_writer)
         tier.bind_cpu_source(cpu, SLOT_BYTES)
-        store.bind_demote_fn(tier.demote_inc)
+        store.bind_demote_fn(tier.capture_inc)   # capture-at-eviction
 
         n_blocks = 4
         _write_job(store, "jobA", n_blocks, seed=7)
@@ -289,12 +318,11 @@ class TestEndToEnd:
         orig = {r[2]: bytes(cpu[r[0] * SLOT_BYTES:(r[0] + 1) * SLOT_BYTES])
                 for r in recs}
 
-        store._demote_scan()
-        assert _wait(lambda: store._stat_demote_ok == 1)
-
-        # 洗净后闸门放行 -> CPU 释放; SSD 上按 hash 找回并逐字节比对
-        gained = store._evict_lockfree(999, clean_gate=True)
+        # 纯 LRU 驱逐: 释放前 capture memmove 进环; drain (模拟写进程) -> SSD
+        gained = store._evict_lockfree(999)
         assert gained == n_blocks
+        assert tier.drain_ring(tier._ring) >= 1
+        assert tier._stat_demote_blocks >= n_blocks
         with open(tier.data_file, "rb") as f:
             for h, want in orig.items():
                 s_slot = A.ht_probe(tier.store._ht_base, tier.store._ht_cap,

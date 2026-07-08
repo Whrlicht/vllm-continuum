@@ -389,6 +389,51 @@ class RoundKVStore:
         self._ssd_queue_depth = int(os.environ.get("LICHT_SSD_QUEUE", "64"))
         self._ssd_direct = os.environ.get("LICHT_SSD_DIRECT", "0") == "1"
         self._ssd_tier = None    # SsdTier, 由 _arena_init 设置 (worker 侧)
+        # ---- P2: 升级 (promote, admit 后同步基线) ----
+        # claim 时两层拼接 lookup: CPU 匹配停在 a 后续探 SSD 账本 -> [a,c)
+        # 计入 claim; worker load 前把该段 pread 回 CPU 再统一上 GPU.
+        # MAX_MB 在 claim 期封顶 SSD 段 (同步模式 claim 后无法反悔, 所以
+        # "承诺得起多少才 claim 多少", 超出部分不 claim 自然重算).
+        # 默认 256MB: 实测争抢读速 ~0.4GB/s -> 单次卡引擎最坏 ~0.7s
+        # (2026-07-03 复盘: 4096 默认造成过 32s 停顿).
+        self._ssd_promote = (
+            os.environ.get("LICHT_SSD_PROMOTE", "1") == "1")
+        self._ssd_promote_max_mb = int(
+            os.environ.get("LICHT_SSD_PROMOTE_MAX_MB", "256"))
+        # ---- P2 收益闸门: 搬 < 算 才 claim ("SSD 不劣于纯 CPU" 的数学保证).
+        #   搬运估计 = 段字节 / BW_MBPS (按设备实测配: 本机 SATA 级 ~400,
+        #     NVMe 到货后调 ~3000; 实测见 ssd_contention_bench)
+        #   重算估计 = 段 token / RECOMPUTE_TOKS (8B@A800 真算力 ~1.2 万 tok/s)
+        #   FACTOR: 搬 < 算×FACTOR 才放行; 99 = 强制放行 (功能验证用).
+        # 慢盘上闸门常闭是【正确经济学】(重算比搬快), 不是缺陷.
+        self._ssd_bw_mbps = float(
+            os.environ.get("LICHT_SSD_BW_MBPS", "400"))
+        self._ssd_recompute_toks = float(
+            os.environ.get("LICHT_SSD_RECOMPUTE_TOKS", "12000"))
+        self._ssd_promote_factor = float(
+            os.environ.get("LICHT_SSD_PROMOTE_FACTOR", "1.0"))
+        # ★ 收益闸门开关 (2026-07-05 用户决策): 默认【关】—— 哪怕搬比重算慢也搬.
+        #   理由: 慢盘上闸门常闭 -> SSD 层等于死重, prefill 根本用不到它; 要先把
+        #   "SSD 真能端到端复用" 跑通再谈经济学. 打开 (=1) 恢复 "搬<算×FACTOR
+        #   才放行" 的老行为.  注意: 门一旦关, prefill claim 会把 SSD 段计入
+        #   anchor -> 必须配合 scheduler 的 chunk 计划钉死 (LICHT_DYN_PIN_CAP)
+        #   一起用, 否则 SSD promote 失败会污染 timeline (见 2026-07-04 复盘).
+        self._ssd_gate_enabled = (
+            os.environ.get("LICHT_SSD_PROMOTE_GATE", "0") == "1")
+        self._ssd_lookup_store = None    # scheduler 侧 SSD 只读表 (lazy)
+        self._ssd_lk_slot_bytes = 0      # 来自 _ssd_meta.json (算 MAX_MB 块数)
+        self._stat_promote_ok = 0
+        self._stat_promote_fail = 0
+        self._stat_promote_blocks = 0
+        self._stat_promote_ms = 0.0
+        self._stat_promote_gated = 0     # 收益闸门拒绝 (重算更快) 的段数
+        # ---- P2 修 (2026-07-05): Phase2 defer 期后台修复搬运 ----
+        # 单后台线程 + 有限深队列: 把 "CPU 有洞、洞在 SSD" 的历史段搬回
+        # CPU (不占引擎), CPU 齐后调度器按纯 CPU 判定 admit. 幂等 (内容
+        # 寻址), 失败只影响收敛速度 (下轮探测重试), 不影响正确性.
+        self._promote_q: "queue.Queue" = queue.Queue(maxsize=32)
+        self._promote_thread = None
+        self._promote_stop = False
         if self._ssd_enabled and not self._ssd_path:
             logger.warning(
                 "LICHT_SSD_TIER=1 但 LICHT_SSD_PATH 未设置 -> SSD tier 禁用")
@@ -692,8 +737,13 @@ class RoundKVStore:
                         # 见 arena_lru_store.bind_demote_fn 文档).
                         self._ssd_tier.bind_cpu_source(
                             self._arena_mm, self._slot_bytes)
+                        # ★ 2026-07-06: 绑 capture_inc (驱逐释放前拷数据, 零 pin)
+                        # 取代旧 demote_inc (提前 pin 冷块破坏 LRU -> hit 崩).
                         self._lru_store.bind_demote_fn(
-                            self._ssd_tier.demote_inc)
+                            self._ssd_tier.capture_inc)
+                        # ARENA-STAT 周期日志显示"SSD 存了多少"用.
+                        self._lru_store._capture_stats_fn = (
+                            self._ssd_tier.stats)
                     except Exception as e:
                         logger.warning(
                             "round-kv SSD tier init failed: %s -> disabled",
@@ -2086,6 +2136,235 @@ class RoundKVStore:
             return None
         mt, mb = res
         return mt, mb, None
+
+    # ------------------------------------------------------------------
+    # ★ P2: 两层拼接 lookup + admit 后同步 promote (SSD -> CPU -> GPU)
+    # ------------------------------------------------------------------
+    def _ensure_ssd_lookup_store(self) -> None:
+        """SSD 账本只读表 (lazy). worker 侧直接用 _ssd_tier 的; scheduler 侧
+        从 _ssd_meta.json 开 (照抄 _ensure_lookup_store 的模式)."""
+        if self._ssd_lookup_store is not None or not self._ssd_enabled:
+            return
+        if self._ssd_tier is not None:      # worker 侧
+            self._ssd_lookup_store = self._ssd_tier.store
+            self._ssd_lk_slot_bytes = self._ssd_tier.slot_bytes
+            return
+        try:
+            from vllm.v1.core.sched.licht_v3.ssd_tier import SsdTier
+            meta = SsdTier.read_meta(self._ssd_meta_path)
+            if not meta:
+                return       # worker 未初始化完, 下次再试 (同 CPU 表口径)
+            from vllm.v1.core.sched.licht_v3.arena_lru_store import (
+                LruArenaStore)
+            self._ssd_lookup_store = LruArenaStore.open_or_create(
+                self._ssd_meta_path,
+                num_slots=int(meta["num_slots"]),
+                block_size=int(meta["block_size"]),
+                wait_timeout_s=5.0)
+            self._ssd_lk_slot_bytes = int(meta["slot_bytes"])
+            logger.info(
+                "round-kv scheduler-side SSD lookup store opened "
+                "(table-only, num_slots=%d)", int(meta["num_slots"]))
+        except Exception:
+            pass
+
+    def ssd_promote_active(self) -> bool:
+        """SSD promote 是否就绪 (开关 + 账本可用 + 内容寻址)."""
+        if not (self._ssd_enabled and self._ssd_promote):
+            return False
+        self._ensure_ssd_lookup_store()
+        s = self._ssd_lookup_store
+        return s is not None and getattr(s, "content_addr", False)
+
+    def ssd_tail_hashes(self, cur_token_ids: list,
+                        start_block: int) -> Optional[list]:
+        """SSD 续段候选的链式 hash, [start_block, start+cap) 逐块对齐.
+
+        ★ P2 修 (当步现探): 算 hash 贵 (O(prompt) Python), 探测便宜 (C 原子
+        读) —— 调用方按请求【缓存本函数的结果】, 每步用 ssd_probe_fresh 现探.
+        cap = MAX_MB 折算的块数 (claim 期上限, 探多了也不会 claim)."""
+        if not self.ssd_promote_active():
+            return None
+        bs = self.block_size
+        n_full = len(cur_token_ids) // bs
+        if start_block >= n_full:
+            return None
+        end = n_full
+        if self._ssd_promote_max_mb > 0 and self._ssd_lk_slot_bytes > 0:
+            cap = max((self._ssd_promote_max_mb * 1024 * 1024)
+                      // self._ssd_lk_slot_bytes, 1)
+            end = min(end, start_block + cap)
+        if start_block >= end:
+            return None
+        from vllm.v1.core.sched.licht_v3.arena_block_hash import block_hashes
+        hs = block_hashes(list(cur_token_ids), bs, end)
+        if len(hs) < end:
+            return None
+        return hs[start_block:end]
+
+    def ssd_probe_fresh(self, job_id: str, start_block: int,
+                        tail_hashes: list,
+                        apply_gate: bool = True,
+                        mark_inflight: bool = True) -> Optional[tuple]:
+        """★ P2 修 (三道防陈旧闸之一): 用缓存的 hash 对 SSD 账本【当刻】探测.
+
+        每次调用都是新探 (几十 µs C 原子读), 结果只在本步有效 —— 杜绝
+        2026-07-03 复盘的 "拿几分钟前的地图取货" (74 次 promote 秒败).
+
+        内嵌两道闸:
+          1. 收益闸门: 搬运估计 > 重算估计×FACTOR -> 返 None (不 claim,
+             重算更快; "SSD 不劣于纯 CPU" 由此保证);
+          2. 探中且过闸 -> 【立即】给 SSD 账本挂 job inflight (第二道闸:
+             从 claim 意向那一刻起 SSD 淘汰绕行, 不等 admit).
+        返回 (start_block, [(slot,gen,hash),...]) 或 None."""
+        if not tail_hashes or not self.ssd_promote_active():
+            return None
+        sstore = self._ssd_lookup_store
+        rr = sstore.resolve_range_hashed(list(tail_hashes),
+                                         int(start_block))
+        if rr is None:
+            return None
+        _end, recs = rr
+        # 收益闸门 (慢盘上常闭是正确行为: 重算比搬快).
+        # ★ apply_gate=False (decode Phase2 admission 用): 那边的替代方案
+        # 不是"重算"而是"永远等到客户端超时" —— 搬永远划算, 闸门不适用.
+        # ★ _ssd_gate_enabled=False (2026-07-05 默认): 全局关门, 无条件搬.
+        if (self._ssd_gate_enabled and apply_gate
+                and self._ssd_bw_mbps > 0 and self._ssd_recompute_toks > 0):
+            seg_bytes = len(recs) * max(self._ssd_lk_slot_bytes, 1)
+            seg_tokens = len(recs) * self.block_size
+            est_promote_s = seg_bytes / (self._ssd_bw_mbps * 1e6)
+            est_recompute_s = seg_tokens / self._ssd_recompute_toks
+            if est_promote_s > est_recompute_s * self._ssd_promote_factor:
+                self._stat_promote_gated += 1
+                return None
+        # claim 意向即挂 inflight (幂等 touch; 另一请求 promote 后清掉也会
+        # 在下一步现探时重挂).
+        # ★ 2026-07-05: mark_inflight 参数化. decode/Phase2 (默认 True): defer
+        # 期后台真在搬, 槽必须撑到搬完, 保留 claim 挂. prefill/producer 传
+        # False: admit 前根本不搬, claim 挂只是白锁一整个排队期 → 深队列下
+        # 饿死 SSD 容量. producer 改为【只在 admit 挂】(update_state_after_alloc),
+        # 等待期腾出的槽让别的请求 KV 复用. 正确性不受影响: promote 时 pin+gen
+        # fail-closed 才是防读错的机制, inflight 只是"保住复用"的优化.
+        if mark_inflight:
+            self.ssd_mark_inflight(job_id)
+        return int(start_block), recs
+
+    def lookup_resolve_tiered(self, job_id: str,
+                              cur_token_ids: list,
+                              apply_gate: bool = True) -> Optional[tuple]:
+        """两层拼接 resolve: CPU 前缀 [0,a) + SSD 续段 [a,c). 全新鲜路径
+        (CPU resolve + hash + 现探一次做完; 高频调用方应缓存 hash 只重复
+        现探 —— 见 connector._rk_lookup_cached).
+
+        返回 (matched_tokens, matched_blocks, sg_cpu, ssd_seg) 或 None."""
+        base = self.lookup_resolve(job_id, cur_token_ids)
+        if not self.ssd_promote_active():
+            return (base + (None,)) if base is not None else None
+        mb = base[1] if base is not None else 0
+        tail = self.ssd_tail_hashes(cur_token_ids, mb)
+        seg = (self.ssd_probe_fresh(job_id, mb, tail, apply_gate=apply_gate)
+               if tail is not None else None)
+        if seg is None:
+            return (base + (None,)) if base is not None else None
+        _a, recs = seg
+        end_blk = _a + len(recs)
+        sg = base[2] if base is not None else None
+        return end_blk * self.block_size, end_blk, sg, seg
+
+    def ssd_mark_inflight(self, job_id: str) -> None:
+        """claim 含 SSD 段后立即调: SSD 账本整 job 防淘 (驱逐绕行),
+        堵 claim->load 的毫秒级竞态窗口. promote 后/请求结束时 clear."""
+        self._ensure_ssd_lookup_store()
+        s = self._ssd_lookup_store
+        if s is not None:
+            try:
+                s.mark_inflight(str(job_id))
+            except Exception:
+                pass
+
+    def ssd_clear_inflight(self, job_id: str) -> None:
+        self._ensure_ssd_lookup_store()
+        s = self._ssd_lookup_store
+        if s is not None:
+            try:
+                s.clear_inflight(str(job_id))
+            except Exception:
+                pass
+
+    def enqueue_promote(self, job_id: str, start_block: int,
+                        records: list) -> bool:
+        """★ P2 修 (2026-07-05): Phase2 defer 期的后台修复搬运入队.
+
+        worker 侧调用 (start_load_kv 收到 metadata.arena_promote). 单后台
+        线程执行 promote_from_ssd (pread, 不占引擎); 队列满即弃 (下轮探测
+        会按节流重发, 幂等). 返回是否成功入队."""
+        if self._ssd_tier is None or self._lru_store is None:
+            return False
+        if self._promote_thread is None:
+            self._promote_thread = threading.Thread(
+                target=self._promote_loop, name="licht-ssd-promote",
+                daemon=True)
+            self._promote_thread.start()
+            logger.info("round-kv PROMOTE bg worker started (Phase2 修复)")
+        try:
+            self._promote_q.put_nowait(
+                (str(job_id), int(start_block), list(records)))
+            return True
+        except queue.Full:
+            return False
+
+    def _promote_loop(self) -> None:
+        while not self._promote_stop:
+            try:
+                item = self._promote_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            job_id, start_block, records = item
+            try:
+                self.promote_from_ssd(job_id, start_block, records)
+            except Exception as e:  # pragma: no cover
+                logger.warning("bg promote failed job=%s: %s",
+                               str(job_id)[:32], e)
+
+    def promote_from_ssd(self, job_id: str, start_block: int,
+                         records: list) -> Optional[list]:
+        """worker 侧 (引擎线程, admit 后同步): SSD 段搬回 CPU.
+
+        records: [(ssd_slot, gen, hash), ...]. 返回逐块 (cpu_slot, gen)
+        或 None (整段失败 -> 调用方走现有 fail-closed, error 级报警).
+        卡引擎时长 = pread, 上限已由 claim 期 MAX_MB 保证. 完成后清
+        SSD inflight."""
+        if self._ssd_tier is None or self._lru_store is None:
+            return None
+        _t0 = time.time()
+        try:
+            sg = self._ssd_tier.promote_inc(
+                self._lru_store, str(job_id), int(start_block),
+                int(start_block) + len(records), list(records))
+        finally:
+            self.ssd_clear_inflight(job_id)
+        _ms = (time.time() - _t0) * 1000.0
+        self._stat_promote_ms += _ms
+        if sg is not None:
+            self._stat_promote_ok += 1
+            self._stat_promote_blocks += len(records)
+            logger.info(
+                "round-kv PROMOTE ok job=%s [%d,%d) blocks=%d ms=%.0f "
+                "(SSD->CPU)",
+                str(job_id)[:32], start_block,
+                start_block + len(records), len(records), _ms)
+        else:
+            self._stat_promote_fail += 1
+            logger.error(
+                "round-kv PROMOTE FAILED job=%s [%d,%d) blocks=%d ms=%.0f "
+                "— 该请求本段 gap 将不被填充 (同现有 fail=N 类), 若频发需查 "
+                "SSD inflight 保护是否失效",
+                str(job_id)[:32], start_block,
+                start_block + len(records), len(records), _ms)
+        return sg
 
     def lookup(self, job_id: str, cur_token_ids: list) -> Optional[tuple]:
         """Return (matched_tokens, matched_blocks) for the longest
@@ -3648,6 +3927,13 @@ class RoundKVStore:
                 self._load_pool.shutdown(wait=False)
             except Exception:
                 pass
+        self._promote_stop = True
+        if self._promote_thread is not None:
+            try:
+                self._promote_q.put_nowait(None)
+            except Exception:
+                pass
+            self._promote_thread.join(timeout=2.0)
         if self._ssd_tier is not None:
             try:
                 self._ssd_tier.close()

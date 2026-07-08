@@ -258,24 +258,31 @@ class LruArenaStore:
         self._stat_bg_rounds = 0
 
         # ============================================================
-        # ★ P1: demote-ahead (提前洗净) —— SSD tier 跨层降级基建
+        # ★ SSD tier 跨层降级 (2026-07-06: capture-at-eviction)
         # ============================================================
-        # OS 页回收式结构 (后台写回 + 回收偏好干净页). 本类不知 SSD 存在,
-        # 只调注入的 demote_fn (与 bind_data_writer 同哲学):
-        #   扫描器 (_demote_scan, 在 bg evictor 线程): free < 洗衣水位时从
-        #     LRU 最冷端挑"脏" inc (跳过 finished/inflight/非本进程 store 的),
-        #     整 inc try_pin 后投有限深队列 (满即弃 -> 盘追不上自动放弃,
-        #     该 inc 退化为今天的直接丢弃语义);
-        #   写线程 (_demote_writer_loop): 出队 -> demote_fn (慢 I/O, 不持
-        #     本类任何锁) -> 成功记入干净集合 -> unpin;
-        #   驱逐闸门 (bg evictor 调 _evict_lockfree(clean_gate=True)): 真释放
-        #     前查干净集合 (纯内存零 I/O), 活跃 job 的脏 inc 跳过等下轮;
-        #     free < bg_low/2 紧急旁路 (闸门失效, 完全回退丢弃语义, 防饿死).
-        # 干净键 = (job, s, e, 首块hash, 末块hash): 内容变则键变 -> 旧标记
-        # 自动失效; 即便误判, 下游按 hash 链校验, 最坏 miss 重算, 不会读错.
+        # 本类不知 SSD 存在, 只在【驱逐真正释放一个 inc 的块之前】调注入的
+        # capture 回调 (_capture_fn, 由 bind_demote_fn 绑到 SsdTier.capture_inc):
+        # 回调把该 inc 的数据拷走 (SSD 暂存), 零 pin, best-effort. 驱逐照常纯
+        # LRU (bg_low -> bg_high), 和纯 CPU 逐字节一致.
+        #   旧路 (已删): demote-ahead 扫描器提前 pin 最冷 inc 慢慢写盘 + 驱逐
+        #   闸门只淘已洗净的. 慢盘上洗不过来 -> pin 锁住冷块逼驱逐淘热块 ->
+        #   CPU arena LRU 崩 -> hit 从 96% 掉到 24% (2026-07-05 复盘). 故改为
+        #   "释放时顺手拷" 的 capture 模型, 洗从不干预驱逐顺序.
+        # 干净键/闸门 (_clean_incs/clean_gate) 仅在 LICHT_SSD_EVICT_GATE=1 时用
+        # (opt-in A/B, 现无人填充 _clean_incs, 默认关).
         # 仅 content_addr 模式生效 (hash 注入依赖 v2 records).
         self._demote_fn: Optional[Callable[..., bool]] = None
         self._demote_on = os.environ.get("LICHT_SSD_DEMOTE", "1") == "1"
+        # ★ 2026-07-06 (SSD 令 hit 崩塌根因): 驱逐闸门默认【关】. 闸门=只淘已
+        # 洗净(降级进 SSD)的 inc, 保证"每个被淘的块都在 SSD". 但 SATA 上洗不过
+        # 来 -> evictor 被迫跳过冷脏块、去淘已洗完的【不一定是最冷】的块 -> CPU
+        # arena 的严格 LRU 被破坏 -> 本该留住的热块被淘 -> hit 崩(96%->24.6%,
+        # 见 no-ssd/SSD A/B). 关掉闸门 = 驱逐走纯 LRU(和纯 CPU 完全一致),
+        # demote 退化为尽力而为的后台洗: 洗完的块被淘时留在 SSD(bonus), 没洗完
+        # 就被淘的和纯 CPU 一样丢. SSD 由此恢复"只加不减"的严格超集语义.
+        # 打开 (=1) 恢复"保证被淘块都在 SSD"的老行为 (A/B 用).
+        self._evict_gate_on = (
+            os.environ.get("LICHT_SSD_EVICT_GATE", "0") == "1")
         self._demote_low_env = int(
             os.environ.get("LICHT_ARENA_DEMOTE_LOW", "0"))
         self._demote_low = 0        # _ensure_bg_evictor 里按水位推定
@@ -284,6 +291,13 @@ class LruArenaStore:
         self._demote_queue: Optional["queue.Queue"] = None
         self._demote_threads: list = []
         self._demote_stop = False
+        # ★ 2026-07-06 capture-at-eviction 重构: 驱逐释放块【前】调此回调把 inc
+        #   数据拷给 SSD 暂存 (零 pin). 取代旧 demote-ahead+pin (提前 pin 冷块
+        #   破坏 LRU -> hit 崩). None = 无 SSD, 回调是 no-op, 驱逐纯 LRU 不变.
+        self._capture_fn: Optional[Callable[..., None]] = None
+        # capture 计数取数回调 (round_kv_store 绑到 SsdTier.stats), ARENA-STAT
+        # 周期日志用它显示"SSD 存了多少". None = 无 SSD, 该段显示 0.
+        self._capture_stats_fn: Optional[Callable[[], dict]] = None
         self._clean_lock = threading.Lock()   # 保护下面两个集合
         self._clean_incs: set = set()         # 已洗净 inc 的 clean key
         self._demote_inflight: set = set()    # 已入队未完成 (防重复入队)
@@ -399,33 +413,25 @@ class LruArenaStore:
     # ============================================================
     # ★ P1: demote-ahead (跨层降级)
     # ============================================================
-    def bind_demote_fn(self, fn: Callable[..., bool]) -> None:
-        """注入跨层降级函数并启动写线程.
+    def bind_demote_fn(self, fn: Callable[..., None]) -> None:
+        """★ 2026-07-06 重构: 注入 capture 回调 (取代旧 demote-ahead+pin 写线程).
 
-        签名: fn(job_id, start_block, end_block, records) -> bool
-              records = [(slot, gen, hash), ...] —— 调用时已被本类整 inc
-              pin 住 (fn 直接读 slot 数据, 无需自己 pin; 返回后由写线程
-              统一 unpin). 在独立写线程调用 (可做慢 I/O); 异常按失败处理.
+        签名: fn(job_id, start_block, end_block, records) -> None
+              records = [(slot, gen, hash), ...]. 在【驱逐释放该 inc 的块之前】
+              被调 (块此刻仍分配、数据稳定), 由回调把数据拷走 (SSD 暂存),
+              零 pin. best-effort, 不返回状态, 失败 no-op.
 
-        仅 content_addr 模式生效 (依赖 v2 records 的内容 hash 注入下游).
+        与旧路的关键区别: 不再提前 pin 冷块、不再起写线程. 驱逐照常纯 LRU,
+        capture 只在释放前顺手拷一份 -> 驱逐行为和纯 CPU 逐字节一致.
+        仅 content_addr 模式生效 (下游按 hash 注入去重).
         """
         if not self._content_addr:
             logger.warning("bind_demote_fn: 需要 content_addr 模式, 忽略")
             return
         if not self._demote_on:
-            logger.info("bind_demote_fn: LICHT_SSD_DEMOTE=0, 降级关闭")
+            logger.info("bind_demote_fn: LICHT_SSD_DEMOTE=0, capture 关闭")
             return
-        self._demote_fn = fn
-        if self._demote_queue is None:
-            self._demote_queue = queue.Queue(maxsize=self._demote_qdepth)
-            for i in range(max(1, self._demote_writers)):
-                t = threading.Thread(target=self._demote_writer_loop,
-                                     name=f"licht-arena-demote-{i}",
-                                     daemon=True)
-                t.start()
-                self._demote_threads.append(t)
-            logger.info("round-kv DEMOTE started: writers=%d qdepth=%d",
-                        len(self._demote_threads), self._demote_qdepth)
+        self._capture_fn = fn
 
     @staticmethod
     def _clean_key(job_id: str, s: int, e: int, records) -> tuple:
@@ -436,94 +442,6 @@ class LruArenaStore:
         h1 = records[-1][2] if records and len(records[-1]) >= 3 else -1
         return (job_id, int(s), int(e), int(h0), int(h1))
 
-    def _demote_scan(self) -> None:
-        """把最冷的脏 inc pin 住投进降级队列 (bg evictor 线程内调).
-
-        无锁: _job_lru/_job_slot_index 是进程内提示结构, pin+gen 才是权威
-        -> 过时条目 try_pin 失败自动跳过. 队列有限深: 满即停 (盘追不上时
-        自动放弃, 那些 inc 退化为直接丢弃).
-        """
-        q = self._demote_queue
-        if q is None or self._demote_fn is None:
-            return
-        for victim in list(self._job_lru):
-            if q.full():
-                return
-            if victim in self._finished_jobs:
-                continue      # 已结束: 不会回来, 不值得写盘
-            if self.is_inflight(victim):
-                continue      # 在途: 不碰 (与淘汰同规)
-            mem = self._job_slot_index.get(victim)
-            if not mem:
-                continue      # 只洗本进程 store 的 (对齐 index_only 语义)
-            for (s, e, records) in reversed(list(mem)):   # tail-first
-                if q.full():
-                    return
-                if not records:
-                    continue
-                key = self._clean_key(victim, s, e, records)
-                with self._clean_lock:
-                    if key in self._clean_incs or key in self._demote_inflight:
-                        continue
-                    self._demote_inflight.add(key)
-                # 整 inc try_pin: 任一块 pin 不上 (已淘/在改) -> 放弃本 inc
-                pinned: List[int] = []
-                ok = True
-                for rec in records:
-                    if _atomic.try_pin(self._hdr.slot_state_addr(rec[0]),
-                                       rec[1]):
-                        pinned.append(rec[0])
-                    else:
-                        ok = False
-                        break
-                if not ok:
-                    for slot in pinned:
-                        _atomic.unpin(self._hdr.slot_state_addr(slot))
-                    with self._clean_lock:
-                        self._demote_inflight.discard(key)
-                    continue
-                try:
-                    q.put_nowait((victim, int(s), int(e), list(records),
-                                  key, pinned))
-                except queue.Full:
-                    for slot in pinned:
-                        _atomic.unpin(self._hdr.slot_state_addr(slot))
-                    with self._clean_lock:
-                        self._demote_inflight.discard(key)
-                    self._stat_demote_drop += 1
-                    return
-
-    def _demote_writer_loop(self) -> None:
-        """降级写线程: 出队 -> demote_fn (慢 I/O) -> 标干净 -> unpin.
-        不持本类任何锁 (_evict_lock / alloc_mutex), 只靠 pin 保数据不动."""
-        while not self._demote_stop:
-            try:
-                item = self._demote_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-            job_id, s, e, records, key, pinned = item
-            ok = False
-            try:
-                ok = bool(self._demote_fn(job_id, s, e, records))
-            except Exception as ex:
-                logger.warning("demote_fn failed job=%s [%d,%d): %s",
-                               str(job_id)[:32], s, e, ex)
-            finally:
-                for slot in pinned:
-                    _atomic.unpin(self._hdr.slot_state_addr(slot))
-                with self._clean_lock:
-                    self._demote_inflight.discard(key)
-                    if ok:
-                        self._clean_incs.add(key)
-                if ok:
-                    self._stat_demote_ok += 1
-                    # ★ 真机修 B: 有新干净货 -> 踢醒清洁工来收 (否则它在
-                    # "全脏" 退避睡眠中, 白等; 见 _bg_evictor_loop 的退避).
-                    self._signal_bg_evictor()
-                else:
-                    self._stat_demote_fail += 1
 
     def _drop_clean_keys(self, job_id: str) -> None:
         """清理某 job 的全部干净标记 (job 删除/淘空时防集合无界增长)."""
@@ -606,15 +524,23 @@ class LruArenaStore:
                 _cfd = self._claim_job(job_id)
                 if _cfd is None:
                     time.sleep(0.001)   # evictor 正处理该 job, 等它放 claim
+            # ★ 2026-07-05 降噪: 只在【真跳变】(文件从无到有) 时打 MARK-INFLIGHT,
+            # 和 CLEAR-INFLIGHT "只有真删掉才记" 对称. 幂等重标 (Phase2 defer 期
+            # 每步重探) 不再刷屏. O_EXCL 探真新建, 已存在则静默.
+            _newly = False
             try:
                 fd = os.open(self._inflight_path(job_id),
-                             os.O_CREAT | os.O_WRONLY, 0o644)
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
                 os.close(fd)
+                _newly = True
+            except FileExistsError:
+                _newly = False              # 已在途, 幂等, 不打日志
             finally:
                 self._release_claim(_cfd)
-            logger.info("MARK-INFLIGHT job=%s path=%s%s",  # ★诊断
-                        job_id, self._inflight_path(job_id),
-                        "" if _cfd is not None else " (claim-timeout)")
+            if _newly:
+                logger.info("MARK-INFLIGHT job=%s path=%s%s",  # ★诊断
+                            job_id, self._inflight_path(job_id),
+                            "" if _cfd is not None else " (claim-timeout)")
         except Exception as _e:
             logger.warning("MARK-INFLIGHT FAILED job=%s: %s", job_id, _e)  # ★诊断
 
@@ -718,7 +644,8 @@ class LruArenaStore:
                   token_ids: List[int],
                   source_obj: object,
                   gpu_write_fn=None,
-                  inc_hashes: Optional[List[int]] = None) -> bool:
+                  inc_hashes: Optional[List[int]] = None,
+                  data_writer: Optional[Callable] = None) -> bool:
         """把 [start_block, end_block) 这段 inc 写入 arena.
 
         参数:
@@ -742,7 +669,9 @@ class LruArenaStore:
         if end_block <= start_block:
             return True  # 无 inc 需要写
         n_blocks = end_block - start_block
-        if self._data_writer is None:
+        # 默认 writer 未绑 且 本次也没传 data_writer 覆盖 -> 无从写数据.
+        # (Q2 写进程: SSD 账本不 bind_cpu_source, 靠每次传 data_writer 从环读.)
+        if self._data_writer is None and data_writer is None:
             logger.warning("write_inc: data_writer not bound, skipping")
             return False
         # ★诊断: 记每次 write 的范围 + 之前的 committed 边界 (查"重复写覆盖"假设:
@@ -757,10 +686,13 @@ class LruArenaStore:
         if self._content_addr:
             return self._write_inc_dedup(
                 job_id, start_block, end_block, token_ids, source_obj,
-                gpu_write_fn=gpu_write_fn, inc_hashes=inc_hashes)
-        if inc_hashes is not None:
-            # hash 注入 (P1 跨层降级) 依赖 v2/哈希表, 非 content_addr 不支持
-            logger.warning("write_inc: inc_hashes 需要 content_addr 模式")
+                gpu_write_fn=gpu_write_fn, inc_hashes=inc_hashes,
+                data_writer=data_writer)
+        if inc_hashes is not None or data_writer is not None:
+            # hash 注入 / writer 覆盖 (P1 降级 / P2 升级) 依赖 v2/哈希表,
+            # 非 content_addr 不支持
+            logger.warning("write_inc: inc_hashes/data_writer 需要 "
+                           "content_addr 模式")
             return False
 
         # ---- 临界区 1: alloc (+ evict if needed), 拿到 slot_ids ----
@@ -867,7 +799,8 @@ class LruArenaStore:
                          token_ids: List[int],
                          source_obj: object,
                          gpu_write_fn=None,
-                         inc_hashes: Optional[List[int]] = None) -> bool:
+                         inc_hashes: Optional[List[int]] = None,
+                         data_writer: Optional[Callable] = None) -> bool:
         """内容寻址版 write_inc.
 
         与非 dedup 版同样的三段式临界区, 但每块先 probe hash 表:
@@ -1064,9 +997,13 @@ class LruArenaStore:
                              if plan[i][0] == 'M']
                 gpu_write_fn(_miss_slots, _miss_pos)
             else:
+                # ★ P2: data_writer 参数可按次覆盖默认 writer (promote 用
+                # "pread SSD->CPU slot" 代替常规 GPU gather 源).
+                _dw = data_writer if data_writer is not None \
+                    else self._data_writer
                 for i in range(n_blocks):
                     if plan[i][0] == 'M':
-                        self._data_writer(plan[i][1], i, source_obj)
+                        _dw(plan[i][1], i, source_obj)
             if _prof:
                 _seg['data'] = (time.time() - _tp) * 1000.0; _tp = time.time()
             # records: (slot, gen, hash). HIT gen=当前; MISS gen=当前+1(待发布)
@@ -1426,6 +1363,92 @@ class LruArenaStore:
             return None
         return nb * bs, nb, slot_gen
 
+    def resolve_range(self, prompt_token_ids: List[int], start_block: int,
+                      max_blocks: int = 0
+                      ) -> Optional[Tuple[int, List[Tuple[int, int, int]]]]:
+        """★ P2 跨层 lookup 拼接: 从 start_block 起继续表驱动探测.
+
+        与 lookup_resolve 同一套校验口径 (slot>=0 / egen!=UNPUB / gen 匹配 /
+        refcnt>0), 但从中段开始 —— 链式 hash 是绝对的 (含前缀上下文), 任意
+        起点可独立校验. 用途: CPU 层匹配停在 a 后, 对 SSD 账本从 a 续探.
+
+        返回 (end_block, [(slot, gen, hash), ...]) —— 连续命中到 end_block
+        (records 与 [start_block, end_block) 逐块对齐); 一个没中返回 None.
+        max_blocks > 0 时封顶命中长度 (claim 期的 LICHT_SSD_PROMOTE_MAX_MB
+        上限: 只 claim 承诺得起的量, 超出部分不 claim 自然重算).
+        不 pin (只读探测); 由调用方在 claim 后立即 mark_inflight + promote
+        时 try_pin fail-closed 兜底. 纯 Python (只跑 SSD 尾段, 长度有限).
+        """
+        if not self._content_addr:
+            return None
+        bs = self._block_size
+        n_full = len(prompt_token_ids) // bs
+        if start_block >= n_full:
+            return None
+        end_cap = n_full
+        if max_blocks > 0:
+            end_cap = min(end_cap, start_block + max_blocks)
+        hashes = block_hashes(prompt_token_ids, bs, end_cap)
+        recs: List[Tuple[int, int, int]] = []
+        for i in range(start_block, end_cap):
+            h = hashes[i]
+            slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+            if slot < 0 or egen == 0:
+                break
+            if _atomic.get_gen(self._hdr.slot_state_addr(slot)) != egen:
+                break
+            if _atomic.refcnt_get(self._hdr.slot_refcnt_addr(slot)) == 0:
+                break
+            recs.append((slot, egen, h))
+        if not recs:
+            return None
+        return start_block + len(recs), recs
+
+    def resolve_range_hashed(self, hashes: List[int], start_block: int
+                             ) -> Optional[Tuple[int,
+                                                 List[Tuple[int, int, int]]]]:
+        """★ P2 修 (当步现探): resolve_range 的 hash 注入版.
+
+        hashes 与块 [start_block, start_block+len) 逐块对齐 (调用方按请求
+        缓存 —— 算 hash 贵而探测便宜, 拆开后每步现探只花几十 µs 的 C 原子
+        读, 探测结果永远是当刻的, 杜绝"拿几分钟前的地图取货").
+        校验口径与 lookup_resolve 相同. 返回 (end_block, [(slot,gen,hash)])
+        或 None."""
+        if not self._content_addr or not hashes:
+            return None
+        recs: List[Tuple[int, int, int]] = []
+        for h in hashes:
+            slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+            if slot < 0 or egen == 0:
+                break
+            if _atomic.get_gen(self._hdr.slot_state_addr(slot)) != egen:
+                break
+            if _atomic.refcnt_get(self._hdr.slot_refcnt_addr(slot)) == 0:
+                break
+            recs.append((slot, egen, int(h)))
+        if not recs:
+            return None
+        return start_block + len(recs), recs
+
+    def probe_slots(self, hashes: List[int]
+                    ) -> Optional[List[Tuple[int, int]]]:
+        """★ P2: 按内容 hash 逐个探测, 全部命中才返回 [(slot, gen)].
+
+        promote 把 SSD 段写进 CPU 账本后, 用同一批 hash 重探拿新分配的
+        (slot, gen) 喂显式 load (dedup 命中的块拿到的是已有 slot, 同样正确).
+        任何一块探不到 (极端: 刚写入就被并发驱逐) → None, 调用方按整段
+        失败处理 (fail-closed).
+        """
+        out: List[Tuple[int, int]] = []
+        for h in hashes:
+            slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
+            if slot < 0 or egen == 0:
+                return None
+            if _atomic.get_gen(self._hdr.slot_state_addr(slot)) != egen:
+                return None
+            out.append((slot, egen))
+        return out
+
     def probe_block_reason(self, job_id: str, prompt_token_ids: List[int],
                            block_idx: int) -> Optional[dict]:
         """★ 诊断: lookup 在 block_idx 断了, 查清到底为啥 (只读, 不改状态)。
@@ -1721,6 +1744,16 @@ class LruArenaStore:
                         if _dirty:
                             self._stat_gate_skip += 1
                             continue
+                    # ★ capture-at-eviction (2026-07-06): 释放这 inc 的块【之前】
+                    # 把数据拷给 SSD 暂存 (零 pin, best-effort). 块此刻仍分配
+                    # (持 _evict_lock + job claim), _cpu_mv 读稳定. 无 SSD /
+                    # 失败时 no-op, 驱逐照常纯 LRU. finished job 不值得存.
+                    if (self._capture_fn is not None
+                            and victim not in self._finished_jobs):
+                        try:
+                            self._capture_fn(victim, s, e, records)
+                        except Exception:
+                            pass
                     freed, left_pinned = self._evict_inc_apply_locked(
                         records)                            # 短锁原子释放
                     gained += freed
@@ -1846,15 +1879,10 @@ class LruArenaStore:
             try:
                 _idle_wait = self._bg_interval
                 free = int(self._allocator.count_free_accurate())
-                # ★ P1: 洗衣扫描 —— 在驱逐水位之上很早就开始把最冷的脏 inc
-                # 送去写线程落盘, 等真到驱逐时它们多半已"干净"(可直接丢).
-                _demote_active = (self._demote_queue is not None
-                                  and self._demote_fn is not None)
-                if _demote_active and free < self._demote_low:
-                    try:
-                        self._demote_scan()
-                    except Exception as e:
-                        logger.warning("demote scan error: %s", e)
+                # ★ 2026-07-06: demote-ahead 扫描已删除. 降级改为 capture-at-
+                # eviction (见 _evict_inc_apply_locked 前的 _capture_fn 调用):
+                # 驱逐释放块前顺手拷一份给 SSD, 零 pin, 驱逐纯 LRU 不受影响.
+                _demote_active = False
                 if free < self._bg_low:
                     self._stat_bg_rounds += 1
                     # 分小 chunk 淘到 high; 每 chunk 一次 _evict_lockfree (短持
@@ -1867,9 +1895,11 @@ class LruArenaStore:
                         # ★ P1 紧急旁路: free 掉到 bg_low/2 仍洗不出干净的 ->
                         # 本 chunk 闸门失效, 脏 inc 也放行 (回退丢弃语义,
                         # 防"全脏 + 盘慢"把空闲池饿死).
-                        _gate = (_demote_active
+                        # ★ 闸门默认关 (self._evict_gate_on): 关 = 纯 LRU 驱逐,
+                        # 和纯 CPU 一致, 不让"洗净与否"决定淘谁 (见 __init__ 注释).
+                        _gate = (self._evict_gate_on and _demote_active
                                  and free >= max(self._bg_low // 2, 1))
-                        if _demote_active and not _gate:
+                        if self._evict_gate_on and _demote_active and not _gate:
                             self._stat_gate_bypass += 1
                         gained = self._evict_lockfree(
                             min(self._bg_chunk, self._bg_high - free),
@@ -1895,9 +1925,20 @@ class LruArenaStore:
                                 self._allocator.count_free_accurate())
                         except Exception:
                             _free = -1
-                        with self._clean_lock:
-                            _nclean = len(self._clean_incs)
-                            _ninfl = len(self._demote_inflight)
+                        # ★ capture-at-eviction 计数 (SsdTier.stats): 直观看到
+                        # "驱逐时拷了多少 / 丢了多少 / 真正写进 SSD 多少".
+                        #   cap_ok    = 成功入队的 inc 数
+                        #   cap_blk   = 成功 capture 的 block 数
+                        #   cap_drop  = 预算满/超大丢弃的 block 数 (= 纯 CPU 丢)
+                        #   ssd_wrote = 真写进 SSD 文件的 block 数 (dedup miss)
+                        #   ssd_hit   = SSD 账本 dedup 命中零 I/O 的 block 数
+                        #   ssd_free  = SSD 冷库剩余 slot
+                        _cs = {}
+                        if self._capture_stats_fn is not None:
+                            try:
+                                _cs = self._capture_stats_fn() or {}
+                            except Exception:
+                                _cs = {}
                         logger.info(
                             "ARENA-STAT[%s] free=%d/%d"
                             " | bg(rounds=%d freed=%d)"
@@ -1905,8 +1946,8 @@ class LruArenaStore:
                             " locked(calls=%d freed=%d)"
                             " | dedup(hit=%d miss=%d)"
                             " evict(freed=%d decref=%d)"
-                            " | demote(ok=%d fail=%d drop=%d clean=%d"
-                            " inflight=%d) gate(skip=%d bypass=%d)",
+                            " | capture(ok=%d blk=%d drop=%d stageMB=%d)"
+                            " ssd(wrote=%d hit=%d free=%d)",
                             self._stat_tag, _free, self._num_slots,
                             self._stat_bg_rounds, self._stat_bg_freed,
                             self._stat_preevict_calls,
@@ -1916,9 +1957,13 @@ class LruArenaStore:
                             self._stat_hit_blocks, self._stat_miss_blocks,
                             self._stat_evict_freed,
                             self._stat_evict_decref,
-                            self._stat_demote_ok, self._stat_demote_fail,
-                            self._stat_demote_drop, _nclean, _ninfl,
-                            self._stat_gate_skip, self._stat_gate_bypass)
+                            _cs.get("capture_ok", 0),
+                            _cs.get("capture_blocks", 0),
+                            _cs.get("capture_drop", 0),
+                            _cs.get("stage_inflight_mb", 0),
+                            _cs.get("demote_blocks", 0),
+                            _cs.get("demote_hit_blocks", 0),
+                            _cs.get("free", -1))
                 # idle 等待 (被 _signal_bg_evictor 唤醒 or 超时巡检;
                 # 全脏空转时 _idle_wait 已放大, 见循环头注释)
                 with self._bg_cv:

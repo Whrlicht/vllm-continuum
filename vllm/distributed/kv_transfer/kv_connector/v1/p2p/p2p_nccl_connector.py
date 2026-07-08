@@ -87,6 +87,14 @@ class RoundReqMeta:
     # the worker so a brand-new job can load another job's shared prefix.
     src_slots: Optional[list] = None
     src_gens: Optional[list] = None
+    # ★ P2 SSD 升级段: scheduler 侧 lookup_resolve_tiered 续探到的 SSD 块.
+    # worker 在 load 前把它们 promote 回 CPU (pread), 然后统一走 CPU->GPU.
+    # 三个平行 int 列表逐块对齐, 覆盖绝对块区间 [ssd_start, ssd_start+len).
+    # None/空 = 无 SSD 段.
+    ssd_start: int = 0
+    ssd_slots: Optional[list] = None
+    ssd_gens: Optional[list] = None
+    ssd_hashes: Optional[list] = None
 
 
 def _rl_slot_gen(rl: "RoundReqMeta"):
@@ -137,6 +145,13 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         # releases its GPU blocks; decode side admits via arena-load
         # next pass.  Empty unless LICHT_PHASE2_ADMISSION_GATE=1.
         self.arena_sink: list[tuple] = []
+        # ★ P2 修 (2026-07-05 定案): Phase2 defer 期的后台修复搬运 —— 探测
+        # 发现 "CPU 有洞、洞在 SSD" (冷期被降级的历史段) 时, 让 worker 后台
+        # 把该段 SSD->CPU 搬回, CPU 真齐后按【纯 CPU】判定 admit. SSD 不参与
+        # "齐" 的承诺 (decode 永不重算的铁律: 失败模式只能是"多等", 不能是
+        # "错"). 每 entry = (request_id, job_id, ssd_start, slots, gens,
+        # hashes). 幂等 (内容寻址, 重复搬零成本).
+        self.arena_promote: list[tuple] = []
         # Phase A: job_ids whose trace has finished (is_last_step on a
         # request just completed).  Worker iterates and calls
         # _round_store_obj.mark_finished so its in-memory eviction
@@ -218,6 +233,26 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # build_connector_meta 丢弃本步未再 probe 的条目 (_rk_lk_seen), 不泄漏.
         self._rk_lk_cache: dict[str, Any] = {}
         self._rk_lk_seen: set = set()
+        # ★ P2: claim 了 SSD 段的请求 (req_id -> job_id). worker promote 后
+        # 清 SSD inflight; 请求没走到 load 就挂掉时由 request_finished 兜底清.
+        self._ssd_marked: dict[str, str] = {}
+        # ★ P2 修 (当步现探): SSD 段探测结果只在【本步】有效 —— rid ->
+        # (step_no, seg). 步内 get_num/update_state 共用同一探测 (防两次
+        # 现探结果不一致导致 claim/记账错位), 跨步必重探 (防陈旧地图).
+        self._rk_step_no = 0
+        self._rk_ssd_seg: dict[str, Any] = {}
+        # ★ Phase2 专用查询的缓存 (2026-07-04 18:17 复盘: Phase2 覆盖判定
+        # 误用了跨步缓存的 _rk_lookup_cached -> sink 写齐后 matched 永远停在
+        # 首次探测值 -> 5 个请求 PRESENT 却永远 SHORT/defer). Phase2 是轮询
+        # "写齐了没", CPU 部分必须每次现算 (C 快路径 ~1ms); 贵的 Python
+        # tail hash 按 (matched 边界) 缓存, 边界变才重算.
+        self._rk_ph2_tail: dict[str, Any] = {}   # rid -> (mb, tail_hashes)
+        self._rk_ph2_res: dict[str, Any] = {}    # rid -> (step_no, res) 步内共用
+        # ★ Phase2 defer 期后台修复搬运 (2026-07-05): rid -> 上次入队 step
+        # (节流, 25 步重试一次; 搬运幂等); _q 每步由 build_connector_meta
+        # 排空进 metadata.arena_promote 下发 worker.
+        self._ph2_promote_pending: dict[str, int] = {}
+        self._ph2_promote_q: list = []
         if self._round_kv_enabled:
             try:
                 from vllm.v1.core.sched.licht_v3.round_kv_store import (
@@ -412,6 +447,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # the GPU paged buffer BEFORE the forward, so attention
                 # sees it.  Delete-on-load (consume-once).
                 if self._round_kv_enabled:
+                    # ★ P2: load 分发前把各请求的 SSD 段搬回 CPU (同步基线,
+                    # 卡引擎 = pread 时长, claim 期 MAX_MB 已封顶). 之后
+                    # 三种分发模式 (async/pipelined/batch) 均不感知 SSD.
+                    if metadata.round_load:
+                        self._promote_ssd_segments(metadata.round_load)
                     # NO delete-on-load (incremental keeps history; later
                     # rounds append only the delta).
                     if self._round_async:
@@ -523,6 +563,21 @@ class P2pNcclConnector(KVConnectorBase_V1):
             # Phase-2-only deployments never read the sunk KV back.)
             # Done BEFORE the NCCL pull loop so attention sees the prefix this
             # step.  Sync load (small per-request increment).
+            # ★ P2 修 (2026-07-05): Phase2 defer 期修复搬运 —— 后台线程把
+            # "CPU 有洞、洞在 SSD" 的历史段搬回 CPU (不占引擎), CPU 真齐后
+            # 调度器按纯 CPU 判定 admit. consumer 的 load 永远只读 CPU.
+            if (self._phase2_admission_gate and metadata.arena_promote
+                    and self._round_store_obj is not None):
+                for (_rid, _job, _a, _slots, _gens, _hashes) in \
+                        metadata.arena_promote:
+                    try:
+                        self._round_store_obj.enqueue_promote(
+                            _job, int(_a),
+                            list(zip(_slots, _gens, _hashes)))
+                    except Exception as e:  # pragma: no cover
+                        logger.warning(
+                            "arena_promote enqueue failed req=%s: %s",
+                            _rid, e)
             if ((self._phase1_save_on_preempt or self._phase2_admission_gate)
                     and self._round_kv_enabled and metadata.round_load
                     and self._round_store_obj is not None):
@@ -1138,21 +1193,181 @@ p2p_nccl_engine import get_fast_release_queue
         """
         rid = request.request_id
         self._rk_lk_seen.add(rid)
+        job_id = getattr(request, "job_id", None)
         if rid in self._rk_lk_cache:
-            return self._rk_lk_cache[rid]
+            entry = self._rk_lk_cache[rid]
+        else:
+            if not job_id or self._round_store_obj is None:
+                self._rk_lk_cache[rid] = None
+                return None
+            _t = time.time()
+            # ★ P2 修 (当步现探): 缓存只存【贵且稳定】的部分 —— CPU resolve
+            # 结果 + SSD 尾段 hash (token 不变 hash 永远有效). SSD 的探测
+            # 结果【绝不】跨步缓存 (2026-07-03 复盘: 旧版整包缓存 -> admit
+            # 时拿几分钟前的 SSD 地图 -> 74 次 promote 秒败).
+            base = self._round_store_obj.lookup_resolve(
+                str(job_id), request.prompt_token_ids)
+            tail = None
+            try:
+                _mb = base[1] if base is not None else 0
+                tail = self._round_store_obj.ssd_tail_hashes(
+                    request.prompt_token_ids, _mb)
+            except Exception:
+                tail = None
+            # [PROBE] 只在真正算 (cache miss) 时累计 lookup 耗时/次数.
+            self._sched_lk_ms = getattr(self, "_sched_lk_ms", 0.0) \
+                + (time.time() - _t) * 1000.0
+            self._sched_lk_n = getattr(self, "_sched_lk_n", 0) + 1
+            entry = ((base, tail)
+                     if (base is not None or tail) else None)
+            self._rk_lk_cache[rid] = entry
+        if entry is None:
+            return None
+        base, tail = entry
+        # SSD 段: 每步现探一次 (µs 级 C 原子读), 步内共用; 探中即挂 inflight
+        # (在 ssd_probe_fresh 内) + 记入 _ssd_marked 供 finish 兜底清.
+        seg = None
+        if tail:
+            _c = self._rk_ssd_seg.get(rid)
+            if _c is not None and _c[0] == self._rk_step_no:
+                seg = _c[1]
+            else:
+                try:
+                    _mb = base[1] if base is not None else 0
+                    # ★ 闸门按角色: producer(prefill) 走诚实收益闸门 (搬 vs
+                    # 重算); consumer(decode Phase2 admission) 旁路 —— 那边
+                    # 等不到数据的下场是客户端超时, 搬永远比死等划算.
+                    # ★ 2026-07-05 (prefill inflight 久占修): claim 期【不挂】
+                    # SSD inflight —— admit 前根本不搬, 挂着只是把 SSD 槽白锁
+                    # 一整个排队期, 深队列下饿死 SSD 容量. 改为只在 admit 挂
+                    # (update_state_after_alloc). 等待期腾出的槽让别的请求 KV
+                    # 复用. 正确性: promote 时 pin+gen fail-closed 才防读错,
+                    # inflight 只是保住复用的优化; 等待中槽被淘 → admit 现探返
+                    # None → 该段退回重算 (安全, 只丢复用). Phase2(decode)不走
+                    # 这条路, 它的 claim 挂保留 (defer 期后台真在搬).
+                    seg = self._round_store_obj.ssd_probe_fresh(
+                        str(job_id), _mb, tail,
+                        apply_gate=self.is_producer,
+                        mark_inflight=False)
+                except Exception:
+                    seg = None
+                self._rk_ssd_seg[rid] = (self._rk_step_no, seg)
+                # NB: 不在此记 _ssd_marked —— producer 只在 admit 挂 inflight,
+                # 由 update_state_after_alloc 记 (供 request_finished 兜底清).
+        if base is None and seg is None:
+            return None
+        mt, mb, sg = base if base is not None else (0, 0, None)
+        if seg is not None:
+            _a, _recs = seg
+            _end = _a + len(_recs)
+            return _end * self._block_size, _end, sg, seg
+        return mt, mb, sg, None
+
+    def _promote_ssd_segments(self, round_load) -> None:
+        """★ P2 (worker, 引擎线程): load 分发前把各请求的 SSD 段搬回 CPU.
+
+        成功: 跨 job 显式路径把 promote 返回的 (cpu_slot, gen) 接到
+        src_slots/src_gens 尾部 (own-job 路径无需接 —— promote 以同 job 写入
+        CPU 账本, own .slot 已自然覆盖 gap 全段).
+        失败: 清空该请求的 ssd + src 字段 → 整个 gap 退回 own-.slot 路径并
+        整体 fail-closed (per_item_ok=False, 同现有 fail=N 类; promote 侧
+        已 error 级报警). 处理后抹掉 ssd 字段, 下游分发模式不感知 SSD."""
+        for rl in round_load:
+            if not rl.ssd_slots:
+                continue
+            recs = list(zip(rl.ssd_slots, rl.ssd_gens or [],
+                            rl.ssd_hashes or []))
+            sg = None
+            if (len(recs) == len(rl.ssd_slots)
+                    and self._round_store_obj is not None):
+                try:
+                    sg = self._round_store_obj.promote_from_ssd(
+                        rl.job_id, int(rl.ssd_start), recs)
+                except Exception as e:  # pragma: no cover
+                    logger.error(
+                        "promote_ssd_segments error req=%s job=%s: %s",
+                        rl.request_id, str(rl.job_id)[:32], e)
+            if sg is not None:
+                if rl.src_slots:
+                    rl.src_slots = (list(rl.src_slots)
+                                    + [int(s) for (s, _g) in sg])
+                    rl.src_gens = (list(rl.src_gens)
+                                   + [int(g) for (_s, g) in sg])
+                # src_slots 空/None = own-job: promote 已写进本 job 账本,
+                # own .slot 覆盖, 无需显式列表.
+            else:
+                # 失败: gap 整体退 own-.slot (own incs 只到 SSD 段前 →
+                # load_request 返 None → 整请求 fail-closed, 不留半截).
+                rl.src_slots = None
+                rl.src_gens = None
+            rl.ssd_slots = None
+            rl.ssd_gens = None
+            rl.ssd_hashes = None
+
+    def _rk_lookup_fresh_tiered(self, request):
+        """★ Phase2 (decode admission) 专用查询: CPU 覆盖每次现算.
+
+        与 _rk_lookup_cached 的区别 (2026-07-04 复盘): Phase2 在轮询 "sink
+        写齐了没", CPU matched 必须反映当刻 (跨步缓存会把 matched 冻在首次
+        探测值 -> PRESENT 却永远 SHORT). CPU resolve 走 C 快路径 (~1ms);
+        贵的 Python tail hash 按 matched 边界缓存 (边界变才重算 O(prompt)).
+
+        ★ 2026-07-05 定案: 返回的 matched 是【纯 CPU】口径 (SSD 不参与
+        "齐" 的承诺 —— decode 永不重算, 失败模式只能是"多等"不能是"错").
+        ssd_seg 仅作情报: 非 None = "CPU 的洞在 SSD 里" (冷期被降级的历史
+        段), 调用方据此触发 defer 期后台修复搬运, CPU 真齐后才 admit.
+        SSD 探测不走收益闸门 (死等无经济学), 探中挂 SSD inflight 保护
+        修复窗口. 步内 get_num/update_state 共用同一结果.
+        返回 4 元组 (mt_cpu, mb_cpu, sg, ssd_seg) 或 None."""
+        rid = request.request_id
+        _c = self._rk_ph2_res.get(rid)
+        if _c is not None and _c[0] == self._rk_step_no:
+            return _c[1]
         job_id = getattr(request, "job_id", None)
         if not job_id or self._round_store_obj is None:
-            self._rk_lk_cache[rid] = None
             return None
-        _t = time.time()
-        res = self._round_store_obj.lookup_resolve(
+        base = self._round_store_obj.lookup_resolve(
             str(job_id), request.prompt_token_ids)
-        # [PROBE] 只在真正算 (cache miss) 时累计 lookup 耗时/次数.
-        self._sched_lk_ms = getattr(self, "_sched_lk_ms", 0.0) \
-            + (time.time() - _t) * 1000.0
-        self._sched_lk_n = getattr(self, "_sched_lk_n", 0) + 1
-        self._rk_lk_cache[rid] = res
+        mb = base[1] if base is not None else 0
+        seg = None
+        try:
+            _t = self._rk_ph2_tail.get(rid)
+            if _t is None or _t[0] != mb:
+                tail = self._round_store_obj.ssd_tail_hashes(
+                    request.prompt_token_ids, mb)
+                self._rk_ph2_tail[rid] = (mb, tail)
+            else:
+                tail = _t[1]
+            if tail:
+                seg = self._round_store_obj.ssd_probe_fresh(
+                    str(job_id), mb, tail, apply_gate=False)
+                if seg is not None:
+                    self._ssd_marked[rid] = str(job_id)
+        except Exception:
+            seg = None
+        if base is None and seg is None:
+            res = None
+        else:
+            mt, _mb2, sg = base if base is not None else (0, 0, None)
+            res = (mt, mb, sg, seg)   # matched = 纯 CPU; seg 仅情报
+        self._rk_ph2_res[rid] = (self._rk_step_no, res)
         return res
+
+    def _ph2_schedule_promote(self, rid: str, job_id: str, seg) -> None:
+        """把 Phase2 defer 期的修复搬运排进本步元数据 (幂等 + 节流).
+
+        节流 25 步重试一次: 搬运本身幂等 (内容寻址, 重复搬 = dedup HIT 零
+        I/O), 节流只为省元数据带宽. rid 在 admit / request_finished 时清."""
+        _p = self._ph2_promote_pending.get(rid)
+        if _p is not None and self._rk_step_no - _p < 25:
+            return
+        self._ph2_promote_pending[rid] = self._rk_step_no
+        _a, recs = seg
+        self._ph2_promote_q.append(
+            (rid, str(job_id), int(_a),
+             [int(s) for (s, _g, _h) in recs],
+             [int(g) for (_s, g, _h) in recs],
+             [int(h) for (_s, _g, h) in recs]))
 
     def mark_arena_sink(self, request) -> bool:
         """★ 改动1/2: scheduler 在 waiting 循环【80% break】后, 对 break 那个 + 它后面
@@ -1232,7 +1447,7 @@ p2p_nccl_engine import get_fast_release_queue
                     # 命中白费. [perf] 走 _rk_lookup_cached: 同请求只算一次.
                     res = self._rk_lookup_cached(request)
                     if res is not None:
-                        matched_tokens, _mb, _sg = res
+                        matched_tokens, _mb, _sg, _ssd = res
                         ext = matched_tokens - num_computed_tokens
                         if ext > 0:
                             # async (True): park in WAITING_FOR_REMOTE_KVS,
@@ -1253,12 +1468,22 @@ p2p_nccl_engine import get_fast_release_queue
                 and self._round_store_obj is not None):
             job_id = getattr(request, "job_id", None)
             if job_id:
-                res = self._round_store_obj.lookup(
-                    str(job_id), request.prompt_token_ids)
-                # 整份齐 = arena 命中块覆盖整个 prompt 的完整块数.
+                # ★ P2 修 (2026-07-04 复盘, decode3 卡死请求): 覆盖判定改两层
+                # 拼接 —— CPU 淘掉但已降级进 SSD 的块算"在" (admit 后 worker
+                # 在 load 前 promote 回 CPU). 原 CPU-only lookup 会对
+                # "CPU 有洞 + 洞在 SSD" 的请求永远 defer 到客户端超时.
+                # ★★ 必须用 fresh 版 (18:17 复盘): Phase2 在轮询 sink 进度,
+                # _rk_lookup_cached 的跨步缓存会把 matched 冻在首次值 ->
+                # PRESENT 却永远 SHORT. fresh 版 CPU 每步现算 + SSD 不走
+                # 收益闸门 + 探中挂 SSD inflight.
+                res = self._rk_lookup_fresh_tiered(request)
+                # 整份齐 = 两层命中块覆盖整个 prompt 的完整块数.
                 _need_blk = (len(request.prompt_token_ids)
                              // self._block_size)
                 _mb = res[1] if res is not None else -1
+                _ssd_blk = (len(res[3][1])
+                            if (res is not None and res[3] is not None)
+                            else 0)
                 # ★ 诊断(每请求每 5s 一条): 区分 sink 请求死法 —
                 #   一直 matched<need → 数据缺(被淘/没写齐) = pin/淘汰问题;
                 #   一直 matched>=need 却没 admit → 数据在却 admit 不上 = 调度问题。
@@ -1270,8 +1495,8 @@ p2p_nccl_engine import get_fast_release_queue
                                 ("FULL" if _mb >= _need_blk else "SHORT"))
                     logger.info(
                         "Phase2 arena-probe req=%s job=%s matched_blk=%d "
-                        "need=%d verdict=%s", request.request_id,
-                        str(job_id)[:40], _mb, _need_blk, _verdict)
+                        "(ssd=%d) need=%d verdict=%s", request.request_id,
+                        str(job_id)[:40], _mb, _ssd_blk, _need_blk, _verdict)
                     # ★ 诊断: SHORT 时查清 block[matched] 到底为啥 miss
                     #   (ht_miss/unpublished/gen_mismatch/refcnt0/PRESENT + 这个 job
                     #    自己覆盖没覆盖这块) → 一眼锁定真因, 不再猜。
@@ -1287,10 +1512,17 @@ p2p_nccl_engine import get_fast_release_queue
                             logger.info("Phase2 SHORT-WHY probe failed req=%s: "
                                         "%s", request.request_id, _pe)
                 if res is not None:
-                    matched_tokens, matched_blocks = res
-                    if matched_blocks >= _need_blk:
+                    matched_tokens = res[0]
+                    if _mb >= _need_blk:   # ★ 纯 CPU 口径的"齐" (2026-07-05)
                         ext = matched_tokens - num_computed_tokens
                         return max(0, ext), False   # 齐 → admit-from-arena
+                    if res[3] is not None:
+                        # ★ defer 期后台修复: CPU 的洞在 SSD (冷期被降级的
+                        # 历史段) → 交给 worker 后台搬回 CPU; 本步照旧 defer,
+                        # CPU 真齐后才 admit. 失败 = 继续等 + 自动重试,
+                        # 结构上不可能产生垃圾 (decode 永不重算的铁律).
+                        self._ph2_schedule_promote(
+                            request.request_id, str(job_id), res[3])
             # 没齐 (这一轮的块还没 sink 完 / 被淘) → defer 等下轮, 永不重算.
             return None, False
 
@@ -1361,12 +1593,15 @@ p2p_nccl_engine import get_fast_release_queue
                     and self._round_kv_enabled
                     and self._round_store_obj is not None):
                 job_id = getattr(request, "job_id", None)
-                all_tids = list(request.prompt_token_ids)
                 if job_id:
-                    res = self._round_store_obj.lookup(
-                        str(job_id), all_tids)
+                    # ★ P2 修 (2026-07-05 定案): 与 get_num 同一步共用同一
+                    # fresh 结果 (步内 memo); matched 是【纯 CPU】口径 ——
+                    # admit 只在 CPU 真齐时发生, load 永远只读 CPU (SSD 段
+                    # 已在 defer 期由后台修复搬回). sg 显式传 (表驱动匹配
+                    # 可能超出 own-.slot 覆盖).
+                    res = self._rk_lookup_fresh_tiered(request)
                     if res is not None:
-                        _matched, matched_blocks = res
+                        _matched, matched_blocks, slot_gen, _ssd_seg = res
                         num_blocks = num_external_tokens // self._block_size
                         local_hit_blocks = matched_blocks - num_blocks
                         block_ids0 = blocks.get_block_ids()[0]
@@ -1376,12 +1611,23 @@ p2p_nccl_engine import get_fast_release_queue
                             dst = list(block_ids0)[
                                 local_hit_blocks:
                                 local_hit_blocks + num_blocks]
+                            sg = None
+                            if slot_gen is not None:
+                                sg = slot_gen[
+                                    local_hit_blocks:
+                                    local_hit_blocks + num_blocks]
+                                if len(sg) != num_blocks:
+                                    sg = None   # 解析不足, 退 own-.slot
                             self._round_load_reqs[
                                 request.request_id] = (
-                                    str(job_id), dst, local_hit_blocks, None)
+                                    str(job_id), dst, local_hit_blocks, sg)
                             self._arena_sinked.discard(
                                 request.request_id)
                             self._arena_sink_ts.pop(
+                                request.request_id, None)
+                            self._rk_ph2_tail.pop(request.request_id, None)
+                            self._rk_ph2_res.pop(request.request_id, None)
+                            self._ph2_promote_pending.pop(
                                 request.request_id, None)
                             # ★ 在途保护: 已拉走 → 清 .inflight, job 重新可淘。
                             self._round_store_obj.clear_inflight(str(job_id))
@@ -1452,7 +1698,7 @@ p2p_nccl_engine import get_fast_release_queue
                 # [perf] 复用 get_num 这步算过的同一结果 (按 request_id 缓存).
                 res = self._rk_lookup_cached(request)
                 if res is not None:
-                    _matched_tokens, matched_blocks, slot_gen = res
+                    _matched_tokens, matched_blocks, slot_gen, ssd_seg = res
                     num_blocks = num_external_tokens // self._block_size
                     # local cache hit (in blocks) sits before the gap.
                     local_hit_blocks = matched_blocks - num_blocks
@@ -1462,16 +1708,41 @@ p2p_nccl_engine import get_fast_release_queue
                             >= local_hit_blocks + num_blocks):
                         dst = list(block_ids0)[
                             local_hit_blocks:local_hit_blocks + num_blocks]
-                        # ★ 跨 job: 把 lookup_resolve 解析的 slot 切到与 dst 对齐的
-                        # 段 [local_hit_blocks, local_hit_blocks+num_blocks).
+                        g0 = local_hit_blocks       # gap 起点 (绝对块号)
+                        gend = local_hit_blocks + num_blocks
+                        # ★ P2: gap 拆两段 —— CPU 段 [g0, cpu_end) + SSD 段
+                        # [max(ssd_a, g0), gend). ssd_a = CPU 匹配终点.
+                        ssd_meta = None
+                        cpu_end = gend
+                        if ssd_seg is not None:
+                            ssd_a, ssd_recs = ssd_seg
+                            ssd_from = max(int(ssd_a), g0)
+                            recs_sliced = list(
+                                ssd_recs[ssd_from - int(ssd_a):])
+                            # 一致性: SSD 段必须恰好补到 gap 末尾
+                            if (recs_sliced
+                                    and ssd_from + len(recs_sliced) == gend
+                                    and ssd_from >= g0):
+                                ssd_meta = (ssd_from, recs_sliced)
+                                cpu_end = ssd_from
+                                # ★ producer 唯一的 SSD inflight 挂点
+                                # (2026-07-05): admit 确定要用这段才挂, 只需
+                                # 撑过 admit->worker promote pin 的毫秒竞态窗口
+                                # (等待期不挂, 见 _rk_lookup_cached). worker
+                                # promote 后清; 请求挂掉由 request_finished 兜底.
+                                self._round_store_obj.ssd_mark_inflight(
+                                    str(job_id))
+                                self._ssd_marked[request.request_id] = (
+                                    str(job_id))
+                        # ★ 跨 job: 把 lookup_resolve 解析的 slot 切到与 dst
+                        # 对齐的 CPU 段 [g0, cpu_end).
                         sg = None
                         if slot_gen is not None:
-                            sg = slot_gen[
-                                local_hit_blocks:local_hit_blocks + num_blocks]
-                            if len(sg) != num_blocks:
+                            sg = slot_gen[g0:cpu_end]
+                            if len(sg) != cpu_end - g0:
                                 sg = None   # 解析不足, 退回 own-.slot
                         self._round_load_reqs[request.request_id] = (
-                            str(job_id), dst, local_hit_blocks, sg)
+                            str(job_id), dst, local_hit_blocks, sg, ssd_meta)
 
     # 回传 REMOVED (2026-05-21): enqueue_v3_pushback / enqueue_v3_offload /
     # enqueue_v3_offload_release deleted.
@@ -1504,6 +1775,10 @@ p2p_nccl_engine import get_fast_release_queue
         if self._rk_lk_cache:
             self._rk_lk_cache = {k: v for k, v in self._rk_lk_cache.items()
                                  if k in self._rk_lk_seen}
+            # ★ P2 修: SSD 现探结果同策略清理 + 步号推进 (跨步作废)
+            self._rk_ssd_seg = {k: v for k, v in self._rk_ssd_seg.items()
+                                if k in self._rk_lk_seen}
+        self._rk_step_no += 1
         self._rk_lk_seen.clear()
 
         # LICHT round-kv: drain scheduler-side reuse bookkeeping into the
@@ -1512,19 +1787,31 @@ p2p_nccl_engine import get_fast_release_queue
         # early returns below so both paths carry it.
         if self._round_kv_enabled:
             for req_id, _v in self._round_load_reqs.items():
-                # _v 为 (job_id, dst, src_offset) 或 (..., slot_gen) 4 元组.
+                # _v 为 (job_id, dst, src_offset) / (..., slot_gen) 4 元组 /
+                # (..., ssd_meta) 5 元组 (★ P2 producer 路径).
                 job_id, dst_block_ids, src_offset = _v[0], _v[1], _v[2]
                 slot_gen = _v[3] if len(_v) > 3 else None
                 src_slots = ([int(s) for (s, _g) in slot_gen]
                              if slot_gen else None)
                 src_gens = ([int(g) for (_s, g) in slot_gen]
                             if slot_gen else None)
+                # ★ P2: SSD 段 (ssd_from, [(slot,gen,hash),...]) -> 平行列表
+                _ssd = _v[4] if len(_v) > 4 else None
+                ssd_start = int(_ssd[0]) if _ssd else 0
+                ssd_slots = ([int(s) for (s, _g, _h) in _ssd[1]]
+                             if _ssd else None)
+                ssd_gens = ([int(g) for (_s, g, _h) in _ssd[1]]
+                            if _ssd else None)
+                ssd_hashes = ([int(h) for (_s, _g, h) in _ssd[1]]
+                              if _ssd else None)
                 meta.round_load.append(RoundReqMeta(
                     request_id=req_id, job_id=job_id,
                     block_ids=list(dst_block_ids), token_ids=[],
                     num_blocks=len(dst_block_ids),
                     src_block_offset=src_offset,
-                    src_slots=src_slots, src_gens=src_gens))
+                    src_slots=src_slots, src_gens=src_gens,
+                    ssd_start=ssd_start, ssd_slots=ssd_slots,
+                    ssd_gens=ssd_gens, ssd_hashes=ssd_hashes))
             self._round_load_reqs.clear()
             for req_id, (job_id, block_ids0, token_ids) in \
                     self._pending_round_store.items():
@@ -1557,6 +1844,10 @@ p2p_nccl_engine import get_fast_release_queue
                 meta.arena_sink.append(
                     (req_id, job_id, list(prompt_tids), remote_addr))
             self._pending_arena_sink.clear()
+        # ★ P2 修 (2026-07-05): Phase2 defer 期修复搬运下发 worker
+        if self._phase2_admission_gate and self._ph2_promote_q:
+            meta.arena_promote.extend(self._ph2_promote_q)
+            self._ph2_promote_q.clear()
 
         # Phase A: drain trace-finished job IDs.  Both producer and
         # consumer worker process these (each updates its own
@@ -1750,6 +2041,16 @@ p2p_nccl_engine import get_fast_release_queue
                 if _jid:
                     self._round_store_obj.clear_inflight(str(_jid))
         self._preempt_saved.pop(request.request_id, None)
+        # ★ P2 兜底: claim 了 SSD 段却没走到 load 就结束的请求 (排队超时挂掉
+        # 等), 清 SSD 账本 .inflight 防永久保护泄漏. 正常路径 worker promote
+        # 后已清, 这里幂等重清无害; 不误清下一轮 (多轮顺序执行, 同 CPU 侧).
+        _sjob = self._ssd_marked.pop(request.request_id, None)
+        if (_sjob and self._round_kv_enabled
+                and self._round_store_obj is not None):
+            self._round_store_obj.ssd_clear_inflight(_sjob)
+        self._rk_ph2_tail.pop(request.request_id, None)
+        self._rk_ph2_res.pop(request.request_id, None)
+        self._ph2_promote_pending.pop(request.request_id, None)
         # Phase2 arena-sink markers 生命周期到此 (防 _arena_sink_failed 无界增长)
         self._arena_sink_failed.discard(request.request_id)
         self._arena_sink_ts.pop(request.request_id, None)

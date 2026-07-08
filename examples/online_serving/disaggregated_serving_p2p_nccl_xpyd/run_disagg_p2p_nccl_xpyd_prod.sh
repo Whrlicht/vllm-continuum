@@ -52,6 +52,24 @@ KV_SEND_TYPE="BLOCK_MIGRATE"
 ROUND_KV_REUSE_PATH=""
 ROUND_KV_DEFAULT_PATH="/dev/shm/licht_round_kv"
 NO_ROUND_KV=false
+# ---- SSD 三层存储 (最冷层, ssd_tier.py) ----
+# CPU arena 驱逐时把活跃 job 的 inc 降级到 SSD (P1); prefill claim / decode
+# Phase2 defer 时从 SSD promote 回 CPU (P2).  数据 = SSD 上单个 fallocate 大
+# 文件 (SSD_PATH/arena.data), 账本元数据 = shm (SSD_META_PATH).  跨进程共享,
+# prefill + decode 两端必须同一 PATH/META (两端同一 export 保证).  之前每次
+# 手动 export, 现固化进脚本. 关掉: --no-ssd-tier.
+SSD_TIER=true                                   # --no-ssd-tier 关
+SSD_PATH="/home/fdse/whr/licht_ssd"             # SSD 数据文件目录; --ssd-path 改
+SSD_META_PATH="/dev/shm/licht_ssd_meta"         # 账本 (shm)
+SSD_GB="200"                                    # 数据文件大小; --ssd-gb 改
+# capture 暂存环 (decode->写进程 SHM SPSC 环) 每环大小 MB.  每个引擎进程建一个
+# 环 (3 decode + 1 prefill), 环在 /dev/shm.  默认 512MB 太小: 驱逐突发瞬间灌爆
+# -> 94% 环满丢 (2026-07-07 复盘: 盘平均只写 81MB/s 远未到上限, 瓶颈是突发+小环).
+# 提到 5120MB(5GB): 3 decode 环峰值 ~15GB, 4 环兜底 ~20GB, 远小于 shm 空闲 ~100GB.
+SSD_STAGE_MB="5120"                             # 每环暂存 MB; --ssd-stage-mb 改
+# 收益闸门 (搬<算才 claim): 2026-07-05 用户决策默认【关】—— 慢盘上先保证
+# SSD 端到端复用跑通, 再谈经济学.  开门 (=1): --ssd-gate.
+SSD_GATE=false
 # Layer-wise pipelined round-kv load: prefill loads layer i+1's reused
 # prefix while computing layer i (vs the default: read+scatter all layers
 # before the forward, blocking).  Off by default; enable with
@@ -203,6 +221,13 @@ Options:
                                ${ROUND_KV_DEFAULT_PATH}
   --no-round-kv                Disable cross-round KV reuse even under
                                --licht-v3 (for A/B comparison)
+  --no-ssd-tier                Disable the SSD cold tier (default ON under
+                               --licht-v3; demote CPU->SSD + promote SSD->CPU).
+  --ssd-path DIR               SSD data-file dir (default /home/fdse/whr/licht_ssd).
+  --ssd-gb N                   SSD data-file size in GB (default 200).
+  --ssd-stage-mb N             capture 暂存环每环 MB (default 5120; 每引擎一环, 在 shm).
+  --ssd-gate                   Enable the promote benefit-gate (搬<算才搬).
+                               Default OFF: always promote (2026-07-05 decision).
   --round-kv-pipeline          Layer-wise pipelined load: load layer i+1's
                                reused prefix while computing layer i (instead
                                of loading all layers before the forward).
@@ -309,6 +334,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-round-kv)
       NO_ROUND_KV=true
+      shift
+      ;;
+    --no-ssd-tier)
+      SSD_TIER=false
+      shift
+      ;;
+    --ssd-path)
+      SSD_PATH="$2"
+      shift 2
+      ;;
+    --ssd-gb)
+      SSD_GB="$2"
+      shift 2
+      ;;
+    --ssd-stage-mb)
+      SSD_STAGE_MB="$2"
+      shift 2
+      ;;
+    --ssd-gate)
+      SSD_GATE=true
       shift
       ;;
     --round-kv-pipeline)
@@ -535,6 +580,13 @@ export LICHT_PHASE2_GATE_THRESHOLD=0.90
 # GPU 块泄漏. 两端都 export (prefill 存得多, decode 也存少量在途 KV). 默认即开,
 # 这里显式声明. 关掉: LICHT_SINK_HEAL=0 (回到旧的无限重试, 仅 A/B 用).
 export LICHT_SINK_HEAL=1
+# ★ 猎杀探针 (2026-07-04, decode3 卡死请求复盘): inflight 保护在场时块仍
+# 消失 (verify=FULL 13 分钟后 ht_miss, 两层皆无). 头号嫌疑 = 内容共享块的
+# refcnt 经其它非 inflight job 的淘汰衰减到 0 被释放 (inflight 只挡"选中本
+# job 为受害者", 挡不住共享槽的旁路释放). 开 FREE_TRACE: 每次 refcnt→0 真
+# 释放打一行 ARENA-FREE (slot/hash/victim_job/是否在途), 复现后拿 SHORT-WHY
+# 的 hash 反查释放现场. info 级, 高频, 定罪后关闭.
+export LICHT_ARENA_FREE_TRACE=1
 if [[ "${ROUND_KV_RAW}" != "true" ]]; then
   export LICHT_ROUND_KV_RAW=0
 fi
@@ -578,6 +630,42 @@ fi
 # arena NUMA interleave (默认关, A/B 用). 两端同一 export 继承.
 if [[ "${ARENA_NUMA_INTERLEAVE}" == "true" ]]; then
   export LICHT_ARENA_NUMA_INTERLEAVE=1
+fi
+# ---- SSD 三层存储 (最冷层). ★ 一次 export, prefill+decode 两端继承同一
+# PATH/META (跨进程共享的硬要求). 之前每次手动 export, 现固化. ----
+if [[ "${SSD_TIER}" == "true" ]]; then
+  # SSD 需要 LRU arena (降级 hook 挂在 bg evictor 上) + 内容寻址 (promote 靠
+  # hash 重探). 缺任一则 SSD 无从生效, 直接告警不启用, 避免静默空转.
+  if [[ "${ROUND_KV_LRU}" != "true" || "${ARENA_CONTENT_ADDR}" != "true" ]]; then
+    echo "WARN: --ssd-tier 需要 LRU arena + 内容寻址 (--licht-v3 默认已开); 当前未满足 → SSD 层不启用"
+  else
+    mkdir -p "${SSD_PATH}" 2>/dev/null || true
+    # ★ 清跨 run 残留账本 (2026-07-04 复盘: 旧 _ssd_meta 的槽布局/内容与本 run
+    # 的 arena.data 不一致 → promote 取到陈旧地图. 每 run 起前清, SsdTier
+    # open_or_create 会 flock 重建). 数据大文件保留 (fallocate 复用, 省 200G 预写).
+    rm -rf "${SSD_META_PATH}" 2>/dev/null || true
+    export LICHT_SSD_TIER=1
+    export LICHT_SSD_PATH="${SSD_PATH}"
+    export LICHT_SSD_META_PATH="${SSD_META_PATH}"
+    export LICHT_SSD_GB="${SSD_GB}"
+    export LICHT_SSD_STAGE_MB="${SSD_STAGE_MB}"
+    # 收益闸门 (默认关 = 无条件搬). --ssd-gate 打开恢复经济学.
+    if [[ "${SSD_GATE}" == "true" ]]; then
+      export LICHT_SSD_PROMOTE_GATE=1
+    else
+      export LICHT_SSD_PROMOTE_GATE=0
+    fi
+    # ★ Q2 (2026-07-06): SSD 写在独立 sidecar 进程做, 和 decode 隔离. decode
+    #   只 capture (memmove 进 shm 环); sidecar drain 环 -> 写 SSD (含 fdatasync).
+    #   环在 /dev/shm, sidecar glob 发现. 下面 proxy 之后起.
+    export LICHT_SSD_RING_DIR="${SSD_RING_DIR:-/dev/shm}"
+    rm -f "${LICHT_SSD_RING_DIR}"/licht_ssd_stage_*.ring 2>/dev/null || true
+    SSD_WRITER_ON=true
+    echo "  SSD tier: ON  path=${SSD_PATH} (${SSD_GB}GB) meta=${SSD_META_PATH} gate=${SSD_GATE} stage_ring=${SSD_STAGE_MB}MB/环 (写进程 sidecar, ring=${LICHT_SSD_RING_DIR})"
+  fi
+else
+  # 显式关: 确保不残留上次 shell 的 export 泄漏进子进程.
+  unset LICHT_SSD_TIER LICHT_SSD_PATH LICHT_SSD_META_PATH LICHT_SSD_GB
 fi
 
 if [[ ! -f "${PROXY_SCRIPT}" ]]; then
@@ -848,6 +936,7 @@ echo "  ROUND_KV_LRU=${ROUND_KV_LRU} (stage2 slot-paged LRU arena)"
 echo "  ARENA_CONTENT_ADDR=${ARENA_CONTENT_ADDR} (stage6 跨 job dedup: hash表+refcnt)"
 echo "  ARENA_CONSUMER_DIRECT=${ARENA_CONSUMER_DIRECT} (decode 也 register arena 走直读, 防长前缀 staging OOM)"
 echo "  ARENA_NUMA_INTERLEAVE=${ARENA_NUMA_INTERLEAVE} (arena 跨 NUMA 摊带宽, A/B 用)"
+echo "  SSD_TIER=${SSD_TIER} (三层最冷层; path=${SSD_PATH} ${SSD_GB}GB gate=${SSD_GATE})"
 echo "  REQUEST_COMPLETION_TIMEOUT_S=${REQUEST_COMPLETION_TIMEOUT_S}"
 echo "  GET_RETRY_TIMEOUT_S=${GET_RETRY_TIMEOUT_S}"
 echo "  GET_RETRY_INTERVAL_S=${GET_RETRY_INTERVAL_S}"
@@ -891,6 +980,15 @@ setsid python3 "${PROXY_SCRIPT}" \
   --discovery-port "${PROXY_DISCOVERY_PORT}" \
   > proxy_prod.log 2>&1 &
 PIDS+=("$!")
+
+# ★ Q2: SSD 写进程 sidecar (只在 SSD tier 开时). 等账本 meta 就绪后 drain
+#   各 decode 的 shm 环 -> SSD. 和 proxy 一样 setsid, cleanup 按 PGID 收.
+if [[ "${SSD_WRITER_ON}" == "true" ]]; then
+  echo "Starting SSD writer sidecar..."
+  setsid python3 -m vllm.v1.core.sched.licht_v3.ssd_writer_process \
+    > ssd_writer_prod.log 2>&1 &
+  PIDS+=("$!")
+fi
 
 echo "Starting prefill workers..."
 PREFILL_PORTS=()
@@ -1007,6 +1105,9 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     echo "  prefill[$i]: PREFILL_FCFS on (LICHT-V3 + pure-FCFS priority + fixed chunk=native"\
          "long_prefill_token_threshold; NO longcap, NO dynamic_chunk)"
   fi
+
+
+  export LICHT_DYN_DEGEN_CAP=32768
   CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
     --host 0.0.0.0 \
