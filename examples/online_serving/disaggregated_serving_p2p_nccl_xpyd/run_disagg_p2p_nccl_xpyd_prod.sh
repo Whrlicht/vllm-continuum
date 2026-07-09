@@ -1073,21 +1073,22 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     # 塞满长请求, 直到某个长请求装不下为止. 短请求一旦有被挡下的, θ 立即恢复.
     # 解决"长请求多、短请求已塞满、但 KV 还空着被 θ 挡住"的浪费. 配合
     # LICHT_LONGCAP_FOOTPRINT=1(footprint 帽)使用.
+    # θ-relax full: 没短请求被挡时松开 θ 帽、长请求填满空闲 KV(最大化显存利用)。
+    # 零驱逐由 footprint 投影记账 + LICHTV2 timeline 双保。代价是 p50 有 trade-off
+    # (混合负载实测会涨), 但走"最大利用+零驱逐"的系统故事时接受。CAP=1.0=全松。
     export LICHT_LONG_THETA_RELAX=1
-    # dynamic_chunk mode F: smooth long/short via lambda=smoothstep((C-Clow)/(Chigh-Clow)).
-    # F adds the "big request also waits for short requests each round" penalty
-    # (shared by N_long), curing mode E's over-chunking (S* floored ~256 under
-    # congestion). SHORT_SET=all => drag penalty W_soft counts running shorts AND
-    # waiting requests' extra wait => more conservative chunks, best p50/mean under
-    # load (validated jps=10: p50 37.5->36.5, mean 54.4->53.7, all tail metrics down).
-    # timeline (R_at/B_at) uses this real per-step chunk so future_free matches reality.
-    export LICHT_DYN_CHUNK=F
-    export LICHT_DYN_SHORT_SET=all
-    export LICHT_DYN_CLOW="${PREFILL_OPT_CLOW}"
-    export LICHT_DYN_CHIGH="${PREFILL_OPT_CHIGH}"
+    export LICHT_LONG_THETA_RELAX_CAP=1.0
+    export LICHT_DYN_PIN_CAP=0        # chunk cap 不钉死(避免肥尾; kmax 已稳定护尾)
+    export LICHT_LONGCAP_FOOTPRINT=1  # 投影 footprint θ帽(零驱逐记账; θ-relax 松它)
+    # dynamic chunk = mode C(激进细切, 最低 p50) + per-request k_max 护尾:
+    #   chunk = max(S*, ceil(C0/kmax)), C0=准入时总新增 prefill -> 单请求最多切
+    #   kmax 段。只卡【巨请求】的重读爆炸(护 tail), 中小请求 S*>C0/kmax 碰不到
+    #   地板 -> 照样细切(保 p50)。实测 C+kmax16 双优, p50/tail 压过 F 和 nochunk。
+    export LICHT_DYN_CHUNK=C
+    export LICHT_DYN_KMAX=16
     [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
     echo "  prefill[$i]: PREFILL_OPT on (shorts-first longcap_fcfs + theta=${PREFILL_OPT_THETA}"\
-         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + dynamic_chunk[F/all] band=${PREFILL_OPT_CLOW}-${PREFILL_OPT_CHIGH}"\
+         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + footprint + dynamic_chunk[C+kmax16]"\
          "+ short_reserve=${PREFILL_OPT_SHORT_RESERVE}; brb=${_brb_file:-default216})"
   elif [[ "${PREFILL_FCFS}" == "true" ]]; then
     # --prefill-fcfs: DIAGNOSTIC baseline. Keep LICHT-V3 (round-kv arena reuse)
