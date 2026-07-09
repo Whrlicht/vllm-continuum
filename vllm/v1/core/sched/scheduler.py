@@ -300,6 +300,14 @@ class Scheduler(SchedulerInterface):
         self.licht_v2_dyn_cap_at_admit: dict[str, int] = {}
         self._dyn_pin_cap = (
             os.environ.get("LICHT_DYN_PIN_CAP", "1") == "1")
+        # S*=0 退化兜底: 记每个【已被切过】请求上一步的 chunk, 供 S*=0 时复用
+        # (存在=running/已排过; 缺失=本step新请求). 见 _dyn_degenerate.
+        self._dyn_last_chunk: dict[str, int] = {}
+        # 详细 trace (LICHT_TRACE=path): 每请求 arrive/admit/finish + 每步
+        # KV利用率/chunk, 供 queue-vs-compute + 长/短分开分析. best-effort。
+        self._trace_path = os.environ.get("LICHT_TRACE")
+        self._trace_f = open(self._trace_path, "w") if self._trace_path else None
+        self._trace_step = 0
         # P5b: last-probed (prefix-hit, evictable) per WAITING request, so
         # the StepEvent can report the real prefix hit for waiting reqs
         # (their request.num_computed_tokens is still 0 pre-admit).  The
@@ -858,6 +866,14 @@ class Scheduler(SchedulerInterface):
         # 由 LICHT_DYN_SHORT_SET 选用哪堆。f_lC=Σλ_run C, f_Nlong=Σλ_run。
         f_lDC = f_lC = f_lD = f_Nlong = 0.0
         f_Ts_run = f_ws_run = f_Ts_wait = f_ws_wait = 0.0
+        # mode F: predict THIS step's batch (running carryover + FCFS-estimated
+        # waiting admits) so the long-terms see the long requests that will
+        # actually run this step -- not just last step's running.  Fixes the
+        # precompute-before-admit timing gap (a soon-to-run long is still in
+        # `waiting` -> f_lD=0 -> S*=0 -> run whole -> never chunked -> F≈nochunk).
+        # Default-on for F; E keeps the raw running/waiting split.
+        _pred = (self._dyn_estimate_step_batch(cstar)
+                 if self._dyn_mode == "F" else None)
         _n_run = len(self.running)
         for _idx, r in enumerate(list(self.running) + list(self.waiting)):
             # predicted cross-tier hit for waiting (real num_computed for
@@ -877,14 +893,18 @@ class Scheduler(SchedulerInterface):
                 e_gA += _lam * _D
                 e_wsoft += (1.0 - _lam)
                 _s = 1.0 - _lam
-                if _idx < _n_run:                       # running
+                # "runs this step" = running carryover OR predicted-admitted (F);
+                # E/off falls back to the raw running/waiting split.
+                _in = (r.request_id in _pred) if _pred is not None \
+                    else (_idx < _n_run)
+                if _in:                                 # in this step's batch
                     f_lDC += _lam * _D * rem
                     f_lC += _lam * rem
                     f_lD += _lam * _D
                     f_Nlong += _lam
                     f_Ts_run += _s * _D * rem
                     f_ws_run += _s
-                else:                                   # waiting
+                else:                                   # not scheduled this step
                     f_Ts_wait += _s * _D * rem
                     f_ws_wait += _s
         self._dyn_ntotal = len(rema)
@@ -925,6 +945,53 @@ class Scheduler(SchedulerInterface):
             self._dyn_S = self._dyn_clamp(
                 math.sqrt(self._dyn_brb * sum_DC / denom), None)
 
+    def _dyn_estimate_step_batch(self, cstar: int) -> set:
+        """Rough estimate of the request_ids that will RUN this step: running
+        carryover + waiting admitted FCFS (short band + long band, each by
+        arrival) by cumulative KV footprint until capacity / the θ cap is hit.
+        Read-only.  Rough by design -- mode F only needs the long requests'
+        *presence* in the batch (0/1), not exact sizing, so a cheap FCFS-by-
+        footprint walk suffices.  HITPRED-aware: uses the same cross-tier hit as
+        precompute so returning rounds are classified by their real remaining."""
+        bs = self.block_size
+        pred = {r.request_id for r in self.running}
+        ff = getattr(self, "_licht_v2_future_free", None)
+        try:
+            avail = int(ff[0]) if ff else \
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+        except Exception:
+            avail = self._total_kv_blocks
+        _theta = os.environ.get("LICHT_LONG_THETA")
+        cap_long = (float(_theta) * self._total_kv_blocks
+                    if _theta else float(self._total_kv_blocks))
+
+        def _rem(r):                                # real remaining (HITPRED-aware)
+            _hd = self._sched_hit_pred.get(r.request_id, r.num_computed_tokens)
+            return r.num_tokens - _hd
+
+        def _fp(r):                                 # resident KV footprint (blocks)
+            return (r.num_tokens + bs - 1) // bs
+
+        long_used = sum(_fp(r) for r in self.running if _rem(r) > cstar)
+        used = 0
+        _wait = [r for r in self.waiting if _rem(r) > 0]
+        _sh = sorted((r for r in _wait if _rem(r) <= cstar),
+                     key=lambda r: r.arrival_time)      # short band, FCFS
+        _lo = sorted((r for r in _wait if _rem(r) > cstar),
+                     key=lambda r: r.arrival_time)      # long band, FCFS
+        _order = os.environ.get("LICHT_LONGCAP_ORDER", "long")
+        for r in (_sh + _lo) if _order == "short" else (_lo + _sh):
+            f = _fp(r)
+            if used + f > avail:
+                break                               # KV full: nothing more fits
+            if _rem(r) > cstar:
+                if long_used + f > cap_long:
+                    continue                        # long-lane θ cap: skip long
+                long_used += f
+            pred.add(r.request_id)
+            used += f
+        return pred
+
     def _dyn_nshort(self, remaining: int) -> int:
         return bisect.bisect_left(self._dyn_sorted, remaining)
 
@@ -935,6 +1002,47 @@ class Scheduler(SchedulerInterface):
             c = min(c, remaining)
         return c
 
+    def _dyn_kmax(self, request: Request, s: int, remaining: int) -> int:
+        """Per-request chunk-count cap (LICHT_DYN_KMAX, 0=off): raise the chunk
+        to at least C0/k_max (C0 = total new prefill at admission) so no request
+        is split into more than k_max pieces -> bounds the giant-request re-read
+        blowup (protects tail) even when S* is aggressive (low p50)."""
+        k = int(os.environ.get("LICHT_DYN_KMAX", "0"))
+        if k > 0:
+            c0 = request.num_tokens - self.licht_v2_num_computed_at_admit.get(
+                request.request_id, request.num_computed_tokens)
+            if c0 > 0:
+                s = max(s, (c0 + k - 1) // k)
+        return min(s, remaining)
+
+    def _dyn_degenerate(self, request: Request, remaining: int) -> int:
+        """S*=0 退化兜底 (防"未来 S*=0 -> 全整段 -> 打穿 KV 池"):
+        已在 running 的请求(有 last_chunk 记录)-> max(上一步 chunk, C0/kmax)
+        有界续切、不整段、与 timeline 预订一致; 本 step 新请求(无记录)-> 整段
+        (其完整 footprint 已在准入闸门过 θ 帽, 整段安全)。"""
+        _last = self._dyn_last_chunk.get(request.request_id)
+        if _last is None:                       # 新请求: 整段(准入已按 footprint 过帽)
+            return 0
+        k = int(os.environ.get("LICHT_DYN_KMAX", "0"))
+        _kf = 0
+        if k > 0:
+            c0 = request.num_tokens - self.licht_v2_num_computed_at_admit.get(
+                request.request_id, request.num_computed_tokens)
+            if c0 > 0:
+                _kf = (c0 + k - 1) // k
+        return min(max(_last, _kf), remaining)
+
+    def _trace_ev(self, kind: str, **f) -> None:
+        if self._trace_f is None:
+            return
+        try:
+            f["kind"] = kind
+            self._trace_f.write(json.dumps(f) + "\n")
+            if kind == "step":
+                self._trace_f.flush()
+        except Exception:
+            pass
+
     def _licht_dyn_cap(self, request: Request, remaining: int) -> int:
         # ★ 计划钉死: 已准入的请求返回准入那一刻快照的 cap (与 timeline 预订
         # 一致), 不随全局 S* 漂移. 未准入的候选走 live (用当前 S* 评估). 判据
@@ -944,7 +1052,10 @@ class Scheduler(SchedulerInterface):
             _pinned = self.licht_v2_dyn_cap_at_admit.get(request.request_id)
             if _pinned is not None:
                 return _pinned
-        return self._licht_dyn_cap_live(request, remaining)
+        cap = self._licht_dyn_cap_live(request, remaining)
+        if cap > 0:                             # 记本步 chunk, 供未来 S*=0 复用
+            self._dyn_last_chunk[request.request_id] = cap
+        return cap
 
     def _licht_dyn_cap_live(self, request: Request, remaining: int) -> int:
         # 0 = no cap (run whole).  When disabled, fall back to the static
@@ -953,21 +1064,15 @@ class Scheduler(SchedulerInterface):
         if mode not in ("A", "B", "C", "D", "E", "F"):
             return self.scheduler_config.long_prefill_token_threshold
         if mode in ("E", "F"):
-            # smooth: short (lambda=0, C<=Clow) runs whole; else chunk at S*.
+            # short (lambda=0, C<=Clow) -> run whole.  Else chunk at S* with the
+            # per-request k_max cap; S*=0 -> _dyn_degenerate (running: bounded
+            # reuse of last chunk; new: whole) -- prevents "future S*=0 -> everyone
+            # runs whole -> KV pool overflow" without pin-cap's fat tail.
             if remaining <= getattr(self, "_dyn_clow", 2048):
                 return 0
             if self._dyn_S > 0:
-                return min(self._dyn_S, remaining)
-            # degenerate S*=0 (fresh lone long): fall back to static chunk so it
-            # still gets a bounded first step (then D>0 and the formula kicks in).
-            _stat = self.scheduler_config.long_prefill_token_threshold
-            if _stat <= 0:
-                # ★ 退化分支兜底 (2026-07-03 OOM 复盘): 全系统皆长请求时
-                # W_soft=0 -> S*=0, 且 static 未配 -> 原行为整段不切 -> 一步
-                # 22 万 token 的激活分配踩中碎片化. LICHT_DYN_DEGEN_CAP>0
-                # 时用它封顶 (opt-in, 默认 0 = 原行为字节级不变).
-                _stat = int(os.environ.get("LICHT_DYN_DEGEN_CAP", "0"))
-            return min(_stat if _stat > 0 else remaining, remaining)
+                return self._dyn_kmax(request, self._dyn_S, remaining)
+            return self._dyn_degenerate(request, remaining)
         if remaining <= self._dyn_cstar:       # short request: never chunk
             return 0
         if mode == "A":
@@ -978,8 +1083,10 @@ class Scheduler(SchedulerInterface):
             denom = max(self._dyn_nshort(remaining), 1)
             return self._dyn_clamp(
                 math.sqrt(self._dyn_brb * remaining / denom), remaining)
-        # C / D: one batch-shared S
-        return min(self._dyn_S, remaining) if self._dyn_S > 0 else 0
+        # C / D: one batch-shared S with per-request k_max cap; S*=0 -> degenerate
+        # fallback (running: bounded reuse of last chunk; new: run whole).
+        return self._dyn_kmax(request, self._dyn_S, remaining) \
+            if self._dyn_S > 0 else self._dyn_degenerate(request, remaining)
 
     def _peek_waiting_request(self) -> Request:
         if self.licht_prefill_sched_enabled:
@@ -1510,7 +1617,7 @@ class Scheduler(SchedulerInterface):
                     _theta_relax = (
                         os.environ.get("LICHT_LONG_THETA_RELAX") == "1"
                         and not getattr(self, "_licht_short_skipped", False))
-                    if os.environ.get("LICHT_LONGCAP_FOOTPRINT") == "1":
+                    if os.environ.get("LICHT_LONGCAP_FOOTPRINT", "1") == "1":
                         # FOOTPRINT theta cap: bound the LONG lane to theta of total
                         # KV by PROJECTED footprint (sum of running longs' full L+C
                         # blocks + this candidate).  Unlike the SHORT_RESERVE branch,
@@ -1522,23 +1629,24 @@ class Scheduler(SchedulerInterface):
                         cur_long = sum((r.num_tokens + bs - 1) // bs
                                        for r in self.running
                                        if (r.num_tokens - r.num_computed_tokens) > thr)
+                        # θ-relax 有界版: 正常长请求投影 footprint <= θ (30%);
+                        # 本步没短请求被挡时放宽到 <= LICHT_LONG_THETA_RELAX_CAP
+                        # (默认 0.8), 但【仍是帽, 不跳过】-> 永远给短请求留
+                        # (1-cap)=20% (PD 分离无 decode 占用 => 该不变式 == "长请求
+                        # 投影 footprint <= 80%"), 下一步短请求可快速插队, 不会像
+                        # 旧 θ-relax 填满物理容量把短请求饿死。
                         cap_long = float(_theta) * self._total_kv_blocks
+                        if _theta_relax:
+                            cap_long = float(os.environ.get(
+                                "LICHT_LONG_THETA_RELAX_CAP", "0.8")
+                            ) * self._total_kv_blocks
                         if any_long and cur_long + cand > cap_long:
-                            if _theta_relax:
-                                # 松 θ: 没短请求要保护, 不 return → 落到下面的
-                                # future-free 物理检查, 装得下就塞这个长请求。
-                                if _capr_on:
-                                    logger.info(
-                                        "PROBE-GUARD theta_relax PACK-LONG "
-                                        "cur_long=%d cand=%d cap=%d "
-                                        "(no short pending)", cur_long, cand,
-                                        int(cap_long))
-                            else:
-                                if _capr_on:
-                                    logger.info("PROBE-GUARD reject=LONG_THETA_FP "
-                                                "cur_long=%d cand=%d cap=%d",
-                                                cur_long, cand, int(cap_long))
-                                return False
+                            if _capr_on:
+                                logger.info("PROBE-GUARD reject=LONG_THETA_FP "
+                                            "cur_long=%d cand=%d cap=%d relax=%d",
+                                            cur_long, cand, int(cap_long),
+                                            int(_theta_relax))
+                            return False
                         # physical feasibility within the timeline horizon: don't
                         # admit a long the predicted free blocks can't hold now.
                         ff = getattr(self, "_licht_v2_future_free", None)
@@ -1695,6 +1803,8 @@ class Scheduler(SchedulerInterface):
             return self._schedule_impl()
 
     def _schedule_impl(self) -> SchedulerOutput:
+        if self._trace_f is not None:
+            self._trace_step += 1
         # LICHTV3 K_queue actual: increment per-call step counter.  Used
         # both for stamping arrival_step on add_request and admit_step
         # when a waiting request is moved into scheduled_new_reqs.
@@ -1977,6 +2087,9 @@ class Scheduler(SchedulerInterface):
                         # 计划钉死: 抢占后清 cap 快照, 下次重新准入时按新
                         # 时刻的 S* 重新钉 (它此刻是全新候选).
                         self.licht_v2_dyn_cap_at_admit.pop(
+                            preempted_req.request_id, None)
+                        # 抢占后清 last_chunk: 重新准入时按"新请求"处理.
+                        self._dyn_last_chunk.pop(
                             preempted_req.request_id, None)
                         # Accumulate victim count for the LICHT preempt
                         # selector.  Unconditional: non-LICHT paths never
@@ -2588,6 +2701,10 @@ class Scheduler(SchedulerInterface):
                         hit_length=num_computed_tokens
                     )
                     scheduled_new_reqs.append(request)
+                    self._trace_ev("admit", rid=request.request_id,
+                                   t=time.time(), step=self._trace_step,
+                                   ntok=request.num_tokens,
+                                   ncomp=num_computed_tokens)
                     # LICHTV3 K_queue ground truth: a WAITING request was
                     # just admitted to RUNNING — write the diff between
                     # admit step and arrival step.
@@ -2818,6 +2935,16 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_blocks,
         )
+        if self._trace_f is not None:
+            try:
+                _free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                _tot = self._total_kv_blocks
+                self._trace_ev("step", step=self._trace_step, t=time.time(),
+                               kv_used=_tot - _free, kv_total=_tot,
+                               chunks=dict(num_scheduled_tokens))
+            except Exception:
+                pass
+
         structured_output_request_ids, grammar_bitmask = (
             self.get_grammar_bitmask(self.running,
                                      scheduled_spec_decode_tokens))
@@ -3584,6 +3711,9 @@ class Scheduler(SchedulerInterface):
         # before the scheduler picked it up.  This stamp isolates the pure
         # scheduler-waiting time (add -> admit) from that input-queue delay.
         request._licht_add_ts = time.time()
+        self._trace_ev("arrive", rid=request.request_id,
+                       t=request._licht_add_ts, ntok=request.num_tokens,
+                       ncomp=request.num_computed_tokens)
 
         #print(f"Adding request {request.job_id} to waiting queue")
         #print(f"Request last_func_call: {request.last_func_call}")
@@ -3678,6 +3808,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
+        self._trace_ev("finish", rid=request.request_id, t=time.time())
         # LICHTV3: on decode, every finished request is a "round end".
         # Notify the v3 coordinator BEFORE we free state so its predictor
         # sees consistent num_tokens / agent_round on the request.  This
@@ -3714,6 +3845,7 @@ class Scheduler(SchedulerInterface):
         self.licht_v2_num_computed_at_admit.pop(request.request_id, None)
         self.licht_v2_evictable_prefix_at_admit.pop(request.request_id, None)
         self.licht_v2_dyn_cap_at_admit.pop(request.request_id, None)
+        self._dyn_last_chunk.pop(request.request_id, None)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
 
@@ -3774,6 +3906,7 @@ class Scheduler(SchedulerInterface):
             self.licht_v2_evictable_prefix_at_admit.pop(
                 request.request_id, None)
             self.licht_v2_dyn_cap_at_admit.pop(request.request_id, None)
+            self._dyn_last_chunk.pop(request.request_id, None)
             delay_free_blocks, _ = self._connector_finished(request)
             self.encoder_cache_manager.free(request)
             self.finished_req_ids.add(request_id)
