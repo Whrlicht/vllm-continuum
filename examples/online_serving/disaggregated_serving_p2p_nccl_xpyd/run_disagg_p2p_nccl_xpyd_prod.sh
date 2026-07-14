@@ -96,17 +96,18 @@ ROUND_KV_RAW=true
 # decode memcpys KV into a /dev/shm region that prefill cudaHostRegisters once,
 # so a load is a DIRECT H2D (~24GB/s) — no per-load file read / mmap->pinned
 # copy / page faults.  Supersedes RAW.  --no-round-kv-arena -> RAW .bin path.
-# --round-kv-arena-gb N sizes the arena (default 24; ring-evicts oldest when
+# --round-kv-arena-gb N sizes the arena (default 400; ring-evicts oldest when
 # full; prefill pays a one-time ~N/2 s cudaHostRegister at startup).
 ROUND_KV_ARENA=true
-ROUND_KV_ARENA_GB="400"
+ROUND_KV_ARENA_GB="${LICHT_ROUND_KV_ARENA_GB:-400}"
 # DIAGNOSTIC: drain the GPU before each round-kv load + time it, to tell
 # contention-with-prior-forward apart from op-inefficiency.  --round-kv-sync-first.
 ROUND_KV_SYNC_FIRST=false
-# Fused multi-layer scatter CUDA kernel: replace per-chunk nL index_puts with
-# ONE kernel launch (cuts CPU dispatch that starves the GPU in serving).
-# --round-kv-fused to enable (opt-in until serving-validated).
-ROUND_KV_FUSED=false
+# Fused multi-layer scatter backend kernel: CUDA uses csrc/, Ascend/NPU uses
+# csrc_npu/.  It replaces per-layer Python scatter with backend extension
+# launches on the round-kv load path.  If the backend extension is not built,
+# Python falls back to the old per-layer scatter with a clear warning.
+ROUND_KV_FUSED=true
 # Stage 2 LRU arena (slot-paged bitmap alloc + per-job LRU + tail-first evict +
 # self-heal, cross-process mutex + reader pin). Replaces the FIFO ring arena.
 # --round-kv-lru to enable (opt-in until serving-validated).
@@ -140,7 +141,7 @@ REQUEST_COMPLETION_TIMEOUT_S=600
 GET_RETRY_TIMEOUT_S=60
 GET_RETRY_INTERVAL_S=0.005
 
-DTYPE="float16"
+DTYPE="bfloat16"
 # Keep 0 as "auto": use model's own max context length.
 MAX_MODEL_LEN=0
 MAX_NUM_BATCHED_TOKENS=265944
@@ -188,6 +189,8 @@ FAIL_ON_WAIT_TIMEOUT=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+LICHT_V3_CSRC_ARENA="${REPO_ROOT}/vllm/v1/core/sched/licht_v3/csrc_arena"
+export PYTHONPATH="${REPO_ROOT}:${LICHT_V3_CSRC_ARENA}${PYTHONPATH:+:${PYTHONPATH}}"
 TRACE_REPLAY_PATH="${REPO_ROOT}/trace_data/mixed"
 # LICHT-V3 tool-time predictor bundle (tool_call_time): bash family → ML
 # p50/p95, editor/submit family → bucket-median 查表.  Unset/missing →
@@ -199,6 +202,8 @@ STOP_CLIENT_ON_EXIT=true
 
 PIDS=()
 EXPECTED_TIMESTAMP_FILES=()
+CLEANUP_REASON="unknown"
+CLEANUP_STATUS=0
 
 usage() {
   cat <<EOF
@@ -521,13 +526,11 @@ done
 # v3_shadow_predictions.jsonl and v3_step_time.jsonl stay empty.  Export
 # so the decode worker (a setsid child) inherits it.
 if [[ "${LICHT_V3}" == "true" ]]; then
-  export LICHT_V3_USE_SHADOW_SCHED=0
-  #export LICHT_V3_USE_SHADOW_SCHED=1
+  export LICHT_V3_USE_SHADOW_SCHED="${LICHT_V3_USE_SHADOW_SCHED:-1}"
   # Tool-time predictor bundle (bash→ML p50/p95, editor/submit→bucket 查表).
   # Without this the predictor runs in constant-fallback mode.
   if [[ -f "${TOOL_PREDICTOR_DIR}/bundle.json" ]]; then
-    #export LICHT_V3_TOOL_PREDICTOR_DIR="${TOOL_PREDICTOR_DIR}"
-    export LICHT_V3_TOOL_PREDICTOR_DIR=""
+    export LICHT_V3_TOOL_PREDICTOR_DIR="${TOOL_PREDICTOR_DIR}"
   else
     echo "WARN: tool predictor bundle not found at ${TOOL_PREDICTOR_DIR}/bundle.json"
     echo "      → tool-time prediction will use the constant fallback."
@@ -709,6 +712,7 @@ fi
 cleanup() {
   set +e
   trap - INT TERM EXIT
+  echo "Launcher cleanup triggered: reason=${CLEANUP_REASON}, status=${CLEANUP_STATUS}"
 
   stop_client_if_needed() {
     if [[ "${STOP_CLIENT_ON_EXIT}" != "true" ]]; then
@@ -870,6 +874,29 @@ cleanup() {
   wait 2>/dev/null || true
 }
 
+on_int() {
+  CLEANUP_REASON="INT"
+  CLEANUP_STATUS=130
+  cleanup
+  exit 130
+}
+
+on_term() {
+  CLEANUP_REASON="TERM"
+  CLEANUP_STATUS=143
+  cleanup
+  exit 143
+}
+
+on_exit() {
+  local status=$?
+  CLEANUP_STATUS="${status}"
+  if [[ "${CLEANUP_REASON}" == "unknown" ]]; then
+    CLEANUP_REASON="EXIT"
+  fi
+  cleanup
+}
+
 # Echo a `numactl --cpunodebind=N --membind=N` prefix that binds a worker to
 # the NUMA node local to GPU $1 (derived from sysfs), or nothing if disabled /
 # unavailable / node unknown.  numactl needs no privileges.
@@ -894,7 +921,7 @@ wait_for_http_ready() {
   local start_ts
   start_ts="$(date +%s)"
   while true; do
-    if curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+    if curl --noproxy '*' -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
       echo "HTTP ready on port ${port}"
       return 0
     fi
@@ -956,7 +983,9 @@ echo "  PROXY_DISCOVERY=tcp://${PROXY_DISCOVERY_HOST}:${PROXY_DISCOVERY_PORT}"
 echo "  PROXY_API=http://${PROXY_API_HOST}:${PROXY_API_PORT}"
 echo ""
 
-trap cleanup INT TERM EXIT
+trap on_int INT
+trap on_term TERM
+trap on_exit EXIT
 
 cd "${SCRIPT_DIR}"
 
@@ -1108,7 +1137,12 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
 
 
   export LICHT_DYN_DEGEN_CAP=32768
-  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
+  if command -v npu-smi >/dev/null 2>&1; then
+    DEVICE_VISIBLE_ENV="ASCEND_RT_VISIBLE_DEVICES"
+  else
+    DEVICE_VISIBLE_ENV="CUDA_VISIBLE_DEVICES"
+  fi
+  env "${DEVICE_VISIBLE_ENV}=${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${prefill_output_dir}" CONTINUUM_INSTANCE_TAG="prefill_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --enforce-eager \
     --host 0.0.0.0 \
     --port "${http_port}" \
@@ -1120,7 +1154,7 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     --gpu-memory-utilization "${PREFILL_GPU_MEMORY_UTILIZATION}" \
     "${PREFILL_EXTRA_ARGS[@]}" \
     --kv-transfer-config \
-    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
+    "{\"kv_connector\":\"P2pConnector\",\"kv_role\":\"kv_producer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"p2p_num_channels\":\"16\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
     > "prefill_prod_$((i + 1)).log" 2>&1 &
   PIDS+=("$!")
 done
@@ -1181,7 +1215,12 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
 
   NUMA_WRAP="$(numa_wrap_for_gpu "${gpu_id}")"
   [[ -n "${NUMA_WRAP}" ]] && echo "  decode[$i]: numa-bind gpu ${gpu_id} via '${NUMA_WRAP}'"
-  CUDA_VISIBLE_DEVICES="${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
+  if command -v npu-smi >/dev/null 2>&1; then
+    DEVICE_VISIBLE_ENV="ASCEND_RT_VISIBLE_DEVICES"
+  else
+    DEVICE_VISIBLE_ENV="CUDA_VISIBLE_DEVICES"
+  fi
+  env "${DEVICE_VISIBLE_ENV}=${gpu_id}" VLLM_USE_V1=1 VLLM_TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH}" RUN_OUTPUT_DIR="${decode_output_dir}" CONTINUUM_INSTANCE_TAG="decode_${http_port}" setsid ${NUMA_WRAP} vllm serve "${MODEL_PATH}" \
     --host 0.0.0.0 \
     --port "${http_port}" \
     --tensor-parallel-size 1 \
@@ -1193,7 +1232,7 @@ for i in "${!DECODE_GPU_ARRAY[@]}"; do
     "${DECODE_EXTRA_ARGS[@]}" \
     --enable-chunked-prefill \
     --kv-transfer-config \
-    "{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
+    "{\"kv_connector\":\"P2pConnector\",\"kv_role\":\"kv_consumer\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${PROXY_IP_FOR_WORKERS}\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${http_port}\",\"send_type\":\"${KV_SEND_TYPE}\",\"p2p_num_channels\":\"16\",\"nccl_num_channels\":\"16\",\"request_completion_timeout_s\":\"${REQUEST_COMPLETION_TIMEOUT_S}\",\"get_retry_timeout_s\":\"${GET_RETRY_TIMEOUT_S}\",\"get_retry_interval_s\":\"${GET_RETRY_INTERVAL_S}\",\"round_kv_reuse_path\":\"${ROUND_KV_REUSE_PATH}\"}}" \
     > "decode_prod_$((i + 1)).log" 2>&1 &
   PIDS+=("$!")
 done

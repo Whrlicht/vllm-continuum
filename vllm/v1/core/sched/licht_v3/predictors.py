@@ -19,12 +19,40 @@ predictor.  Only the tool-time wrapper lives here now.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _add_repo_root_for_tool_call_time(run_dir: str | os.PathLike | None
+                                      = None) -> None:
+    """Make the local tool_call_time package and legacy modules importable.
+
+    Production launchers often run from example directories and may not have
+    the repo root on PYTHONPATH. Resolve it from the predictor bundle first,
+    then fall back to this file's location.  The tool_call_time training
+    scripts still use legacy bare imports such as ``import features``; keep
+    both the repo root and the package directory importable.
+    """
+    candidates: list[Path] = []
+    if run_dir is not None:
+        p = Path(run_dir).resolve()
+        candidates.extend([p, *p.parents])
+    here = Path(__file__).resolve()
+    candidates.extend([here, *here.parents])
+
+    for p in candidates:
+        root = p if (p / "tool_call_time" / "train.py").is_file() else None
+        if root is not None:
+            paths = [str(root), str(root / "tool_call_time")]
+            for path in reversed(paths):
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +100,9 @@ class ToolTimePredictorWrapper:
     def from_run_dir(cls, run_dir: str | os.PathLike,
                      default_t_tool_s: float = 5.0,
                      tokenizer_provider: Optional[Any] = None,
-                     ) -> "ToolTimePredictorWrapper":
+                       ) -> "ToolTimePredictorWrapper":
         try:
-            import sys
-            tool_pkg = "/data/whr/vllm-continuum"
-            if tool_pkg not in sys.path:
-                sys.path.insert(0, tool_pkg)
+            _add_repo_root_for_tool_call_time(run_dir)
             from tool_call_time.train import Predictor as _P  # type: ignore
             p = _P.load(Path(run_dir))
             logger.info("LICHTV3 ToolTimePredictor loaded from %s", run_dir)

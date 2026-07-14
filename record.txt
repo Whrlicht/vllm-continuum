@@ -1,0 +1,410 @@
+1. 连接问题
+容器：ssh -N -R 1111:127.0.0.1:22 ubuntu@10.176.35.72
+跳板机：ssh root@127.0.0.1 -p 1111
+本地：vscode连container
+
+2. 网络问题
+跳板机：proxy_on
+容器：ssh -N -L 7890:127.0.0.1:7890 ubuntu@10.176.35.72
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export http_proxy=$HTTP_PROXY
+export https_proxy=$HTTPS_PROXY
+curl https://github.com
+
+3. 环境问题
+目前环境：
+openEuler + Ascend 910B3
+CANN 8.2.RC1
+torch-npu 2.7.1.dev20250724
+vllm 0.10.2
+vllm-ascend 0.10.2rc1
+已经可以运行
+
+4. github问题
+容器：
+初始化：
+cd /root/work
+git clone https://github.com/TianweiGan/vllm-continuum.git vllm-continuum
+cd /root/work/vllm-continuum
+git remote add upstream https://github.com/Whrlicht/vllm-continuum.git
+git fetch upstream feat/arena-content-addr-stage6
+git checkout -b ascend-cann-migration upstream/feat/arena-content-addr-stage6
+git push -u origin ascend-cann-migration
+
+5. vllm-continuum普通
+VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
+版本：vllm-0.1.dev88+g390b27ae9.empty
+服务端：
+cd /root/work/vllm-continuum
+python -m vllm.entrypoints.cli.main serve /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --trust-remote-code
+客户端：
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"temperature":0}'
+
+6. vllm-continuum C1,C2
+开启--licht-v2
+服务端：
+cd /root/work/vllm-continuum
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LICHT_ROUND_KV_FUSED=0
+export LICHT_ROUND_KV_PIPELINE=0
+export LICHT_ROUND_KV_PINNED=0
+export LICHT_ARENA_CONSUMER_DIRECT=0
+export LICHT_DYN_CHUNK=F
+export LICHT_SCHED_SCHEME=longcap
+export LICHT_LONG_C=5120
+export LICHT_LONG_RESV=1
+export LICHT_LONG_THETA=0.8
+export LICHT_SHORT_RESERVE=0.2
+python -m vllm.entrypoints.cli.main serve /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+--host 0.0.0.0 \
+--port 8000 \
+--tensor-parallel-size 1 \
+--max-model-len 4096 \
+--max-num-batched-tokens 2048 \
+--licht-v2
+客户端：
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"temperature":0}'
+
+7. vllm-continuum C1,C2,C3
+开启--licht-v3
+服务端：
+cd /root/work/vllm-continuum
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LICHT_ROUND_KV_FUSED=0
+export LICHT_ROUND_KV_PIPELINE=0
+export LICHT_ROUND_KV_PINNED=0
+export LICHT_ARENA_CONSUMER_DIRECT=0
+export LICHT_ROUND_KV_ARENA=0
+export LICHT_ROUND_KV_RAW=1
+export LICHT_DYN_CHUNK=F
+export LICHT_SCHED_SCHEME=longcap
+export LICHT_LONG_C=5120
+export LICHT_LONG_RESV=1
+export LICHT_LONG_THETA=0.8
+export LICHT_SHORT_RESERVE=0.2
+python -m vllm.entrypoints.cli.main serve /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 2048 \
+    --licht-v3
+客户端：
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct",
+      "messages": [{"role": "user", "content": "round 0 hello"}],
+      "max_tokens": 32,
+      "temperature": 0,
+      "vllm_xargs": {
+        "job_id": "multi-round-1",
+        "is_last_step": false,
+        "trace_replay_assistant_round": 0
+      }
+    }'
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct",
+      "messages": [{"role": "user", "content": "round 1 continue"}],
+      "max_tokens": 32,
+      "temperature": 0,
+      "vllm_xargs": {
+        "job_id": "multi-round-1",
+        "is_last_step": true,
+        "trace_replay_assistant_round": 1
+      }
+    }'
+
+8. --prefill-opt适配
+当前分支暂不支持动态chunk
+
+9. P/D分离时，NCCL适配 ==> HCCL
+统一p2p connector入口，根据环境决策，gpu用nccl engine，npu用hccl engine
+cd /root/work/vllm-continuum
+python -m py_compile \
+    vllm/distributed/kv_transfer/kv_connector/factory.py \
+    vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_connector.py \
+    vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_engine_selector.py \
+    vllm/distributed/kv_transfer/kv_connector/v1/p2p/hccl_wrapper.py \
+    vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_hccl_engine.py \
+    vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+bash -n examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/run_disagg_p2p_nccl_xpyd_prod.sh
+VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
+cd /root/work/vllm-continuum/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+服务端：
+export LICHT_PROBE=1 （optional）
+export LICHT_KV_CHECK=1 （optional）
+bash run_disagg_p2p_nccl_xpyd_prod.sh \
+    --model-path /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --prefill-gpus 0 \
+    --decode-gpus 1 \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 2048 \
+    --licht-v3 \
+    --trace-replay-path /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --wait-timeout 180 \
+    --fail-on-wait-timeout
+客户端：
+curl -sS http://127.0.0.1:10234/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"temperature":0}'
+LONG_TEXT=$(printf 'Please summarize this sentence and keep the answer short. %.0s' {1..80})
+curl -sS http://127.0.0.1:10234/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"/root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG_TEXT\"}],\"max_tokens\":32,\"temperature\":0}"
+cd /root/work/vllm-continuum/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+python ascend_tests/long_text_request.py
+
+10. PD分离多轮测试
+cd /root/work/vllm-continuum
+VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
+cd /root/work/vllm-continuum/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+服务端：
+export LICHT_V3_USE_SHADOW_SCHED=1
+bash run_disagg_p2p_nccl_xpyd_prod.sh \
+    --model-path /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --prefill-gpus 0 \
+    --decode-gpus 1 \
+    --max-model-len 10000 \
+    --max-num-batched-tokens 10000 \
+    --licht-v3 \
+    --round-kv-lru \
+    --arena-content-addr \
+    --tool-predictor-dir /root/work/vllm-continuum/tool_call_time/runs/run_2902_v2 \
+    --trace-replay-path /root/work/vllm-continuum/trace_data/mixed \
+    --wait-timeout 180 \
+    --fail-on-wait-timeout 2>&1 | tee launcher_c3.log
+客户端：
+cd /root/work/vllm-continuum
+python continuum_exp/multiturn_trace_client.py \
+    --base-url http://127.0.0.1:10234/v1 \
+    --model-name /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --trace-path /root/work/vllm-continuum/trace_data/mixed \
+    --output-dir /tmp/c3_mixed \
+    --dispatch-mode fixed \
+    --concurrency 4 \
+    --max-trajectories 20 \
+    --max-rounds-per-trajectory 3 \
+    --max-tokens-per-round 0 \
+    --trace-replay \
+    --output-mode concise
+
+11. 存储层次分级调度适配
+服务端：
+cd /root/work/vllm-continuum
+VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
+cd /root/work/vllm-continuum/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LICHT_V3_USE_SHADOW_SCHED=1
+export LICHT_ROUND_KV_ARENA_GB=0.5
+bash run_disagg_p2p_nccl_xpyd_prod.sh \
+    --model-path /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --prefill-gpus 0 \
+    --decode-gpus 1 \
+    --max-model-len 10000 \
+    --max-num-batched-tokens 10000 \
+    --licht-v3 \
+    --round-kv-lru \
+    --arena-content-addr \
+    --ssd-path /root/work/licht_ssd \
+    --ssd-gb 20 \
+    --ssd-stage-mb 512 \
+    --tool-predictor-dir /root/work/vllm-continuum/tool_call_time/runs/run_2902_v2 \
+    --trace-replay-path /root/work/vllm-continuum/trace_data/mixed \
+    --wait-timeout 180 \
+    --fail-on-wait-timeout 2>&1 | tee launcher_c3.log
+客户端：
+cd /root/work/vllm-continuum
+python continuum_exp/multiturn_trace_client.py \
+    --base-url http://127.0.0.1:10234/v1 \
+    --model-name /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --trace-path /root/work/vllm-continuum/trace_data/mixed \
+    --output-dir /tmp/c3_mixed_ssd \
+    --dispatch-mode fixed \
+    --concurrency 4 \
+    --max-trajectories 20 \
+    --max-rounds-per-trajectory 3 \
+    --max-tokens-per-round 0 \
+    --trace-replay \
+    --output-mode concise
+
+12. predictor适配
+环境问题和路径问题，已修复
+
+13. 1p3d （目前貌似是robin方式，没有做负载均衡）
+服务端：
+cd /root/work/vllm-continuum
+VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
+cd /root/work/vllm-continuum/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LICHT_V3_USE_SHADOW_SCHED=1
+export LICHT_ROUND_KV_ARENA_GB=0.5
+bash run_disagg_p2p_nccl_xpyd_prod.sh \
+    --model-path /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --prefill-gpus 0 \
+    --decode-gpus 1,2,3 \
+    --max-model-len 10000 \
+    --max-num-batched-tokens 10000 \
+    --licht-v3 \
+    --round-kv-lru \
+    --arena-content-addr \
+    --ssd-path /root/work/licht_ssd \
+    --ssd-gb 20 \
+    --ssd-stage-mb 512 \
+    --tool-predictor-dir /root/work/vllm-continuum/tool_call_time/runs/run_2902_v2 \
+    --trace-replay-path /root/work/vllm-continuum/trace_data/mixed \
+    --wait-timeout 180 \
+    --fail-on-wait-timeout 2>&1 | tee launcher_c3.log
+客户端：
+cd /root/work/vllm-continuum
+python continuum_exp/multiturn_trace_client.py \
+    --base-url http://127.0.0.1:10234/v1 \
+    --model-name /root/work/huggingface/models--meta-llama--Llama-3.1-8B-Instruct \
+    --trace-path /root/work/vllm-continuum/trace_data/mixed \
+    --output-dir /tmp/c3_mixed_ssd \
+    --dispatch-mode fixed \
+    --concurrency 4 \
+    --max-trajectories 20 \
+    --max-rounds-per-trajectory 3 \
+    --max-tokens-per-round 0 \
+    --trace-replay \
+    --output-mode concise
+
+14. 代码梳理
+第一层：入口和路由
+
+先读这个：
+
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
+    run_disagg_p2p_nccl_xpyd_prod.sh
+    disagg_proxy_p2p_nccl_xpyd_prod.py
+
+看清楚：
+
+启动了几个 P、几个 D
+每个 worker 的 HTTP/KV 端口怎么分配
+proxy 怎么选 P/D
+kv_transfer_params 怎么塞进请求
+
+核心问题：一个请求为什么先到 P，再到 D。
+
+第二层：P/D KV 迁移
+
+然后读：
+
+vllm/distributed/kv_transfer/kv_connector/v1/p2p/
+    p2p_connector.py
+    p2p_nccl_connector.py
+    p2p_engine_selector.py
+    p2p_hccl_engine.py
+    hccl_wrapper.py
+
+重点顺序：
+
+p2p_connector.py
+    -> 选择 NCCL 还是 HCCL
+
+p2p_nccl_connector.py
+    -> vLLM 调度器和 KV connector 的主逻辑
+
+p2p_hccl_engine.py
+    -> Ascend 上真正做 HCCL 迁移
+
+核心问题：D 怎么向 P 拉 KV，P 怎么把 block 发给 D。
+
+第三层：C3 round-kv
+
+再读：
+
+vllm/v1/core/sched/licht_v3/
+    round_kv_store.py
+    arena_lru_store.py
+    ssd_tier.py
+    ssd_writer_process.py
+    ssd_stage_ring.py
+
+顺序：
+
+round_kv_store.py
+    -> D 结束后怎么 store，P 下一轮怎么 load
+
+arena_lru_store.py
+    -> CPU arena 怎么管理、去重、LRU、驱逐
+
+ssd_tier.py
+    -> CPU arena 怎么降到 SSD，SSD 怎么 promote 回来
+
+ssd_writer_process.py
+    -> 独立写进程怎么 drain ring
+
+ssd_stage_ring.py
+    -> worker 到 writer 的共享内存队列
+
+核心问题：
+D NPU -> CPU arena -> SSD -> CPU arena -> P NPU 是怎么走的。
+
+第四层：预测式 staging
+
+最后读：
+
+vllm/v1/core/sched/licht_v3/
+    decode_manager.py
+    predictors.py
+    shadow_scheduler.py
+    step_event.py
+
+顺序：
+
+decode_manager.py
+    -> tool call 结束/回访预测入口
+
+predictors.py
+    -> tool 时间预测模型怎么加载
+
+shadow_scheduler.py
+    -> 预测回来后排队多久、什么时候该 staging
+
+step_event.py
+    -> P 侧调度状态怎么发布给 D 侧 shadow scheduler
+
+核心问题：C3 为什么不是“等请求回来再搬”，而是提前算 deadline。
+
+最小阅读路线
+
+如果你只想先读懂主链，按这个顺序：
+
+1. disagg_proxy_p2p_nccl_xpyd_prod.py
+2. run_disagg_p2p_nccl_xpyd_prod.sh
+3. p2p_nccl_connector.py
+4. p2p_hccl_engine.py
+5. round_kv_store.py
+6. arena_lru_store.py
+7. ssd_tier.py
+8. decode_manager.py
+9. shadow_scheduler.py
+
+读的时候只抓 5 个动作：
+
+route       请求分给哪个 P/D
+prefill     P 怎么产出 KV
+migrate     P KV 怎么给 D
+store       D KV 怎么沉到 CPU/SSD
+promote     下一轮怎么从 SSD/CPU 回到 P
