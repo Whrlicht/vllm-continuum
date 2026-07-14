@@ -206,6 +206,7 @@ python continuum_exp/multiturn_trace_client.py \
     --output-mode concise
 
 11. 存储层次分级调度适配
+python setup.py build_ext --inplace
 服务端：
 cd /root/work/vllm-continuum
 VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation --no-deps
