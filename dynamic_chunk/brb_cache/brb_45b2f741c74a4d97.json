@@ -1,0 +1,17 @@
+{
+  "beta_r_ms_per_tok": 0.0007311080529534096,
+  "b_ms_per_c_ctx": 3.2850621326314177e-06,
+  "brb": 222.55531963645802,
+  "F0_ms": 13.314166390840052,
+  "a_ms_per_tok": 0.06798579068443446,
+  "r2": 0.9927384585403278,
+  "n_steps": 27,
+  "fingerprint": "45b2f741c74a4d97",
+  "gpu": "NVIDIA A800-SXM4-80GB",
+  "n_gpu": 1,
+  "model": "/data/huggingface/models--meta-llama--Llama-3.1-8B-Instruct",
+  "dtype": "float16",
+  "max_model_len": 0,
+  "tp": 1,
+  "pp": 1
+}
