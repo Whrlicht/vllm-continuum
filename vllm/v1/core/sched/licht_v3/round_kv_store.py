@@ -83,7 +83,11 @@ class RoundKVStore:
         self.block_size = max(int(block_size), 1)
         self._kv_caches: dict = {}            # layer_name -> paged GPU tensor
         self._device = None
+        self._device_type = None
         self._is_cuda = False
+        self._is_npu = False
+        self._warned_event_fallback = False
+        self._warned_stream_fallback = False
         try:
             os.makedirs(self.storage_path, exist_ok=True)
         except OSError as e:  # pragma: no cover
@@ -270,6 +274,8 @@ class RoundKVStore:
         # kernel won't compile or the layout is unsupported.
         self._fused = (os.environ.get("LICHT_ROUND_KV_FUSED", "0") == "1")
         self._fused_fn = None          # compiled licht_scatter callable
+        self._fused_backend = ""
+        self._fused_uses_layers = False
         self._layer_ptrs = None        # int64 [nL] data_ptr() of each KV layer
         self._fused_layers = None      # keep refs alive
         self._fused_P = 0              # prod(rest)
@@ -447,22 +453,31 @@ class RoundKVStore:
                        is_producer: bool = True) -> None:
         self._kv_caches = kv_caches or {}
         self._is_producer = bool(is_producer)
+        device_type = None
         for v in self._kv_caches.values():
             layer = v[0] if isinstance(v, (list, tuple)) else v
             try:
                 self._device = layer.device
-                self._is_cuda = (layer.device.type == "cuda")
+                device_type = layer.device.type
+                self._device_type = device_type
+                self._is_cuda = (device_type == "cuda")
+                self._is_npu = (device_type == "npu")
             except Exception:
                 pass
             break
-        if self._arena and self._is_cuda:
+        # CUDA uses pinned arena + direct kernels when available.  Ascend/NPU
+        # still needs the CPU arena/LRU/SSD metadata path, but cannot use
+        # cudaHostRegister or CUDA scatter kernels, so initialize without
+        # registration and let load/store fall back to staging copies.
+        if self._arena and device_type in ("cuda", "npu"):
             try:
                 # Prefill (producer) LOADS -> needs cudaHostRegister for fast H2D
                 # + the direct (no-staging) scatter kernel.  Decode (consumer)
                 # 原本只 memcpy 写 shm 故跳过 register; 但 consumer 现在也做复用
                 # LOAD, 不 register 就走逐请求 staging(整段前缀搬 GPU)→ 长前缀 OOM.
                 # 故 _consumer_direct 默认让 consumer 也 register → 直读无 staging.
-                register = bool(is_producer) or self._consumer_direct
+                register = self._is_cuda and (
+                    bool(is_producer) or self._consumer_direct)
                 self._arena_init(register=register)
             except Exception as e:  # pragma: no cover
                 logger.warning("round-kv ARENA init failed (%s); "
@@ -470,6 +485,107 @@ class RoundKVStore:
                 self._arena_mapped = False
                 self._arena_registered = False
         self._maybe_start_hbm_probe()
+
+    def _synchronize_device(self) -> None:
+        """Fence device work issued by this thread when a caller needs visibility.
+
+        CUDA keeps the old current-stream behavior.  Ascend/torch-npu exposes a
+        torch.npu module; use it when present.  CPU-only test paths are no-ops.
+        """
+        try:
+            import torch
+            if self._is_cuda:
+                torch.cuda.current_stream().synchronize()
+            elif self._is_npu and hasattr(torch, "npu"):
+                torch.npu.synchronize()
+        except Exception:
+            pass
+
+    def _device_backend(self):
+        """Return torch's device module for stream/event operations.
+
+        CUDA and torch-npu expose very similar stream/event APIs, but not all
+        signatures are identical.  Keep the differences contained here so the
+        round-kv data path can use one code path for both backends.
+        """
+        try:
+            import torch
+            if self._is_cuda:
+                return torch.cuda
+            if self._is_npu and hasattr(torch, "npu"):
+                return torch.npu
+        except Exception:
+            return None
+        return None
+
+    def _set_device_for_backend(self) -> None:
+        backend = self._device_backend()
+        if backend is None:
+            return
+        try:
+            backend.set_device(self._device)
+        except Exception:
+            pass
+
+    def _new_device_stream(self):
+        backend = self._device_backend()
+        if backend is None or not hasattr(backend, "Stream"):
+            return None
+        try:
+            return backend.Stream()
+        except Exception:
+            return None
+
+    def _stream_context(self, stream):
+        backend = self._device_backend()
+        if stream is None or backend is None or not hasattr(backend, "stream"):
+            return _nullctx()
+        try:
+            return backend.stream(stream)
+        except Exception:
+            return _nullctx()
+
+    def _new_device_event(self, enable_timing: bool = False):
+        backend = self._device_backend()
+        if backend is None or not hasattr(backend, "Event"):
+            return None
+        try:
+            if enable_timing:
+                return backend.Event(enable_timing=True)
+            return backend.Event()
+        except TypeError:
+            try:
+                return backend.Event()
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _record_event(self, stream=None, enable_timing: bool = False):
+        ev = self._new_device_event(enable_timing=enable_timing)
+        if ev is None:
+            return None
+        try:
+            if stream is not None:
+                ev.record(stream)
+            else:
+                ev.record()
+            return ev
+        except Exception:
+            return None
+
+    def _current_stream_wait_event(self, ev) -> None:
+        if ev is None:
+            self._synchronize_device()
+            return
+        backend = self._device_backend()
+        if backend is None or not hasattr(backend, "current_stream"):
+            self._synchronize_device()
+            return
+        try:
+            backend.current_stream().wait_event(ev)
+        except Exception:
+            self._synchronize_device()
 
     # ------------------------------------------------------------------
     # Resident shared pinned ARENA
@@ -707,10 +823,11 @@ class RoundKVStore:
                 from vllm.v1.core.sched.licht_v3.arena_lru_store import (
                     _HAS_C_LOOKUP)
                 logger.info(
-                    "round-kv LRU arena bound (role=%s, registered=%s, "
+                    "round-kv LRU arena bound (role=%s, device=%s, registered=%s, "
                     "num_slots=%d, slot_bytes=%.2fMB, free=%d, direct_kernel=%s, "
                     "content_addr=%s, lookup=%s)",
                     "producer" if self._is_producer else "consumer",
+                    self._device,
                     self._arena_registered,
                     self._num_slots, self._slot_bytes / 1e6,
                     self._lru_store.free_count(),
@@ -749,6 +866,8 @@ class RoundKVStore:
                             "round-kv SSD tier init failed: %s -> disabled",
                             e)
                         self._ssd_tier = None
+                if self._fused:
+                    self._setup_fused()
                 return
             except Exception as e:
                 logger.warning(
@@ -766,7 +885,7 @@ class RoundKVStore:
         logger.info("round-kv ARENA mapped: %.1fGB, %d slots, slot=%.3fMB, "
                     "register=%s", self._arena_bytes / 1e9, self._num_slots,
                     self._slot_bytes / 1e6, register)
-        if self._fused and register:
+        if self._fused and (self._is_cuda or self._is_npu):
             self._setup_fused()
 
     # ==================================================================
@@ -857,17 +976,37 @@ class RoundKVStore:
             # 目标 paged 索引
             dst_t = torch.tensor(handle.dst_block_ids,
                                   dtype=torch.long, device=self._device)
-            # per-layer scatter
             layer_names = list(self._kv_caches.keys())
-            for li, ln in enumerate(layer_names):
-                kv = self._kv_caches[ln]
-                layer = kv[0] if isinstance(kv, (list, tuple)) else kv
-                srcl = src_gpu[:, li]            # [n, 2, *rest]
-                if self._arena_dim == 1:         # FA
-                    layer[:, dst_t, ...] = srcl.permute(
-                        1, 0, *range(2, srcl.dim()))
-                else:                            # MLA
-                    layer[dst_t, ...] = srcl
+            if self._fused_fn is not None:
+                try:
+                    if self._fused_uses_layers:
+                        self._fused_fn(src_gpu.contiguous(), dst_t,
+                                       self._fused_layers, len(handle.slot_ids),
+                                       self._arena_nL, self._arena_dim,
+                                       self._fused_NBLK, self._fused_P)
+                    else:
+                        self._fused_fn(src_gpu.contiguous(), dst_t,
+                                       self._layer_ptrs, len(handle.slot_ids),
+                                       self._arena_nL, self._arena_dim,
+                                       self._fused_NBLK, self._fused_P)
+                except Exception as e:
+                    logger.warning(
+                        "round-kv LRU fused scatter failed backend=%s "
+                        "job=%s blocks=%d: %s; falling back to per-layer "
+                        "scatter", self._fused_backend, str(job_id)[:32],
+                        len(handle.slot_ids), e)
+                    self._fused_fn = None
+            if self._fused_fn is None:
+                # per-layer scatter fallback
+                for li, ln in enumerate(layer_names):
+                    kv = self._kv_caches[ln]
+                    layer = kv[0] if isinstance(kv, (list, tuple)) else kv
+                    srcl = src_gpu[:, li]            # [n, 2, *rest]
+                    if self._arena_dim == 1:         # FA
+                        layer[:, dst_t, ...] = srcl.permute(
+                            1, 0, *range(2, srcl.dim()))
+                    else:                            # MLA
+                        layer[dst_t, ...] = srcl
             # post-load gen 校验 (金丝雀, 理论恒 True; 见 __init__ 注释).
             # 这条单请求 fallback 路径已 return False 让请求走 miss/重算 (安全),
             # 同时 error+计数 报警: 真失败 = pin/evict 不变量被破坏.
@@ -891,7 +1030,7 @@ class RoundKVStore:
         try:
             from vllm.v1.core.sched.licht_v3.fused_scatter import (
                 get_arena_scatter)
-            fn = get_arena_scatter()
+            fn = get_arena_scatter(self._device_type)
             if fn is None:
                 self._arena_direct_fn = None
                 return
@@ -924,14 +1063,16 @@ class RoundKVStore:
             try:
                 from vllm.v1.core.sched.licht_v3.fused_scatter import (
                     get_arena_scatter_layer)
-                self._arena_direct_layer_fn = get_arena_scatter_layer()
+                self._arena_direct_layer_fn = get_arena_scatter_layer(
+                    self._device_type)
             except Exception:
                 self._arena_direct_layer_fn = None
             # ★ store-direct: per-layer 直写 callable (GPU paged -> arena).
             try:
                 from vllm.v1.core.sched.licht_v3.fused_scatter import (
                     get_arena_gather_layer)
-                self._arena_gather_layer_fn = get_arena_gather_layer()
+                self._arena_gather_layer_fn = get_arena_gather_layer(
+                    self._device_type)
             except Exception:
                 self._arena_gather_layer_fn = None
             logger.info(
@@ -1013,19 +1154,35 @@ class RoundKVStore:
             return []
         if self._arena_direct_fn is not None:
             return self._load_batch_arena_lru_direct(items)
-        # fallback: 逐请求 (consumer 端 / kernel 不可用)
+        # fallback: 逐请求 (consumer 端 / kernel 不可用).  CUDA/NPU still use a
+        # dedicated copy stream when available so the forward stream waits on a
+        # single completion event instead of blocking the engine with an eager
+        # synchronize after each request.
+        lstream = (self._get_load_stream()
+                   if self._load_stream_scatter
+                   and (self._is_cuda or self._is_npu) else None)
+        sctx = self._stream_context(lstream)
         results = []
-        for item in items:
-            job_id, dst_block_ids, src_block_offset = item[0], item[1], item[2]
-            slot_gen = item[3] if len(item) > 3 else None
-            try:
-                ok = self._load_request_arena_lru(
-                    job_id, dst_block_ids, src_block_offset, slot_gen)
-            except Exception as e:  # pragma: no cover
-                logger.warning("round-kv LRU load_request error job=%s: %s",
-                               str(job_id)[:32], e)
-                ok = False
-            results.append(ok)
+        with sctx:
+            for item in items:
+                job_id = item[0]
+                dst_block_ids = item[1]
+                src_block_offset = item[2]
+                slot_gen = item[3] if len(item) > 3 else None
+                try:
+                    ok = self._load_request_arena_lru(
+                        job_id, dst_block_ids, src_block_offset, slot_gen)
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "round-kv LRU load_request error job=%s: %s",
+                        str(job_id)[:32], e)
+                    ok = False
+                results.append(ok)
+        if lstream is not None:
+            ev = self._record_event(lstream)
+            self._current_stream_wait_event(ev)
+        else:
+            self._synchronize_device()
         return results
 
     def _load_batch_arena_lru_direct(self, items: list) -> list:
@@ -1130,7 +1287,7 @@ class RoundKVStore:
         import torch
         try:
             from vllm.v1.core.sched.licht_v3.fused_scatter import get_scatter
-            fn = get_scatter()
+            fn = get_scatter(self._device_type)
             if fn is None:
                 self._fused = False
                 return
@@ -1150,14 +1307,21 @@ class RoundKVStore:
             self._fused_NBLK = int(
                 layers[0].shape[1 if self._arena_dim == 1 else 0])
             self._fused_P = int(P)
-            self._layer_ptrs = torch.tensor(
-                [int(l.data_ptr()) for l in layers], dtype=torch.int64,
-                device=self._device)
+            self._fused_backend = self._device_type
+            self._fused_uses_layers = self._is_npu
+            if self._fused_uses_layers:
+                self._layer_ptrs = None
+            else:
+                self._layer_ptrs = torch.tensor(
+                    [int(l.data_ptr()) for l in layers], dtype=torch.int64,
+                    device=self._device)
             self._fused_layers = layers          # keep alive
             self._fused_fn = fn
-            logger.info("round-kv FUSED scatter ON: nL=%d P=%d NBLK=%d dim=%d",
-                        len(layers), self._fused_P, self._fused_NBLK,
-                        self._arena_dim)
+            logger.info(
+                "round-kv FUSED scatter ON: backend=%s nL=%d P=%d NBLK=%d "
+                "dim=%d call=%s", self._fused_backend, len(layers),
+                self._fused_P, self._fused_NBLK, self._arena_dim,
+                "layer-list" if self._fused_uses_layers else "layer-ptrs")
         except Exception as e:  # pragma: no cover
             logger.warning("round-kv FUSED setup failed: %s; per-layer", e)
             self._fused = False
@@ -1411,11 +1575,12 @@ class RoundKVStore:
                       full_token_ids: list,
                       request_id: Optional[str] = None,
                       sink: bool = False) -> None:
-        """Queue an incremental store for `job_id`.  Captures a CUDA event
-        on the engine stream so the background gather waits for the
-        finishing forward's writes to be visible, then returns
-        immediately.  The request's blocks must stay retained (delay-free)
-        until `drain_done` reports `request_id` (= gather complete).
+        """Queue an incremental store for `job_id`.
+
+        Captures a backend event on the engine stream so the background gather
+        waits for the finishing forward's writes to be visible, then returns
+        immediately. The request's blocks must stay retained (delay-free) until
+        `drain_done` reports `request_id` (= gather complete).
 
         sink=True (ARENA_SINK 路径): GPU 块是这份 KV 的唯一来源, decode 端
         请求已被 park 等"整份齐"。此时写失败不再是"下轮重试"——必须在【写
@@ -1428,13 +1593,17 @@ class RoundKVStore:
             return
         self._ensure_pool()
         ev = None
-        if self._is_cuda:
-            try:
-                import torch
-                ev = torch.cuda.Event()
-                ev.record()       # capture engine (default) stream state
-            except Exception:
-                ev = None
+        if self._is_cuda or self._is_npu:
+            ev = self._record_event()  # capture engine/default stream state
+            if ev is None and self._is_npu:
+                # Some torch-npu builds do not expose a usable Event object.
+                # Fall back to a fence rather than letting bg gather race KV.
+                if not self._warned_event_fallback:
+                    logger.warning(
+                        "round-kv STORE backend=npu event unavailable; "
+                        "falling back to synchronize-before-enqueue")
+                    self._warned_event_fallback = True
+                self._synchronize_device()
         try:
             # block=True => high-water back-pressure (rare); never drops.
             # ★ 探针: 引擎线程在这 put 上被背压阻塞多久(假设的卡点)。只在
@@ -1460,13 +1629,18 @@ class RoundKVStore:
 
     def _store_loop(self, idx: int) -> None:
         stream = None
-        if self._is_cuda:
-            try:
-                import torch
-                torch.cuda.set_device(self._device)
-                stream = torch.cuda.Stream()
-            except Exception:
-                stream = None
+        if self._is_cuda or self._is_npu:
+            self._set_device_for_backend()
+            stream = self._new_device_stream()
+            if stream is not None:
+                logger.info(
+                    "round-kv STORE stream enabled backend=%s device=%s "
+                    "writer=%d", self._device_type, self._device, idx)
+            elif self._is_npu and not self._warned_stream_fallback:
+                logger.warning(
+                    "round-kv STORE backend=npu stream unavailable; "
+                    "falling back to synchronous background gather")
+                self._warned_stream_fallback = True
         while not self._stop.is_set():
             try:
                 task = self._queue.get(timeout=0.5)
@@ -1841,8 +2015,7 @@ class RoundKVStore:
         except Exception:
             return None
         tensors = {}
-        ctx = (torch.cuda.stream(stream)
-               if (stream is not None) else _nullctx())
+        ctx = self._stream_context(stream)
         if stream is not None and ev is not None:
             try:
                 stream.wait_event(ev)
@@ -2743,6 +2916,8 @@ class RoundKVStore:
         of the next chunk overlaps the H2D of the current one.  Waits the
         buffer's previous H2D event before overwriting it."""
         import torch
+        if not self._is_cuda:
+            return torch.empty(n, dtype=dtype)
         i = self._stage_idx
         self._stage_idx ^= 1
         self._stage_cur = i
@@ -2756,6 +2931,8 @@ class RoundKVStore:
         return buf[:n]
 
     def _stage_pin_record(self):
+        if not self._is_cuda:
+            return
         import torch
         try:
             ev = torch.cuda.Event()
@@ -2851,15 +3028,17 @@ class RoundKVStore:
         _t0 = time.time()
         futs = {pool.submit(self._read_for_load, j, d, o): k
                 for k, (j, d, o) in enumerate(items)}
-        lstream = (self._get_load_stream() if self._load_stream_scatter
-                   else None)
-        sctx = (torch.cuda.stream(lstream) if lstream is not None
-                else _nullctx())
+        lstream = (self._get_load_stream()
+                   if self._load_stream_scatter
+                   and (self._is_cuda or self._is_npu) else None)
+        sctx = self._stream_context(lstream)
         e0 = e1 = None
         with sctx:
-            if lstream is not None:
-                e0 = torch.cuda.Event(enable_timing=True)
-                e0.record(lstream)
+            if lstream is not None and self._is_cuda:
+                e0 = self._new_device_event(enable_timing=True)
+                e1 = self._new_device_event(enable_timing=True)
+                if e0 is not None:
+                    e0.record(lstream)
             for fut in as_completed(futs):
                 k = futs[fut]
                 try:
@@ -2873,15 +3052,15 @@ class RoundKVStore:
                     results[k] = self._scatter_request_batched(dst, per_layer)
                 except Exception:  # pragma: no cover
                     results[k] = False
-            if lstream is not None:
-                e1 = torch.cuda.Event(enable_timing=True)
+            if lstream is not None and e1 is not None:
                 e1.record(lstream)
         if lstream is not None:
-            ev = torch.cuda.Event()
-            ev.record(lstream)
-            torch.cuda.current_stream().wait_event(ev)
+            ev = self._record_event(lstream)
+            self._current_stream_wait_event(ev)
             if e0 is not None and e1 is not None:
                 self._pipe_ev = (e0, e1, gb)   # read next call (no sync)
+        elif self._is_npu:
+            self._synchronize_device()
         # engine_block_ms = wall time the ENGINE was stuck here.  Scatter is
         # enqueued async on the copy stream, so this ≈ the READ wait (the real,
         # undistorted engine stall — no sync added, unlike the profile path).
@@ -3003,29 +3182,31 @@ class RoundKVStore:
         nblk = sum(len(d) for (_, d, _) in items)
         gb = nblk * 2.097152 / 1e3
         _t0 = time.time()
-        lstream = (self._get_load_stream() if self._load_stream_scatter
-                   else None)
-        sctx = (torch.cuda.stream(lstream) if lstream is not None
-                else _nullctx())
+        lstream = (self._get_load_stream()
+                   if self._load_stream_scatter
+                   and (self._is_cuda or self._is_npu) else None)
+        sctx = self._stream_context(lstream)
         e0 = e1 = None
         with sctx:
-            if lstream is not None:
-                e0 = torch.cuda.Event(enable_timing=True)
-                e0.record(lstream)
+            if lstream is not None and self._is_cuda:
+                e0 = self._new_device_event(enable_timing=True)
+                e1 = self._new_device_event(enable_timing=True)
+                if e0 is not None:
+                    e0.record(lstream)
             for k, (j, d, o) in enumerate(items):
                 try:
                     results[k] = self._load_request_raw(j, d, o)
                 except Exception:  # pragma: no cover
                     results[k] = False
-            if lstream is not None:
-                e1 = torch.cuda.Event(enable_timing=True)
+            if lstream is not None and e1 is not None:
                 e1.record(lstream)
         if lstream is not None:
-            ev = torch.cuda.Event()
-            ev.record(lstream)
-            torch.cuda.current_stream().wait_event(ev)
+            ev = self._record_event(lstream)
+            self._current_stream_wait_event(ev)
             if e0 is not None and e1 is not None:
                 self._pipe_ev = (e0, e1, gb)
+        elif self._is_npu:
+            self._synchronize_device()
         logger.info(
             "round-kv LOAD raw: reqs=%d blocks=%d fail=%d GB=%.1f "
             "engine_block_ms=%.0f (mmap+H2D+scatter)",
@@ -3307,8 +3488,14 @@ class RoundKVStore:
                     es0.record(lstream)
                 if self._fused_fn is not None:
                     # ONE fused launch does all nL layers (vs nL index_puts).
-                    self._fused_fn(staging, all_idx, self._layer_ptrs, nb, nL,
-                                   dim, self._fused_NBLK, self._fused_P)
+                    if self._fused_uses_layers:
+                        self._fused_fn(staging, all_idx, self._fused_layers,
+                                       nb, nL, dim, self._fused_NBLK,
+                                       self._fused_P)
+                    else:
+                        self._fused_fn(staging, all_idx, self._layer_ptrs, nb,
+                                       nL, dim, self._fused_NBLK,
+                                       self._fused_P)
                 else:
                     for li, ln in enumerate(layer_names):
                         kv = self._kv_caches[ln]
@@ -3393,10 +3580,9 @@ class RoundKVStore:
     def _async_load_loop(self) -> None:
         stream = None
         try:
-            import torch
-            if self._is_cuda:
-                torch.cuda.set_device(self._device)
-                stream = torch.cuda.Stream()
+            if self._is_cuda or self._is_npu:
+                self._set_device_for_backend()
+                stream = self._new_device_stream()
         except Exception:  # pragma: no cover
             stream = None
         while not self._stop.is_set():
@@ -3414,37 +3600,35 @@ class RoundKVStore:
                 # Stage 2 LRU dispatch (在 _arena_registered 检查之前, 否则
                 # consumer 端会 fall through 到 FIFO _read_for_load).
                 if self._lru_store is not None:
-                    import torch
                     if stream is not None:
-                        with torch.cuda.stream(stream):
+                        with self._stream_context(stream):
                             self._load_request_arena_lru(
                                 job_id, dst, off, slot_gen)
                         stream.synchronize()
                     else:
                         self._load_request_arena_lru(
                             job_id, dst, off, slot_gen)
-                        torch.cuda.current_stream().synchronize()
+                        self._synchronize_device()
                 elif self._arena and self._arena_registered and self._is_cuda:
                     # ARENA: direct H2D from the resident pinned region.
-                    import torch
                     if stream is not None:
-                        with torch.cuda.stream(stream):
+                        with self._stream_context(stream):
                             self._load_request_arena(job_id, dst, off)
                         stream.synchronize()   # KV present before report-done
                     else:
                         self._load_request_arena(job_id, dst, off)
-                        torch.cuda.current_stream().synchronize()
+                        self._synchronize_device()
                 else:
                     res = self._read_for_load(job_id, dst, off)
                     if res is not None:
                         d2, per_layer = res
                         if stream is not None:
-                            import torch
-                            with torch.cuda.stream(stream):
+                            with self._stream_context(stream):
                                 self._scatter_request_batched(d2, per_layer)
                             stream.synchronize()  # KV present before done
                         else:
                             self._scatter_request_batched(d2, per_layer)
+                            self._synchronize_device()
                 # One concise line per async load (low frequency).
                 logger.info(
                     "round-kv ASYNC-LOAD: blocks=%d ~%.1fGB ms=%.0f "
@@ -3479,16 +3663,17 @@ class RoundKVStore:
         if self._lru_store is not None:
             ok = self._load_request_arena_lru(
                 job_id, dst_block_ids, src_block_offset)
-            if self._is_cuda:
-                import torch
-                torch.cuda.current_stream().synchronize()
+            self._synchronize_device()
             return ok
         if self._arena and self._arena_registered and self._is_cuda:
             ok = self._load_request_arena(job_id, dst_block_ids,
                                           src_block_offset)
-            if self._is_cuda:
-                import torch
-                torch.cuda.current_stream().synchronize()
+            self._synchronize_device()
+            return ok
+        if self._raw and (self._is_cuda or self._is_npu):
+            ok = self._load_request_raw(job_id, dst_block_ids,
+                                        src_block_offset)
+            self._synchronize_device()
             return ok
         res = self._read_for_load(job_id, dst_block_ids, src_block_offset)
         if res is None:
@@ -3527,7 +3712,7 @@ class RoundKVStore:
             # ARENA: direct H2D from the resident pinned region (no file read,
             # no mmap->pinned copy, no per-load alloc).
             return self._load_batch_arena(items)
-        if self._raw and self._is_cuda:
+        if self._raw and (self._is_cuda or self._is_npu):
             # RAW contiguous .bin: mmap + bulk H2D + scatter (no strided read).
             return self._load_batch_raw(items)
         if self._pipelined and self._is_cuda:
@@ -3579,19 +3764,19 @@ class RoundKVStore:
         import torch
         self._acc_pin_ms = 0.0
         lstream = (self._get_load_stream()
-                   if (self._batched and self._is_cuda
-                       and self._load_stream_scatter) else None)
-        sctx = (torch.cuda.stream(lstream) if lstream is not None
-                else _nullctx())
+                   if (self._batched and self._load_stream_scatter
+                       and (self._is_cuda or self._is_npu)) else None)
+        sctx = self._stream_context(lstream)
         nblk_tot = sum(len(d) for (_, d, _) in items)
         big = nblk_tot > 1000   # diagnose only the slow (huge-prefix) loads
         gpu_ms = -1.0
         e0 = e1 = None
         with sctx:
-            if big and lstream is not None:
-                e0 = torch.cuda.Event(enable_timing=True)
-                e1 = torch.cuda.Event(enable_timing=True)
-                e0.record(lstream)
+            if big and lstream is not None and self._is_cuda:
+                e0 = self._new_device_event(enable_timing=True)
+                e1 = self._new_device_event(enable_timing=True)
+                if e0 is not None:
+                    e0.record(lstream)
             for res in reads:
                 if res is None:
                     results.append(False)
@@ -3605,15 +3790,16 @@ class RoundKVStore:
                         results.append(self._scatter_request(dst, per_layer))
                 except Exception:  # pragma: no cover
                     results.append(False)
-            if big and lstream is not None:
+            if big and lstream is not None and e1 is not None:
                 e1.record(lstream)
         if lstream is not None:
             # Make the forward (default/current stream) wait for the
             # copy-stream load before it reads the KV.  The load thus overlaps
             # the PREVIOUS forward instead of serialising behind it.
-            ev = torch.cuda.Event()
-            ev.record(lstream)
-            torch.cuda.current_stream().wait_event(ev)
+            ev = self._record_event(lstream)
+            self._current_stream_wait_event(ev)
+        elif self._is_npu:
+            self._synchronize_device()
         scatter_ms = (time.time() - _t1) * 1000.0
         if e1 is not None:
             # GPU-exec time of H2D+index on the copy stream (one sync; only on
@@ -3641,12 +3827,13 @@ class RoundKVStore:
     # ------------------------------------------------------------------
 
     def _get_load_stream(self):
-        if self._load_stream is None and self._is_cuda:
-            try:
-                import torch
-                self._load_stream = torch.cuda.Stream()
-            except Exception:
-                self._load_stream = None
+        if self._load_stream is None and (self._is_cuda or self._is_npu):
+            self._set_device_for_backend()
+            self._load_stream = self._new_device_stream()
+            if self._load_stream is not None:
+                logger.info(
+                    "round-kv LOAD stream enabled backend=%s device=%s",
+                    self._device_type, self._device)
         return self._load_stream
 
     def _plan_request(self, job_id: str, dst_block_ids: list,

@@ -93,6 +93,11 @@ KVConnectorFactory.register_connector(
     "P2pNcclConnector")
 
 KVConnectorFactory.register_connector(
+    "P2pConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_connector",
+    "P2pConnector")
+
+KVConnectorFactory.register_connector(
     "LMCacheConnectorV1",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
     "LMCacheConnectorV1")

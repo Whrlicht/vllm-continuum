@@ -1,154 +1,102 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused multi-layer block-scatter CUDA op for the round-kv arena load.
+"""Backend-aware fused scatter loaders for round-kv arena load/store.
 
-The arena load's scatter writes a chunk's blocks into the paged KV cache.  The
-naive path issues nL (=32) `index_put`s PER CHUNK; in the busy serving process
-those many small CPU-dispatched launches starve the GPU (it idles waiting for
-the next launch under GIL contention) -> ~1.5 GB/s despite the kernels being
-fast.  This op does the WHOLE chunk's nL layers in ONE launch (and releases the
-GIL during execution), cutting per-chunk dispatches nL->1.
-
-Compiled lazily via cpp_extension.load_inline (needs nvcc; the build env has
-it).  On any failure, returns None and the caller falls back to the Python
-per-layer scatter.
-
-Layout (matches round_kv_store block-major staging):
-  staging : [nb, nL, 2, *rest] contiguous (fp16/bf16, 2-byte)
-  idx     : [nb] int64  destination block ids
-  layer_ptrs : [nL] int64  each = a paged KV layer tensor's data_ptr()
-  FA  (dim==1, layer [2, NBLK, *rest]):  dst off = (kv*NBLK + blk)*P + r
-  MLA (dim==0, layer [NBLK, 2, *rest]):  dst off = (blk*2  + kv)*P + r
-  P = prod(rest); requires P % 8 == 0 (int4-vectorized) and 2-byte dtype.
+CUDA has an existing extension in csrc/ that includes a direct host-pinned
+arena path.  Ascend/NPU uses a separate extension name and intentionally does
+not claim CUDA's host-pointer direct path: the NPU fast path is
+CPU arena -> NPU staging -> Ascend C fused scatter into paged KV.
 """
 from __future__ import annotations
 
 import os
+import sys
+from typing import Any
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The kernel is an ahead-of-time CUDA extension (see csrc/fused_scatter.cu).
-# Build + install it once:
-#     cd vllm/v1/core/sched/licht_v3/csrc
-#     export CUDA_HOME=/usr/local/cuda-12.2   # real toolkit (nvcc is /bin-symlinked)
-#     pip install .
-_CSRC_DIR = os.path.join(os.path.dirname(__file__), "csrc")
+_CUDA_CSRC_DIR = os.path.join(os.path.dirname(__file__), "csrc")
+_NPU_CSRC_DIR = os.path.join(os.path.dirname(__file__), "csrc_npu")
 
-_fn = None
-_tried = False
+_cache: dict[tuple[str, str], Any | None] = {}
+_tried: set[tuple[str, str]] = set()
 
 
-def get_scatter():
-    """Return the prebuilt `licht_scatter` callable, or None if the extension
-    is not installed (caller then falls back to the Python per-layer scatter).
-    Looks up cached result after the first call."""
-    global _fn, _tried
-    if _tried:
-        return _fn
-    _tried = True
+def _normalize_backend(device_type: str | None) -> str:
+    if device_type in ("npu", "ascend"):
+        return "npu"
+    return "cuda"
+
+
+def _get_symbol(backend: str, symbol: str, *, direct: bool = False):
+    key = (backend, symbol)
+    if key in _tried:
+        return _cache.get(key)
+    _tried.add(key)
     try:
-        import licht_fused_scatter as _ext  # built from csrc/ via setup.py
-        _fn = _ext.licht_scatter
-        logger.info("round-kv FUSED scatter: using prebuilt "
-                    "licht_fused_scatter extension")
+        if backend == "npu":
+            if _NPU_CSRC_DIR not in sys.path:
+                sys.path.insert(0, _NPU_CSRC_DIR)
+            import licht_fused_scatter_npu as _ext
+            if direct:
+                logger.warning(
+                    "round-kv NPU direct arena symbol %s requested, but "
+                    "Ascend does not use CUDA host-pointer direct access; "
+                    "falling back to staged NPU scatter.", symbol)
+                _cache[key] = None
+                return None
+        else:
+            if _CUDA_CSRC_DIR not in sys.path:
+                sys.path.insert(0, _CUDA_CSRC_DIR)
+            import licht_fused_scatter as _ext
+        fn = getattr(_ext, symbol)
+        _cache[key] = fn
+        logger.info("round-kv %s fused scatter: using %s.%s",
+                    backend.upper(), _ext.__name__, symbol)
+        return fn
     except Exception as e:
-        logger.warning(
-            "round-kv FUSED scatter: extension not available (%s). Build it: "
-            "cd %s && export CUDA_HOME=/usr/local/cuda-12.2 && pip install . "
-            "-- falling back to per-layer index_put.", e, _CSRC_DIR)
-        _fn = None
-    return _fn
+        if backend == "npu":
+            logger.warning(
+                "round-kv NPU fused scatter symbol %s unavailable (%s). "
+                "Build it in the Ascend environment: cd %s && python "
+                "setup.py build_ext --inplace. Falling back to Python "
+                "per-layer scatter.", symbol, e, _NPU_CSRC_DIR)
+        else:
+            logger.warning(
+                "round-kv CUDA fused scatter symbol %s unavailable (%s). "
+                "Build it: cd %s && export CUDA_HOME=/usr/local/cuda-12.2 "
+                "&& pip install . Falling back to Python per-layer scatter.",
+                symbol, e, _CUDA_CSRC_DIR)
+        _cache[key] = None
+        return None
 
 
-_fn_arena = None
-_tried_arena = False
+def get_scatter(device_type: str | None = None):
+    """Return staged fused scatter for the requested backend, or None."""
+    backend = _normalize_backend(device_type)
+    return _get_symbol(backend, "licht_scatter")
 
 
-def get_arena_scatter():
-    """Return the prebuilt `licht_scatter_from_arena` callable, or None if the
-    extension is not installed / too old (caller then falls back to the
-    staging-based or per-layer path).
+def get_arena_scatter(device_type: str | None = None):
+    """Return CUDA direct host-pinned arena scatter, or None.
 
-    This is the DIRECT load path: source is the cudaHostRegister'd shared
-    arena (host pinned), scattered straight into the paged buffer in one
-    launch — NO GPU staging buffer, NO extra HBM round-trip.
-    Signature: fn(arena_host_ptr, src_slots, dst_idx, layer_ptrs,
-                  nb, nL, dim, NBLK, P)
+    This direct symbol is CUDA-only.  NPU must use the staged NPU scatter after
+    host/CPU arena data is copied to NPU memory.
     """
-    global _fn_arena, _tried_arena
-    if _tried_arena:
-        return _fn_arena
-    _tried_arena = True
-    try:
-        import licht_fused_scatter as _ext
-        _fn_arena = _ext.licht_scatter_from_arena
-        logger.info("round-kv DIRECT arena scatter: using prebuilt "
-                    "licht_fused_scatter.licht_scatter_from_arena")
-    except (ImportError, AttributeError) as e:
-        # AttributeError: old .so without the new symbol -> needs rebuild.
-        logger.warning(
-            "round-kv DIRECT arena scatter unavailable (%s); rebuild csrc/ "
-            "to get licht_scatter_from_arena. Falling back.", e)
-        _fn_arena = None
-    return _fn_arena
+    backend = _normalize_backend(device_type)
+    return _get_symbol(backend, "licht_scatter_from_arena", direct=True)
 
 
-_fn_arena_layer = None
-_tried_arena_layer = False
+def get_arena_scatter_layer(device_type: str | None = None):
+    """Return CUDA per-layer direct arena scatter, or None."""
+    backend = _normalize_backend(device_type)
+    return _get_symbol(backend, "licht_scatter_from_arena_layer",
+                       direct=True)
 
 
-def get_arena_scatter_layer():
-    """Return the prebuilt `licht_scatter_from_arena_layer` callable, or None.
-
-    Per-layer 流水线版: 只 scatter 单层 (固定 layer_idx) -> 单层 paged ptr.
-    用于逐层加载与 forward 重叠. 旧 .so 没这符号 -> None, 调用方回退批量直读.
-    Signature: fn(arena_host_ptr, src_slots, dst_idx, layer_ptr,
-                  nb, nL, layer_idx, dim, NBLK, P)
-    """
-    global _fn_arena_layer, _tried_arena_layer
-    if _tried_arena_layer:
-        return _fn_arena_layer
-    _tried_arena_layer = True
-    try:
-        import licht_fused_scatter as _ext
-        _fn_arena_layer = _ext.licht_scatter_from_arena_layer
-        logger.info("round-kv PIPELINE per-layer arena scatter: using prebuilt "
-                    "licht_fused_scatter.licht_scatter_from_arena_layer")
-    except (ImportError, AttributeError) as e:
-        logger.warning(
-            "round-kv per-layer arena scatter unavailable (%s); rebuild csrc/. "
-            "Pipeline falls back to batched direct.", e)
-        _fn_arena_layer = None
-    return _fn_arena_layer
-
-
-_fn_gather_layer = None
-_tried_gather_layer = False
-
-
-def get_arena_gather_layer():
-    """Return the prebuilt `licht_gather_to_arena_layer` callable, or None.
-
-    Per-layer 直写 (store): 单层 paged 块 -> arena host pinned slot. GPU kernel
-    经 PCIe 直写, 省掉 D2H gather + CPU memcpy. 旧 .so 没此符号 -> None, 调用方
-    回退旧 gather+memcpy 存路径.
-    Signature: fn(arena_host_ptr, dst_slots, src_idx, layer_ptr,
-                  nb, nL, layer_idx, dim, NBLK, P)
-    """
-    global _fn_gather_layer, _tried_gather_layer
-    if _tried_gather_layer:
-        return _fn_gather_layer
-    _tried_gather_layer = True
-    try:
-        import licht_fused_scatter as _ext
-        _fn_gather_layer = _ext.licht_gather_to_arena_layer
-        logger.info("round-kv STORE-DIRECT per-layer arena write: using prebuilt "
-                    "licht_fused_scatter.licht_gather_to_arena_layer")
-    except (ImportError, AttributeError) as e:
-        logger.warning(
-            "round-kv per-layer arena write unavailable (%s); rebuild csrc/. "
-            "Store falls back to gather+memcpy.", e)
-        _fn_gather_layer = None
-    return _fn_gather_layer
+def get_arena_gather_layer(device_type: str | None = None):
+    """Return CUDA per-layer direct paged-KV -> arena writer, or None."""
+    backend = _normalize_backend(device_type)
+    return _get_symbol(backend, "licht_gather_to_arena_layer", direct=True)

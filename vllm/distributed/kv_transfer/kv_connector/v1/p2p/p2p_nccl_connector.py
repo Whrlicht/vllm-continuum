@@ -13,8 +13,8 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
-from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
-    P2pNcclEngine)
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_engine_selector import (  # noqa: E501
+    create_p2p_engine)
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
@@ -46,12 +46,20 @@ class ReqMeta:
     # Optional explicit remote endpoints.
     remote_prefill_address: Optional[str] = None
     remote_decode_address: Optional[str] = None
+    # Direct block migration only: number of valid externally-computed tokens
+    # in block_ids. A partial trailing block may contain speculative/prefill
+    # output KV that decode must not attend to.
+    valid_external_tokens: int = 0
+    # Scheduler/logical cache block size. HCCL may need this to map logical
+    # blocks onto Ascend's physical KV cache block layout.
+    block_size: int = 0
 
     @staticmethod
     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
                   block_size: int,
                   remote_prefill_address: Optional[str] = None,
-                  remote_decode_address: Optional[str] = None) -> "ReqMeta":
+                  remote_decode_address: Optional[str] = None,
+                  valid_external_tokens: int = 0) -> "ReqMeta":
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
@@ -59,6 +67,8 @@ class ReqMeta:
             num_tokens=len(token_ids),
             remote_prefill_address=remote_prefill_address,
             remote_decode_address=remote_decode_address,
+            valid_external_tokens=valid_external_tokens,
+            block_size=block_size,
         )
 
 
@@ -167,6 +177,7 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         block_size: int,
         remote_prefill_address: Optional[str] = None,
         remote_decode_address: Optional[str] = None,
+        valid_external_tokens: int = 0,
     ) -> None:
         self.requests.append(
             ReqMeta.make_meta(
@@ -176,6 +187,7 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
                 block_size,
                 remote_prefill_address,
                 remote_decode_address,
+                valid_external_tokens,
             ))
 
 
@@ -362,7 +374,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # which breaks LICHTV3's decode→prefill RPC.  Honouring kv_ip
         # keeps both directions on the same address.
         _bind_host = getattr(self.config, "kv_ip", None) or ""
-        self.p2p_nccl_engine = P2pNcclEngine(
+        self.p2p_nccl_engine = create_p2p_engine(
             local_rank=self._local_rank,
             config=self.config,
             hostname=_bind_host,
@@ -477,6 +489,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     req.request_id,
                     [int(x) for x in req.block_ids.tolist()],
                 ) for req in metadata.requests)
+                if _LICHT_PROBE and metadata.requests:
+                    logger.info(
+                        "P2P producer pending_bridge nreq=%d reqs=%s",
+                        len(metadata.requests),
+                        [(req.request_id, len(req.block_ids))
+                         for req in metadata.requests])
                 return
 
             # Phase 1 (save-on-preempt) SAVE side: scheduler preempted
@@ -650,12 +668,23 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     if context_block_ids is None:
                         continue
 
-                migrated = self.p2p_nccl_engine.launch_block_migration(
-                    req_meta.request_id,
-                    context_block_ids,
-                    decoding_block_ids,
-                    remote_address,
-                )
+                if (self.p2p_nccl_engine.__class__.__name__
+                        == "P2pHcclEngine"):
+                    migrated = self.p2p_nccl_engine.launch_block_migration(
+                        req_meta.request_id,
+                        context_block_ids,
+                        decoding_block_ids,
+                        remote_address,
+                        valid_external_tokens=req_meta.valid_external_tokens,
+                        logical_block_size=req_meta.block_size,
+                    )
+                else:
+                    migrated = self.p2p_nccl_engine.launch_block_migration(
+                        req_meta.request_id,
+                        context_block_ids,
+                        decoding_block_ids,
+                        remote_address,
+                    )
                 if migrated:
                     self._pending_failed_block_migrations.pop(
                         req_meta.request_id, None)
@@ -886,6 +915,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 for request_id, context_block_ids in self._pending_bridge_reqs:
                     self.p2p_nccl_engine.stage_bridge_request(
                         request_id, context_block_ids)
+                    if _LICHT_PROBE:
+                        logger.info(
+                            "P2P producer stage_bridge req=%s blocks=%d",
+                            request_id, len(context_block_ids))
                 self._pending_bridge_reqs.clear()
                 # Per-step phase breakdown (producer): idle | load | fwd |
                 # bridge.  load = time the engine was STUCK in start_load_kv
@@ -1571,7 +1604,15 @@ p2p_nccl_engine import get_fast_release_queue
             num_external_tokens = 0
 
         if self.direct_block_mode and num_external_tokens > 0:
-            return num_external_tokens, True
+            raw_external_tokens = num_external_tokens
+            if _LICHT_PROBE:
+                logger.info(
+                    "P2P direct external tokens req=%s prompt=%d "
+                    "computed=%d external=%d block_size=%d",
+                    request.request_id, len(request.prompt_token_ids),
+                    num_computed_tokens, raw_external_tokens,
+                    self._block_size)
+            return raw_external_tokens, True
 
         return num_external_tokens, False
 
@@ -1683,7 +1724,16 @@ p2p_nccl_engine import get_fast_release_queue
                 # (which will see 0 tokens on producer = recompute).
                 self._preempt_saved.pop(request.request_id, None)
             self._requests_need_load[request.request_id] = (
-                request, blocks.get_block_ids()[0])
+                request, blocks.get_block_ids()[0], num_external_tokens)
+            if _LICHT_PROBE:
+                kv_params = getattr(request, "kv_transfer_params", None)
+                remote = (kv_params.get("prefill_zmq_address")
+                          if isinstance(kv_params, dict) else None)
+                logger.info(
+                    "P2P direct need_load req=%s external_tokens=%d "
+                    "local_blocks=%d remote_prefill=%s",
+                    request.request_id, num_external_tokens,
+                    len(blocks.get_block_ids()[0]), remote)
             return
         # LICHT round-kv: producer/prefill reuse — record the EXACT prefix
         # blocks to fill before the forward.  The block list is
@@ -1857,8 +1907,13 @@ p2p_nccl_engine import get_fast_release_queue
             self._pending_finish_jobs.clear()
 
         if not self.is_producer and self.direct_block_mode:
-            for req_id, (request, local_block_ids) in \
+            for req_id, load_state in \
                     self._requests_need_load.items():
+                if len(load_state) == 3:
+                    request, local_block_ids, valid_external_tokens = load_state
+                else:
+                    request, local_block_ids = load_state
+                    valid_external_tokens = 0
                 remote_prefill_address: Optional[str] = None
                 remote_decode_address: Optional[str] = None
 
@@ -1884,7 +1939,16 @@ p2p_nccl_engine import get_fast_release_queue
                     block_size=self._block_size,
                     remote_prefill_address=remote_prefill_address,
                     remote_decode_address=remote_decode_address,
+                    valid_external_tokens=valid_external_tokens,
                 )
+                if _LICHT_PROBE:
+                    logger.info(
+                        "P2P direct meta req=%s prompt=%d local_blocks=%d "
+                        "valid_external=%d remote_prefill=%s "
+                        "remote_decode=%s",
+                        req_id, len(request.prompt_token_ids),
+                        len(local_block_ids), valid_external_tokens,
+                        remote_prefill_address, remote_decode_address)
             if _lk_n > 0:
                 logger.info(
                     "round-kv SCHED: lookups=%d lookup_ms=%.1f "
@@ -1908,6 +1972,11 @@ p2p_nccl_engine import get_fast_release_queue
                                  token_ids=new_req.prompt_token_ids,
                                  block_ids=new_req.block_ids[0],
                                  block_size=self._block_size)
+                if _LICHT_PROBE:
+                    logger.info(
+                        "P2P producer meta new req=%s prompt=%d blocks=%d",
+                        new_req.req_id, len(new_req.prompt_token_ids),
+                        len(new_req.block_ids[0]))
                 continue
             if new_req.req_id in self._requests_need_load:
                 meta.add_request(request_id=new_req.req_id,
@@ -1962,6 +2031,10 @@ p2p_nccl_engine import get_fast_release_queue
                                  token_ids=prompt_token_ids,
                                  block_ids=block_ids,
                                  block_size=self._block_size)
+                if _LICHT_PROBE:
+                    logger.info(
+                        "P2P producer meta cached req=%s prompt=%d blocks=%d",
+                        req_id, len(prompt_token_ids), len(block_ids))
                 self.chunked_prefill.pop(req_id, None)
                 continue
 
@@ -1978,7 +2051,12 @@ p2p_nccl_engine import get_fast_release_queue
                         num_computed_tokens)
                     continue
 
-                request, _ = self._requests_need_load.pop(req_id)
+                load_state = self._requests_need_load.pop(req_id)
+                if len(load_state) == 3:
+                    request, _, valid_external_tokens = load_state
+                else:
+                    request, _ = load_state
+                    valid_external_tokens = 0
                 total_tokens = num_computed_tokens + 1
                 token_ids = request.all_token_ids[:total_tokens]
 
@@ -1989,7 +2067,8 @@ p2p_nccl_engine import get_fast_release_queue
                 meta.add_request(request_id=req_id,
                                  token_ids=token_ids,
                                  block_ids=block_ids,
-                                 block_size=self._block_size)
+                                 block_size=self._block_size,
+                                 valid_external_tokens=valid_external_tokens)
 
         self._requests_need_load.clear()
         if _lk_n > 0:

@@ -43,12 +43,35 @@ logger = init_logger(__name__)
 # tool_call_time package import (resolves regardless of CWD)
 # ---------------------------------------------------------------------------
 
-_TOOL_CALL_TIME_PKG = "/data/whr/vllm-continuum/tool_call_time"
-
-
 def _ensure_tool_call_time_on_path() -> None:
-    if _TOOL_CALL_TIME_PKG not in sys.path:
-        sys.path.insert(0, _TOOL_CALL_TIME_PKG)
+    candidates: list[os.PathLike | str] = []
+    predictor_dir = os.environ.get("LICHT_V3_TOOL_PREDICTOR_DIR")
+    if predictor_dir:
+        p = os.path.abspath(predictor_dir)
+        candidates.append(p)
+        parent = p
+        while True:
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            candidates.append(next_parent)
+            parent = next_parent
+
+    here = os.path.abspath(__file__)
+    parent = here
+    while True:
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            break
+        candidates.append(next_parent)
+        parent = next_parent
+
+    for candidate in candidates:
+        root = os.fspath(candidate)
+        if os.path.isfile(os.path.join(root, "tool_call_time", "features.py")):
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            return
 
 
 # ---------------------------------------------------------------------------
