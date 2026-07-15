@@ -295,6 +295,13 @@ class LruArenaStore:
         #   数据拷给 SSD 暂存 (零 pin). 取代旧 demote-ahead+pin (提前 pin 冷块
         #   破坏 LRU -> hit 崩). None = 无 SSD, 回调是 no-op, 驱逐纯 LRU 不变.
         self._capture_fn: Optional[Callable[..., None]] = None
+        # ★ 2026-07-14 连续性 capture (Phase1a, LICHT_SSD_CONTIG_CAPTURE=1, 默认关):
+        #   开 = 被淘的这批 inc 【按 block 升序(边界优先)】拷进 SSD 环、撞满即停
+        #   (后面更高的段注定 orphan 就不拷); 关 = 原样 tail-first 逐 inc 拷.
+        #   目的: 让"被逼丢弃"落在无害的远尾, 而非边界(边界丢=整段 orphan, 实测
+        #   洞里 ①=28% 全是 frontier=0). 【不动驱逐顺序/淘谁】, 只改拷 SSD 的序.
+        self._contig_capture = (
+            os.environ.get("LICHT_SSD_CONTIG_CAPTURE", "0") == "1")
         # capture 计数取数回调 (round_kv_store 绑到 SsdTier.stats), ARENA-STAT
         # 周期日志用它显示"SSD 存了多少". None = 无 SSD, 该段显示 0.
         self._capture_stats_fn: Optional[Callable[[], dict]] = None
@@ -310,6 +317,23 @@ class LruArenaStore:
         self._stat_demote_drop = 0            # 队列满放弃
         self._stat_gate_skip = 0              # 闸门跳过 (脏, 等洗净)
         self._stat_gate_bypass = 0            # 紧急旁路 chunk 数
+        # ★ 2026-07-13 洞成因探针 (LICHT_SSD_HOLE_PROBE=1, 默认关): promote 侧
+        # resolve_range_hashed 从 CPU 边界往上走, 在第一个断点停下 = "洞"。记断点
+        # 成因分布, 判"改 frontier(治①) vs 扩盘/共享(治②③)"该走哪条。
+        #   ht_miss    = 表里根本没这块  -> ① 从没写进(capture 丢) / ⑥ 语义新
+        #   gen_mismatch = 槽被别的内容复用 -> ② 被 SSD-LRU 淘后重分配
+        #   refcnt0    = 块被释放         -> ②/③ 被淘 / 共享块被连累释放
+        # frontier = 停下前连续命中了几块 (0 = 洞就在边界, 整段 orphan)。
+        self._hole_probe_on = (
+            os.environ.get("LICHT_SSD_HOLE_PROBE", "0") == "1")
+        self._hole_probe = {"resolves": 0, "holes": 0, "frontier_sum": 0,
+                            "frontier0": 0, "ht_miss": 0, "gen_mismatch": 0,
+                            "refcnt0": 0,
+                            # ht_miss 再分: bloom 命中=① capture尝试过没写上;
+                            #              未命中=⑥ 从没 demote (新内容)
+                            "miss_demoted": 0, "miss_never": 0}
+        self._hole_bloom = None
+        self._hole_bloom_tried = False
 
     # ============================================================
     # Lifecycle
@@ -1417,18 +1441,74 @@ class LruArenaStore:
         if not self._content_addr or not hashes:
             return None
         recs: List[Tuple[int, int, int]] = []
+        _reason = None                       # 洞成因 (探针用)
+        _bh = None                           # 撞洞那块的 hash (查 bloom 用)
         for h in hashes:
             slot, egen = _atomic.ht_probe(self._ht_base, self._ht_cap, h)
             if slot < 0 or egen == 0:
+                _reason = "ht_miss"; _bh = h
                 break
             if _atomic.get_gen(self._hdr.slot_state_addr(slot)) != egen:
+                _reason = "gen_mismatch"; _bh = h
                 break
             if _atomic.refcnt_get(self._hdr.slot_refcnt_addr(slot)) == 0:
+                _reason = "refcnt0"; _bh = h
                 break
             recs.append((slot, egen, int(h)))
+        if self._hole_probe_on:
+            # _reason 为 None = 整段命中无洞; 否则在 len(recs) 处撞洞
+            self._hole_note(_reason, len(recs), _bh)
         if not recs:
             return None
         return start_block + len(recs), recs
+
+    def _hole_note(self, reason, frontier: int, bad_hash=None) -> None:
+        """洞成因探针累计 + 周期日志 (best-effort, 绝不抛).
+
+        ht_miss 再查 capture bloom: 命中=① (capture 尝试过但没写上盘, 连续性可救);
+        未命中=⑥ (从没 demote, 即新内容, SSD 本就没货, 非真洞)."""
+        try:
+            st = self._hole_probe
+            st["resolves"] += 1
+            if reason is not None:           # 撞洞了
+                st["holes"] += 1
+                st["frontier_sum"] += frontier
+                if frontier == 0:
+                    st["frontier0"] += 1
+                st[reason] = st.get(reason, 0) + 1
+                if reason == "ht_miss" and bad_hash is not None:
+                    if self._hole_bloom is None and not self._hole_bloom_tried:
+                        self._hole_bloom_tried = True
+                        try:
+                            from vllm.v1.core.sched.licht_v3.capture_bloom \
+                                import CaptureBloom
+                            self._hole_bloom = CaptureBloom.open_or_create(
+                                os.environ.get("LICHT_CAPTURE_BLOOM_PATH",
+                                               "/dev/shm/licht_capture_bloom"))
+                        except Exception:
+                            self._hole_bloom = None
+                    if self._hole_bloom is not None:
+                        if self._hole_bloom.test(bad_hash):
+                            st["miss_demoted"] += 1     # ①
+                        else:
+                            st["miss_never"] += 1       # ⑥
+            if st["resolves"] % 2000 == 0:
+                hn = max(st["holes"], 1)
+                _mm = max(st["miss_demoted"] + st["miss_never"], 1)
+                logger.info(
+                    "SSD-HOLE-PROBE[%s] resolves=%d holes=%d(%.0f%%) | 成因: "
+                    "ht_miss=%d gen_mismatch=%d(②被淘复用) refcnt0=%d(②③被淘/共享)"
+                    " | ht_miss细分: ①capture丢=%d(%.0f%%) ⑥新内容=%d(%.0f%%) | "
+                    "frontier avg=%.1f 洞在边界=%d(%.0f%%)",
+                    self._stat_tag, st["resolves"], st["holes"],
+                    100.0 * st["holes"] / st["resolves"],
+                    st["ht_miss"], st["gen_mismatch"], st["refcnt0"],
+                    st["miss_demoted"], 100.0 * st["miss_demoted"] / _mm,
+                    st["miss_never"], 100.0 * st["miss_never"] / _mm,
+                    st["frontier_sum"] / hn, st["frontier0"],
+                    100.0 * st["frontier0"] / hn)
+        except Exception:
+            pass
 
     def probe_slots(self, hashes: List[int]
                     ) -> Optional[List[Tuple[int, int]]]:
@@ -1719,6 +1799,37 @@ class LruArenaStore:
                     m = self._read_manifest(victim)
                     committed = int(m.get("total_blocks", 0)) if m else 0
                 evicted_keys: List[Tuple[int, int]] = []   # 已淘的 (s,e), 末尾从索引剔
+                # ★ 连续性 capture 预拷 (Phase1a): 开关开时, 先把这次要淘的 inc 按
+                #   block 【升序(边界优先)】拷进 SSD 环, 撞满即停 (更高段注定 orphan
+                #   不拷). 之后 tail-first 循环只 free 不拷. 关时 _contig_done=False,
+                #   走原 inline tail-first 拷 (行为字节不变). 拷在 _evict_lock 下,
+                #   块仍分配、数据稳定; 内容寻址不可变, 拷了没被 free 的段无害(下轮 dedup).
+                _contig_done = False
+                if (self._contig_capture and self._capture_fn is not None
+                        and victim not in self._finished_jobs):
+                    _cand = []
+                    _est = 0
+                    for (_s, _e, _rec) in reversed(inc_list):   # tail-first 定集合
+                        if self.is_inflight(victim):
+                            break
+                        if gained + _est >= need or _e > committed:
+                            continue
+                        if _rec is None:
+                            continue
+                        if clean_gate and victim not in self._finished_jobs:
+                            _ck = self._clean_key(victim, _s, _e, _rec)
+                            with self._clean_lock:
+                                if _ck not in self._clean_incs:
+                                    continue
+                        _cand.append((_s, _e, _rec))
+                        _est += len(_rec)
+                    for (_s, _e, _rec) in sorted(_cand, key=lambda x: x[0]):
+                        try:
+                            if self._capture_fn(victim, _s, _e, _rec) is False:
+                                break                       # 环满 -> 撞满即停
+                        except Exception:
+                            pass
+                    _contig_done = True
                 for (s, e, records) in reversed(inc_list):   # tail-first
                     # ★ 每 inc 复查 inflight (µs 级 exists): 兜 mark_inflight
                     #   claim 等待超时仍落 flag 的残余路 — flag 一出现立即停手,
@@ -1748,7 +1859,7 @@ class LruArenaStore:
                     # 把数据拷给 SSD 暂存 (零 pin, best-effort). 块此刻仍分配
                     # (持 _evict_lock + job claim), _cpu_mv 读稳定. 无 SSD /
                     # 失败时 no-op, 驱逐照常纯 LRU. finished job 不值得存.
-                    if (self._capture_fn is not None
+                    if (not _contig_done and self._capture_fn is not None
                             and victim not in self._finished_jobs):
                         try:
                             self._capture_fn(victim, s, e, records)

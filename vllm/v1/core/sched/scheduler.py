@@ -162,6 +162,17 @@ class Scheduler(SchedulerInterface):
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
 
         self.continuum_recorder = Continuum_Recorder()
+        # ★ 临时 hitprobe (LICHT_HITPROBE=1, 默认关): 诊断 vLLM prefix-hit 指标为何
+        #   低于真实复用(hit_length). gcb=get_computed_blocks 调用次数(=queries事件),
+        #   admit=真 admit 数; gcb>>admit => 重复计数. ext_none/zero/pos=arena 命中
+        #   分布; ext_zero 多 => arena 瞬时 miss 按只本地命中计低. uncount=撤销数.
+        self._hitprobe_on = os.environ.get("LICHT_HITPROBE") == "1"
+        self._hp = {"gcb": 0, "q_tok": 0, "h_local": 0, "h_ext": 0,
+                    "ext_none": 0, "ext_zero": 0, "ext_pos": 0,
+                    "uncount": 0, "admit": 0}
+        self._hp_step = 0
+        logger.info("HITPROBE enabled=%s (LICHT_HITPROBE=%s)",
+                    self._hitprobe_on, os.environ.get("LICHT_HITPROBE"))
         output_dir = _resolve_instance_output_dir(vllm_config)
         self.continuum_recorder.set_output_dir(output_dir)
         monitoring_recorder.set_output_dir(output_dir)
@@ -1204,20 +1215,37 @@ class Scheduler(SchedulerInterface):
             key=lambda r: (_evict_score(r), -r.arrival_time, r.request_id),
         )
 
-    def _uncount_prefix_stats(self, request: Request,
-                              local_tokens: int) -> None:
-        """★ 修指标假象: 撤销 get_computed_blocks 给一个【最终没 admit 的请求】加的
-        prefix_cache_stats 计数。get_computed_blocks 在 connector 决定 defer / 80% break
-        之【前】就计了数 (queries += prompt, hits += 本地命中, requests += 1); 但 defer/
-        break 的请求不进 running, 不该算进 prefix hit rate —— 否则改动3 下大量"等整份
-        sink"的 defer 请求每步被重复计入, 按"只命中本地"把命中率狂拉低 (假象, 非真重算)。
-        与 kv_cache_manager.get_computed_blocks 的计数严格对称相减。"""
+    def _neutralize_lookup_prefix_stats(self, request: Request,
+                                        local_tokens: int) -> None:
+        """★ prefix-hit 指标改到 admit 点计数 (2026-07-13)。上游把计数放在
+        get_computed_blocks (lookup 时) —— 上游 FCFS 里 lookup≈admit, 等价; 本
+        fork 的 backfill 准入每步扫 O(队列) 个候选且大多不 admit, lookup 计数把
+        没 admit 的候选反复算进命中率: 慢性 = 队头长请求每步重复计数 (打印值比
+        真实复用低 ~10 个点); 急性 = can_admit 失败关 lane 那步全队列扫描, 一步
+        灌 ~2M 低命中 queries 把 1000-request 窗口砸穿 (76%→66% 假暴跌)。旧方案
+        按 skip 路径逐条撤销 (_uncount), 注定漏; 现在 gcb 一返回就无条件原地中和,
+        真正的计数移到 admit 成功点 (_count_prefix_stats_at_admit)。与
+        kv_cache_manager.get_computed_blocks 的计数严格对称相减。"""
         if (self.kv_cache_manager.log_stats
                 and self.kv_cache_manager.prefix_cache_stats is not None):
             _pcs = self.kv_cache_manager.prefix_cache_stats
             _pcs.requests -= 1
             _pcs.queries -= request.num_tokens
             _pcs.hits -= local_tokens
+
+    def _count_prefix_stats_at_admit(self, request: Request,
+                                     num_computed_tokens: int) -> None:
+        """★ admit 点计数: 每次准入恰好计一次 —— queries = 完整 prompt (含
+        resume 时的已生成 tokens, 与上游口径一致), hits = admit 时刻真实免算的
+        tokens (本地 + arena/外部, 即 trace 里的 hit_length 同一口径)。
+        load_kv_async 请求首过转 WAITING_FOR_REMOTE_KVS 不计 (还没进 running);
+        回来 resume 那次 num_computed>0 不走 gcb, 在这里计, 无重复。"""
+        if (self.kv_cache_manager.log_stats
+                and self.kv_cache_manager.prefix_cache_stats is not None):
+            _pcs = self.kv_cache_manager.prefix_cache_stats
+            _pcs.requests += 1
+            _pcs.queries += request.num_tokens
+            _pcs.hits += num_computed_tokens
 
     def _pop_waiting_request(self, request: Request) -> None:
         # LICHT custom selection may not choose queue head, so remove by object.
@@ -2280,6 +2308,14 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
                             request)
+                    # ★ lookup 时的上游计数原地中和; admit 成功点再计
+                    # (见 _neutralize_lookup_prefix_stats docstring)。
+                    self._neutralize_lookup_prefix_stats(
+                        request, num_new_local_computed_tokens)
+                    if self._hitprobe_on:
+                        self._hp["gcb"] += 1
+                        self._hp["q_tok"] += request.num_tokens
+                        self._hp["h_local"] += num_new_local_computed_tokens
 
                     # ★ 改动2A: 80% 投影门 —— 对【所有】waiting 请求(含已 sink)。
                     # 加入它后 usage 会超 80% → break(★改动1:停止往下扫,没扫到的
@@ -2300,11 +2336,7 @@ class Scheduler(SchedulerInterface):
                             _thr = getattr(self.connector,
                                            "_phase2_gate_threshold", 0.80)
                             if _proj > _thr:
-                                # ★ 修指标假象: 这个请求不进 running, 撤销上面
-                                # get_computed_blocks 刚加的 prefix_cache_stats
-                                # (否则没 admit 的请求按"只命中本地"拉低命中率)。
-                                self._uncount_prefix_stats(
-                                    request, num_new_local_computed_tokens)
+                                # (lookup 计数已在 gcb 后统一中和, 无需撤销)
                                 break   # ★改动1: 停扫; 没扫到的循环外 sink
 
                     # NOTE (Hanchen) The logic here is that we will see if the connector can get the tokens.
@@ -2316,30 +2348,27 @@ class Scheduler(SchedulerInterface):
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens))
 
+                        if self._hitprobe_on:
+                            if num_external_computed_tokens is None:
+                                self._hp["ext_none"] += 1
+                            elif num_external_computed_tokens > 0:
+                                self._hp["ext_pos"] += 1
+                                self._hp["h_ext"] += num_external_computed_tokens
+                            else:
+                                self._hp["ext_zero"] += 1
+
                         # NOTE (Hanchen) this will not be called in cpu offloading.
                         if num_external_computed_tokens is None:
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            # ★ 修指标假象: defer 的请求不进 running, 撤销上面
-                            # get_computed_blocks 加的计数 (否则改动3 下 defer 等整份
-                            # sink 的请求每步被重复计入、按"只命中本地"狂拉低 prefix hit)。
-                            self._uncount_prefix_stats(
-                                request, num_new_local_computed_tokens)
+                            # (lookup 计数已在 gcb 后统一中和, 无需撤销)
                             self._pop_waiting_request(request)
                             skipped_waiting_requests.prepend_request(request)
                             continue
-                        # LICHT round-kv: count external (cross-round) KV hits
-                        # in the prefix-cache hit rate, so the metric reflects
-                        # reuse from the external store too, not only the local
-                        # cache.  external is disjoint from local (the connector
-                        # returns matched - local), so there is no double count.
-                        elif (num_external_computed_tokens
-                              and self.kv_cache_manager.log_stats
-                              and self.kv_cache_manager.prefix_cache_stats
-                              is not None):
-                            self.kv_cache_manager.prefix_cache_stats.hits += (
-                                num_external_computed_tokens)
+                        # LICHT round-kv external (cross-round) hits 不再在这里
+                        # 补记 —— admit 点计数的 num_computed_tokens 已含
+                        # local + external (见 _count_prefix_stats_at_admit)。
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
@@ -2645,6 +2674,9 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.running.append(request)
+                # ★ prefix-hit 指标 admit 点计数 (lookup 处已中和): 每次准入恰好
+                # 一次, hits = 本次 admit 真实免算的 tokens (本地 + 外部)。
+                self._count_prefix_stats_at_admit(request, num_computed_tokens)
                 if self.licht_prefill_sched_enabled:
                     # Stamp the admission time so the LICHT preempt
                     # selector can grant a min-run grace window before
@@ -2694,6 +2726,8 @@ class Scheduler(SchedulerInterface):
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
+                if self._hitprobe_on and request.status == RequestStatus.WAITING:
+                    self._hp["admit"] += 1
                 if request.status == RequestStatus.WAITING:
                     self.continuum_recorder.request_waiting_to_running(
                         request,
@@ -3055,6 +3089,21 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens_this_step=num_tokens_total)
             except Exception as e:
                 logger.debug("LICHTV3 StepEvent publish failed: %s", e)
+
+        if self._hitprobe_on:
+            self._hp_step += 1
+            if self._hp_step % 500 == 0:
+                h = self._hp
+                _q = max(h["q_tok"], 1)
+                logger.info(
+                    "HITPROBE gcb=%d admit=%d (gcb/admit=%.2f) | ext: none=%d "
+                    "zero=%d pos=%d | uncount=%d | tok: q=%d hLocal=%d hExt=%d "
+                    "-> 重建命中=%.1f%% (对照 vLLM 指标; ext_zero 高=arena瞬时miss, "
+                    "gcb>>admit=重复计数)",
+                    h["gcb"], h["admit"], h["gcb"] / max(h["admit"], 1),
+                    h["ext_none"], h["ext_zero"], h["ext_pos"], h["uncount"],
+                    h["q_tok"], h["h_local"], h["h_ext"],
+                    100.0 * (h["h_local"] + h["h_ext"]) / _q)
 
         return scheduler_output
 

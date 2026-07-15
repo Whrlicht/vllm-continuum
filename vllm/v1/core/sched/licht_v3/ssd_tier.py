@@ -125,6 +125,13 @@ class SsdTier:
         self._stat_capture_ok = 0        # 成功入环的 inc 数
         self._stat_capture_drop = 0      # 环满/超大丢弃的 block 数
         self._stat_capture_blocks = 0    # 成功 capture 的 block 数
+        # ★ 2026-07-13 capture bloom (仅 LICHT_SSD_HOLE_PROBE=1): 把【所有尝试
+        #   capture 的 hash】(含被环满丢的) 打进跨进程 shm bloom, 供 prefill 侧
+        #   resolve 撞洞时分 ①(尝试过没写上)vs ⑥(从没 demote=新内容). 懒开.
+        self._cap_bloom_on = (
+            os.environ.get("LICHT_SSD_HOLE_PROBE", "0") == "1")
+        self._cap_bloom = None
+        self._cap_bloom_tried = False
         # ★ capture 拷贝改用 libc.memmove: ctypes 调 C 时【释放 GIL】, 2MB/块
         #   拷贝不再和 decode 计算抢 GIL (实测: memoryview 拷贝把计算线程打到
         #   -67%, memmove 只 -4%, 2026-07-06). argtypes 必设, 否则 64 位地址被
@@ -352,20 +359,39 @@ class SsdTier:
                   self._cpu_mv[off:off + self._slot_bytes],
                   self.slot_offset(ssd_slot))
 
-    def capture_inc(self, job_id: str, s: int, e: int, records) -> None:
+    def capture_inc(self, job_id: str, s: int, e: int, records) -> bool:
         """★ 生产端 (decode): 驱逐释放块【前】把 inc 分块 memmove 进 SHM 环槽 +
         发布. best-effort 绝不抛. 环满即丢 (背压 = 纯 CPU 丢). 只做 memmove(放
         GIL) + 发布, 不碰盘/账本 -> 对 decode 计算冲击 ~-1% (实测).
 
         分块: 长 prompt 首轮 inc 可几千块, 切成 _stage_chunk 块一段逐段.
-        records: [(cpu_slot, gen, hash), ...]. 块此刻仍分配 (arena 持 _evict_lock)."""
+        records: [(cpu_slot, gen, hash), ...]. 块此刻仍分配 (arena 持 _evict_lock).
+
+        返回 True = 全段入环(或 no-op); False = 环满、本段(及之后)丢. 连续性
+        capture(升序拷)据此"撞满即停": 一旦 False, 更高的段注定 orphan 就不再拷."""
         if self._cpu_mv is None or self._closed or self._ring is None:
-            return
+            return True
         n = e - s
         if n <= 0 or len(records) != n:
             if n > 0:
                 self._stat_capture_drop += n
-            return
+            return True
+        # ★ 诊断 bloom: 记【所有尝试 capture 的 hash】(下面可能被环满丢, 但"尝试
+        #   过"就算 demote 意图 -> prefill 撞洞查 bloom 命中=①). 懒开, best-effort.
+        if self._cap_bloom_on:
+            if self._cap_bloom is None and not self._cap_bloom_tried:
+                self._cap_bloom_tried = True
+                try:
+                    from vllm.v1.core.sched.licht_v3.capture_bloom import (
+                        CaptureBloom)
+                    self._cap_bloom = CaptureBloom.open_or_create(
+                        os.environ.get("LICHT_CAPTURE_BLOOM_PATH",
+                                       "/dev/shm/licht_capture_bloom"))
+                except Exception:
+                    self._cap_bloom = None
+            if self._cap_bloom is not None:
+                for rec in records:
+                    self._cap_bloom.add(rec[2])
         sb = self._slot_bytes
         chunk = self._stage_chunk
         off = 0
@@ -374,7 +400,7 @@ class SsdTier:
             r = self._ring.reserve()        # 判满 + 拿槽; 满则丢该段及之后
             if r is None:
                 self._stat_capture_drop += (n - off)
-                return
+                return False                # 环满 -> 撞满即停信号
             h, idx = r
             try:
                 dst = self._ring.data_addr(idx)
@@ -393,6 +419,7 @@ class SsdTier:
                 self._stat_capture_drop += c
                 # 未 publish 的槽自然不占 head, 无需归还.
             off += c
+        return True                         # 全段入环
 
     def drain_ring(self, ring, max_items: int = 256) -> int:
         """★ 消费端 (独立写进程 / 测试): 从环取就绪槽 -> SSD 账本 write_inc

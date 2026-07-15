@@ -37,7 +37,7 @@ DECODE_GPU_MEMORY_UTILIZATION=0.95
 # DECODE_GPU_MEMORY_UTILIZATION to ~0.90.  Verify trace_replay outputs still
 # match after enabling (correctness check that the KV-connector hooks captured
 # cleanly).
-DECODE_CUDA_GRAPH=false
+DECODE_CUDA_GRAPH=true
 
 # DistServe-style direct block migration mode.
 # Decode actively pops bridge metadata and migrates blocks from prefill.
@@ -67,6 +67,14 @@ SSD_GB="200"                                    # 数据文件大小; --ssd-gb �
 # -> 94% 环满丢 (2026-07-07 复盘: 盘平均只写 81MB/s 远未到上限, 瓶颈是突发+小环).
 # 提到 5120MB(5GB): 3 decode 环峰值 ~15GB, 4 环兜底 ~20GB, 远小于 shm 空闲 ~100GB.
 SSD_STAGE_MB="5120"                             # 每环暂存 MB; --ssd-stage-mb 改
+# 洞成因探针 (2026-07-13): promote resolve 撞洞停下时记成因分布 (ht_miss=从没写/
+# gen_mismatch=被淘复用/refcnt0=被淘或共享释放) + frontier。判"改 frontier vs 扩盘/
+# 共享"该走哪条. 只读诊断, 周期打 SSD-HOLE-PROBE 日志. 测完置 false 关.
+SSD_HOLE_PROBE=true
+# 连续性 capture (Phase1a, 2026-07-14): 被淘的 inc 按 block 升序(边界优先)拷进 SSD
+# 环、撞满即停, 让丢弃落在无害远尾而非边界 (救实测 28% 的 ① 洞). 不动驱逐顺序.
+# A/B 用: true 开 / false 关(原 tail-first 逐 inc 拷). --ssd-contig-capture 开.
+SSD_CONTIG_CAPTURE=true
 # 收益闸门 (搬<算才 claim): 2026-07-05 用户决策默认【关】—— 慢盘上先保证
 # SSD 端到端复用跑通, 再谈经济学.  开门 (=1): --ssd-gate.
 SSD_GATE=false
@@ -74,7 +82,7 @@ SSD_GATE=false
 # prefix while computing layer i (vs the default: read+scatter all layers
 # before the forward, blocking).  Off by default; enable with
 # --round-kv-pipeline (or env LICHT_ROUND_KV_PIPELINE=1).
-ROUND_KV_PIPELINE=false
+ROUND_KV_PIPELINE=true
 # Diagnostic profiling of the round-kv load (contention probe + per-segment
 # pin_copy/h2d/index timing).  Adds cuda syncs => slower; use only to find
 # the bottleneck, then turn off.  Enable with --round-kv-profile.
@@ -129,7 +137,7 @@ ARENA_CONSUMER_DIRECT=true
 # P2 提带宽: mbind(MPOL_INTERLEAVE) 把 256GB arena 摊到所有 NUMA 节点, 缓解单节点
 # 内存控制器饱和 (大复用 load 读 + store 写争用). 默认关 (拓扑相关, 单 GPU DMA 可能
 # 跨 socket 反略降, 建议 A/B). --arena-numa-interleave 开.
-ARENA_NUMA_INTERLEAVE=false
+ARENA_NUMA_INTERLEAVE=true
 # Bind each worker to its GPU's local NUMA node (numactl) so pinned buffers
 # and H2D transfers are node-local (~2x H2D on multi-socket boxes).  Defaults
 # ON under --licht-v3; disable with --no-numa-bind, or force on standalone
@@ -172,9 +180,15 @@ LICHT_V3=false
 # vs fcfs: p50 47->3s (15x), p99/max higher (longs wait). Requires the LICHT-V2
 # timeline scheduler (auto-enabled below). Off = no change to scheduling.
 PREFILL_OPT=false
-PREFILL_FCFS=false           # --prefill-fcfs: LICHT-V3 + pure-FCFS priority + fixed
-                             # native chunk (no longcap, no dynamic_chunk). Diagnostic
-                             # baseline; mutually exclusive with --prefill-opt.
+PREFILL_FCFS=false           # --prefill-fcfs: LICHT-V3 + pure-FCFS priority + 默认
+                             # dynamic_chunk[C+kmax16] (no longcap); 叠加 --no-chunk
+                             # 则整段 prefill. Diagnostic baseline; 与 --prefill-opt 互斥.
+TEST_OLD=false               # --test: 与 --prefill-opt 叠加, 在当前代码上【近似复现】
+                             # 旧方案 390b27a(F chunk + footprint OFF), 对比前缀暴跌.
+NO_CHUNK=false               # --no-chunk: 关掉 chunked prefill (dynamic + 固定5242 都不要),
+                             # 把 long_prefill_token_threshold 顶满 max_model_len -> 整个
+                             # prompt 一次 prefill (不切). 可与 --prefill-opt 叠加(只关
+                             # chunk, 调度不变), 做 "chunk vs 不chunk" 的干净 A/B.
 PREFILL_OPT_THETA=0.3        # long-lane KV ceiling (head-of-line safe; sweep best)
 PREFILL_OPT_LONGC=5120       # short/long boundary C (sweep best for break stack)
 PREFILL_OPT_CLOW=2048        # dynamic_chunk mode F: smooth long/short band low (lambda=0 below)
@@ -262,6 +276,12 @@ Options:
                                (default: ${GET_RETRY_INTERVAL_S})
   --max-model-len N            0=auto (follow model max context), >0=override
   --max-num-batched-tokens N   0=auto, >0=override
+  --no-chunk                   关闭 chunked prefill (整 prompt 一次 prefill;
+                               long_prefill_token_threshold=max_model_len).
+                               可叠加 --prefill-opt(只关 chunk, 调度不变).
+  --test                       与 --prefill-opt 叠加: 近似复现旧方案 390b27a
+                               (F chunk + footprint OFF), 对比前缀暴跌.
+                               [近似] scheduler.py 有非 env 改动, 100%一致用 worktree.
   --licht                      Enable LICHT algorithm switch
                                (prefill dynamic priority + decode FCFS)
   --licht-v2                   Enable LICHT-V2 (prefill timeline scheduler)
@@ -351,6 +371,10 @@ while [[ $# -gt 0 ]]; do
     --ssd-stage-mb)
       SSD_STAGE_MB="$2"
       shift 2
+      ;;
+    --ssd-contig-capture)
+      SSD_CONTIG_CAPTURE=true
+      shift
       ;;
     --ssd-gate)
       SSD_GATE=true
@@ -464,6 +488,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prefill-fcfs)
       PREFILL_FCFS=true
+      shift
+      ;;
+    --no-chunk)
+      NO_CHUNK=true
+      shift
+      ;;
+    --test)
+      TEST_OLD=true
       shift
       ;;
     --prefill-opt-theta)
@@ -587,6 +619,12 @@ export LICHT_SINK_HEAL=1
 # 释放打一行 ARENA-FREE (slot/hash/victim_job/是否在途), 复现后拿 SHORT-WHY
 # 的 hash 反查释放现场. info 级, 高频, 定罪后关闭.
 export LICHT_ARENA_FREE_TRACE=1
+# ★ 临时 hitprobe: 诊断 vLLM prefix-hit 指标 vs 真实复用 (prefill+decode 都开).
+# 全局 export 保证两个引擎都拿到 (靠 shell 继承有时不稳). 关: HITPROBE=false.
+HITPROBE=true
+if [[ "${HITPROBE}" == "true" ]]; then
+  export LICHT_HITPROBE=1
+fi
 if [[ "${ROUND_KV_RAW}" != "true" ]]; then
   export LICHT_ROUND_KV_RAW=0
 fi
@@ -649,6 +687,12 @@ if [[ "${SSD_TIER}" == "true" ]]; then
     export LICHT_SSD_META_PATH="${SSD_META_PATH}"
     export LICHT_SSD_GB="${SSD_GB}"
     export LICHT_SSD_STAGE_MB="${SSD_STAGE_MB}"
+    if [[ "${SSD_CONTIG_CAPTURE}" == "true" ]]; then
+      export LICHT_SSD_CONTIG_CAPTURE=1
+    fi
+    if [[ "${SSD_HOLE_PROBE}" == "true" ]]; then
+      export LICHT_SSD_HOLE_PROBE=1
+    fi
     # 收益闸门 (默认关 = 无条件搬). --ssd-gate 打开恢复经济学.
     if [[ "${SSD_GATE}" == "true" ]]; then
       export LICHT_SSD_PROMOTE_GATE=1
@@ -660,6 +704,8 @@ if [[ "${SSD_TIER}" == "true" ]]; then
     #   环在 /dev/shm, sidecar glob 发现. 下面 proxy 之后起.
     export LICHT_SSD_RING_DIR="${SSD_RING_DIR:-/dev/shm}"
     rm -f "${LICHT_SSD_RING_DIR}"/licht_ssd_stage_*.ring 2>/dev/null || true
+    # 洞探针的 capture bloom: 每 run 清, 避免陈旧位把 ①(capture尝试过) 算多
+    rm -f /dev/shm/licht_capture_bloom 2>/dev/null || true
     SSD_WRITER_ON=true
     echo "  SSD tier: ON  path=${SSD_PATH} (${SSD_GB}GB) meta=${SSD_META_PATH} gate=${SSD_GATE} stage_ring=${SSD_STAGE_MB}MB/环 (写进程 sidecar, ring=${LICHT_SSD_RING_DIR})"
   fi
@@ -1006,6 +1052,24 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
   if (( MAX_NUM_BATCHED_TOKENS > 0 )); then
     PREFILL_EXTRA_ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
   fi
+  # --no-chunk: 把 long_prefill_token_threshold 顶满 max_model_len -> 整 prompt 一次
+  # prefill (源码约束: 该阈值不能超 max_model_len, 0 会被自动算成 0.04*maxlen=5242,
+  # 所以必须显式设成 =maxlen). 需 max_num_batched_tokens >= maxlen 才装得下单步.
+  if [[ "${NO_CHUNK}" == "true" ]]; then
+    if [[ -z "${NOCHUNK_LPTT:-}" ]]; then     # 只解析一次, 后续 prefill 复用
+      if (( MAX_MODEL_LEN > 0 )); then
+        NOCHUNK_LPTT="${MAX_MODEL_LEN}"
+      else
+        # MAX_MODEL_LEN=auto: 从模型 config 取真实上下文长度, 并钉死 --max-model-len
+        # 保证阈值 == maxlen (否则 auto 值若小于它会触发源码的 ">maxlen" 报错).
+        NOCHUNK_LPTT="$(python3 -c "import json;c=json.load(open('${MODEL_PATH}/config.json'));print(c.get('max_position_embeddings') or c.get('max_seq_len') or 131072)" 2>/dev/null || echo 131072)"
+      fi
+    fi
+    if (( MAX_MODEL_LEN <= 0 )); then
+      PREFILL_EXTRA_ARGS+=(--max-model-len "${NOCHUNK_LPTT}")
+    fi
+    PREFILL_EXTRA_ARGS+=(--long-prefill-token-threshold "${NOCHUNK_LPTT}")
+  fi
   if [[ "${LICHT}" == "true" ]]; then
     PREFILL_EXTRA_ARGS+=(--licht)
   fi
@@ -1077,34 +1141,79 @@ for i in "${!PREFILL_GPU_ARRAY[@]}"; do
     # 零驱逐由 footprint 投影记账 + LICHTV2 timeline 双保。代价是 p50 有 trade-off
     # (混合负载实测会涨), 但走"最大利用+零驱逐"的系统故事时接受。CAP=1.0=全松。
     export LICHT_LONG_THETA_RELAX=1
-    export LICHT_LONG_THETA_RELAX_CAP=1.0
-    export LICHT_DYN_PIN_CAP=0        # chunk cap 不钉死(避免肥尾; kmax 已稳定护尾)
-    export LICHT_LONGCAP_FOOTPRINT=1  # 投影 footprint θ帽(零驱逐记账; θ-relax 松它)
-    # dynamic chunk = mode C(激进细切, 最低 p50) + per-request k_max 护尾:
-    #   chunk = max(S*, ceil(C0/kmax)), C0=准入时总新增 prefill -> 单请求最多切
-    #   kmax 段。只卡【巨请求】的重读爆炸(护 tail), 中小请求 S*>C0/kmax 碰不到
-    #   地板 -> 照样细切(保 p50)。实测 C+kmax16 双优, p50/tail 压过 F 和 nochunk。
-    export LICHT_DYN_CHUNK=C
-    export LICHT_DYN_KMAX=16
-    [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
-    echo "  prefill[$i]: PREFILL_OPT on (shorts-first longcap_fcfs + theta=${PREFILL_OPT_THETA}"\
-         "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + footprint + dynamic_chunk[C+kmax16]"\
-         "+ short_reserve=${PREFILL_OPT_SHORT_RESERVE}; brb=${_brb_file:-default216})"
+    if [[ "${TEST_OLD}" == "true" ]]; then
+      # --test: 在当前代码上【复现旧方案 390b27a】(F chunk + footprint OFF),
+      # 用于对比"旧方案有没有前缀暴跌". 显式覆盖两版之间翻转的默认:
+      #   * LICHT_LONGCAP_FOOTPRINT 现代码默认="1"(on) -> 必须显式关成 0 (旧=off)
+      #   * DYN_PIN_CAP / RELAX_CAP 旧未设 -> unset 用代码默认(pin_cap=1, relax_cap=0.8)
+      # 注意: scheduler.py 在两 commit 间改了 ~199 行, 非 env 门控的逻辑无法还原,
+      #       所以这是【近似】旧方案; 要 100% 一致请用 worktree 跑 390b27a.
+      export LICHT_LONGCAP_FOOTPRINT=0
+      export LICHT_DYN_CHUNK=F
+      export LICHT_DYN_SHORT_SET=all
+      export LICHT_DYN_CLOW="${PREFILL_OPT_CLOW}"
+      export LICHT_DYN_CHIGH="${PREFILL_OPT_CHIGH}"
+      unset LICHT_DYN_KMAX LICHT_DYN_PIN_CAP LICHT_LONG_THETA_RELAX_CAP
+      [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
+      echo "  prefill[$i]: --test 旧方案复现[近似] (dynamic_chunk[F/all] band=${PREFILL_OPT_CLOW}-${PREFILL_OPT_CHIGH}"\
+           "+ footprint OFF + pin_cap默认; longcap_fcfs/theta/θ-relax 同 prefill-opt)"
+    else
+      export LICHT_LONG_THETA_RELAX_CAP=1.0
+      export LICHT_DYN_PIN_CAP=0    # chunk cap 不钉死(避免肥尾; kmax 已稳定护尾)
+      export LICHT_LONGCAP_FOOTPRINT=1  # 投影 footprint θ帽(零驱逐记账; θ-relax 松它)
+      # dynamic chunk = mode C(激进细切, 最低 p50) + per-request k_max 护尾:
+      #   chunk = max(S*, ceil(C0/kmax)), C0=准入时总新增 prefill -> 单请求最多切
+      #   kmax 段。只卡【巨请求】的重读爆炸(护 tail), 中小请求 S*>C0/kmax 碰不到
+      #   地板 -> 照样细切(保 p50)。实测 C+kmax16 双优, p50/tail 压过 F 和 nochunk。
+      if [[ "${NO_CHUNK}" == "true" ]]; then
+        # --no-chunk 叠加: 关掉 dynamic chunk (回落 _licht_v2_chunk_size), 阈值由
+        # PREFILL_EXTRA_ARGS 顶满 max_model_len -> 整 prompt 一次 prefill. 调度不变.
+        echo "  prefill[$i]: PREFILL_OPT on + --no-chunk (dynamic_chunk OFF, 整 prompt 一次 prefill;"\
+             "theta=${PREFILL_OPT_THETA} + C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + footprint)"
+      else
+        export LICHT_DYN_CHUNK=C
+        export LICHT_DYN_KMAX=16
+        [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
+        echo "  prefill[$i]: PREFILL_OPT on (shorts-first longcap_fcfs + theta=${PREFILL_OPT_THETA}"\
+             "+ C=${PREFILL_OPT_LONGC} + reservation + FCFS-break + footprint + dynamic_chunk[C+kmax16]"\
+             "+ short_reserve=${PREFILL_OPT_SHORT_RESERVE}; brb=${_brb_file:-default216})"
+      fi
+    fi
   elif [[ "${PREFILL_FCFS}" == "true" ]]; then
     # --prefill-fcfs: DIAGNOSTIC baseline. Keep LICHT-V3 (round-kv arena reuse)
-    # intact but strip every prefill-opt scheduling trick:
+    # intact but strip the longcap admission stack:
     #   * priority = pure FCFS by arrival (LICHT_SCHED_SCHEME=fcfs) INSTEAD of the
     #     round-based licht score -> rounds of one conversation are NOT reordered
     #     apart, so a returning round's prefix is less likely evicted before it runs.
-    #   * NO longcap (no theta / reserve / order / FCFS-break).
-    #   * NO dynamic_chunk -> fixed chunk = vLLM native long_prefill_token_threshold
-    #     (= int(0.04*max_model_len) = 5242 for 131072 ctx); LICHT_DYN_CHUNK unset.
+    #   * NO longcap (no theta / reserve / order / FCFS-break / HIT_PRED).
+    #   * chunk = 当前默认 dynamic_chunk (mode C + kmax16, 与 prefill-opt 相同),
+    #     使 fcfs 基线与 prefill-opt 的唯一差别就是准入调度本身. 叠加 --no-chunk
+    #     则关掉 dyn chunk, 阈值由 PREFILL_EXTRA_ARGS 顶满 max_model_len ->
+    #     整 prompt 一次 prefill (真 no-chunk, 不是 native 5242 固定 chunk).
     # Purpose: test whether the low prefix-cache hit rate is caused by scheduling
     # reorder (longcap/score separating a conversation's rounds in time) vs the
     # arena itself. If hit rate recovers -> scheduling; if still low -> arena.
     export LICHT_SCHED_SCHEME=fcfs
-    echo "  prefill[$i]: PREFILL_FCFS on (LICHT-V3 + pure-FCFS priority + fixed chunk=native"\
-         "long_prefill_token_threshold; NO longcap, NO dynamic_chunk)"
+    if [[ "${NO_CHUNK}" == "true" ]]; then
+      echo "  prefill[$i]: PREFILL_FCFS on + --no-chunk (pure-FCFS + 整 prompt 一次 prefill;"\
+           "NO longcap, NO dynamic_chunk)"
+    else
+      # 同 prefill-opt 的 brb 标定 (fingerprint 缓存命中即秒回, 同卡型复用).
+      _brb_dir="${SCRIPT_DIR}/../../../dynamic_chunk/brb_cache"
+      _brb_file="$(LICHT_CAL_MODEL="${MODEL_PATH}" LICHT_CAL_DTYPE="${DTYPE}" \
+                   LICHT_CAL_MAXLEN="${MAX_MODEL_LEN}" \
+                   LICHT_CAL_GMU="${PREFILL_GPU_MEMORY_UTILIZATION}" \
+                   LICHT_CAL_TP=1 \
+                   python "${SCRIPT_DIR}/../../../dynamic_chunk/calibrate_brb.py" \
+                    "${gpu_id}" "${_brb_dir}" 2>/dev/null \
+                    | grep -oE 'BRB_RESULT_PATH=[^ ]+' | tail -1 | cut -d= -f2)"
+      export LICHT_DYN_CHUNK=C
+      export LICHT_DYN_KMAX=16
+      export LICHT_DYN_PIN_CAP=0    # 同 prefill-opt: cap 不钉死, kmax 护尾
+      [[ -n "${_brb_file}" ]] && export LICHT_DYN_BRB_FILE="${_brb_file}"
+      echo "  prefill[$i]: PREFILL_FCFS on (pure-FCFS + dynamic_chunk[C+kmax16];"\
+           "NO longcap; brb=${_brb_file:-default216})"
+    fi
   fi
 
 
